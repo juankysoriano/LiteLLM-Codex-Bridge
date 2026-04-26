@@ -213,6 +213,7 @@ def _builtin_defaults() -> BridgeConfig:
                 features={
                     "qwen_sampling_defaults",
                     "drop_oai_only_fields",
+                    "effort_to_thinking_budget",
                     "thinking_overflow_recovery",
                     "silent_completion_recovery",
                     "truncated_content_recovery",
@@ -225,6 +226,7 @@ def _builtin_defaults() -> BridgeConfig:
                 features={
                     "qwen_sampling_defaults",
                     "drop_oai_only_fields",
+                    "effort_to_thinking_budget",
                     "thinking_overflow_recovery",
                     "silent_completion_recovery",
                     "truncated_content_recovery",
@@ -675,6 +677,21 @@ def _apply_qwen_sampling_defaults(body: dict) -> None:
 
 
 def _apply_effort_budget(body: dict) -> None:
+    """Map a client's `reasoning.effort` (or `reasoning_effort`) hint to a
+    concrete `thinking_token_budget` and inject it where vLLM actually
+    reads it.
+
+    Placement matters: `thinking_token_budget` is a `SamplingParams`
+    field enforced by vLLM's `ThinkingTokenBudgetLogitsProcessor`, which
+    only sees TOP-LEVEL extra_body keys. The same field nested under
+    `chat_template_kwargs` is never read by Qwen3-Thinking's chat
+    template and gets silently dropped — verified empirically: with the
+    correct placement reasoning_tokens ≈ budget, with the wrong one it
+    matches the no-budget baseline.
+
+    `enable_thinking` IS a chat-template variable (Qwen reads it from
+    Jinja), so that one stays under `chat_template_kwargs`.
+    """
     effort: str | None = None
     reasoning = body.get("reasoning")
     if isinstance(reasoning, dict) and isinstance(reasoning.get("effort"), str):
@@ -684,15 +701,22 @@ def _apply_effort_budget(body: dict) -> None:
     if effort:
         budget = _EFFORT_TO_THINKING_BUDGET.get(effort, _DEFAULT_THINKING_BUDGET)
     else:
+        # Client didn't hint at all — assume `high` so reasoning is at
+        # least bounded (otherwise vLLM lets the model think forever,
+        # which is what we observed pre-fix: hermes p95=54s, max=86s).
         budget = _DEFAULT_THINKING_BUDGET
     extra = body.get("extra_body")
     if not isinstance(extra, dict):
         extra = {}
+    # Top-level: real sampler enforcement.
+    extra.setdefault("thinking_token_budget", budget)
+    # Chat-template: only the `enable_thinking` flag actually does
+    # anything here on Qwen3-Thinking; we leave it set for consistency
+    # with hybrid Qwen3 deployments.
     chat_kwargs = extra.get("chat_template_kwargs")
     if not isinstance(chat_kwargs, dict):
         chat_kwargs = {}
     chat_kwargs.setdefault("enable_thinking", True)
-    chat_kwargs.setdefault("thinking_token_budget", budget)
     extra["chat_template_kwargs"] = chat_kwargs
     body["extra_body"] = extra
 
