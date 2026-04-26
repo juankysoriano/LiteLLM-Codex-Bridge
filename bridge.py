@@ -127,6 +127,7 @@ ALL_FEATURES = {
     "parallel_tool_sse_fix",        # vLLM #39426 workaround for parallel tool SSE
     # Recovery triggers (responses-API; chat/completions has its own)
     "thinking_overflow_recovery",   # incomplete + max_output_tokens → 2-tier recovery
+    "silent_completion_recovery",   # completed + no message item → 2-tier recovery
     "truncated_content_recovery",   # length + content cut mid-thought → continue
     "empty_with_stop_retry",        # empty + stop → one cheap retry
 }
@@ -182,6 +183,7 @@ def _builtin_defaults() -> BridgeConfig:
                     "drop_oai_only_fields",
                     "effort_to_thinking_budget",
                     "thinking_overflow_recovery",
+                    "silent_completion_recovery",
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
@@ -198,6 +200,7 @@ def _builtin_defaults() -> BridgeConfig:
                     "force_serial_tool_calls",
                     "parallel_tool_sse_fix",
                     "thinking_overflow_recovery",
+                    "silent_completion_recovery",
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
@@ -209,6 +212,7 @@ def _builtin_defaults() -> BridgeConfig:
                     "qwen_sampling_defaults",
                     "drop_oai_only_fields",
                     "thinking_overflow_recovery",
+                    "silent_completion_recovery",
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
@@ -220,6 +224,7 @@ def _builtin_defaults() -> BridgeConfig:
                     "qwen_sampling_defaults",
                     "drop_oai_only_fields",
                     "thinking_overflow_recovery",
+                    "silent_completion_recovery",
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
@@ -824,6 +829,29 @@ def _is_responses_overflow(response_obj: dict, message_emitted: bool) -> bool:
     return reason == "max_output_tokens" and not message_emitted
 
 
+def _is_responses_silent_completion(response_obj: dict, message_emitted: bool) -> bool:
+    """Detect a `status: completed` response that has no message item.
+
+    Pattern observed with Codex sessions: happy injects the
+    `CHANGE_TITLE_INSTRUCTION` into the first user message of every
+    session, which makes Qwen3 reason about whether to call the title
+    tool. If the model decides the user just said "hello" with no real
+    task, it emits *only* the reasoning explaining its decision and
+    finishes the turn without producing an answer — the user sees a
+    successful but silent completion.
+
+    Trigger: status=completed + no message item in output + we have
+    reasoning text to feed the recovery from. Same recovery as overflow:
+    `continue_final_message` with the reasoning prefilled, asking the
+    model to actually answer the user.
+    """
+    if not isinstance(response_obj, dict):
+        return False
+    if response_obj.get("status") != "completed":
+        return False
+    return not message_emitted
+
+
 def _detect_truncated_message(message_text: str, finish_reason: str | None) -> bool:
     """Heuristic for "answer was cut mid-thought".
 
@@ -945,13 +973,20 @@ async def _stream_responses(
 
                 etype = payload.get("type")
 
+                # Track reasoning text accumulator + whether actual
+                # answer text was emitted. Use `output_text.delta` (real
+                # tokens being emitted into a message) as the signal —
+                # `output_item.added` for a message can fire with empty
+                # content when the model opens a message envelope but
+                # then emits a function_call instead, leaving the user
+                # with no answer.
                 if etype == "response.reasoning_text.delta":
                     delta = payload.get("delta")
                     if isinstance(delta, str):
                         reasoning_accum += delta
-                if etype == "response.output_item.added":
-                    item = payload.get("item") or {}
-                    if item.get("type") == "message":
+                if etype == "response.output_text.delta":
+                    delta = payload.get("delta")
+                    if isinstance(delta, str) and delta:
                         message_emitted = True
 
                 # vLLM #39426 SSE rewrite (only when feature enabled)
@@ -1025,10 +1060,16 @@ async def _stream_responses(
     response_obj = completed_payload.get("response") or {}
 
     # Try recoveries in order. Each is gated by the profile feature flag.
+    # Both overflow and silent-completion use the same continue_final_message
+    # recovery — the only difference is the trigger.
     recovered_text: str | None = None
-    if profile.has("thinking_overflow_recovery") and _is_responses_overflow(
+    overflow = profile.has("thinking_overflow_recovery") and _is_responses_overflow(
         response_obj, message_emitted
-    ) and reasoning_accum.strip():
+    )
+    silent = profile.has("silent_completion_recovery") and _is_responses_silent_completion(
+        response_obj, message_emitted
+    )
+    if (overflow or silent) and reasoning_accum.strip():
         recovered_text = await _recover_thinking_overflow(
             body, reasoning_accum, headers, profile
         )
@@ -1380,15 +1421,34 @@ async def _handle_responses(
         )
     status, payload = await _post_responses_nonstream(body, headers, profile)
     if status < 400 and isinstance(payload, dict):
-        # Apply recovery to the non-streaming response object.
+        # Apply recovery to the non-streaming response object. A "message
+        # item" only counts if it actually carries non-empty text content
+        # — a bare `{type:"message", content:[]}` happens when the model
+        # opens a message envelope but emits only a function_call, and
+        # we want recovery to fire in that case too.
         output_items = payload.get("output") or []
-        message_emitted = any(
-            isinstance(item, dict) and item.get("type") == "message"
-            for item in output_items
-        )
-        if profile.has("thinking_overflow_recovery") and _is_responses_overflow(
+        message_emitted = False
+        for item in output_items:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            content = item.get("content") or []
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "output_text" and (part.get("text") or "").strip():
+                    message_emitted = True
+                    break
+            if message_emitted:
+                break
+        overflow_ns = profile.has("thinking_overflow_recovery") and _is_responses_overflow(
             payload, message_emitted
-        ):
+        )
+        silent_ns = profile.has("silent_completion_recovery") and _is_responses_silent_completion(
+            payload, message_emitted
+        )
+        if overflow_ns or silent_ns:
             partial_reasoning = ""
             for item in output_items:
                 if isinstance(item, dict) and item.get("type") == "reasoning":
