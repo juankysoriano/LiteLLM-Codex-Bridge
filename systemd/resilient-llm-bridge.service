@@ -1,0 +1,22 @@
+[Unit]
+Description=resilient-llm-bridge — local proxy with retry/recovery/rate-limiting for OpenAI-compatible LLM upstreams
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.config/resilient-llm-bridge
+ExecStart=%h/.local/bin/uv run --quiet %h/.config/resilient-llm-bridge/bridge.py
+Restart=on-failure
+RestartSec=3
+
+# Override defaults if you want; otherwise the bridge uses sensible
+# bundled defaults (NaN Builders upstream, profiles for codex /
+# opencode / hermes / default).
+# Environment=PORT=4242
+# Environment=HOST=127.0.0.1
+# Environment=LOG_LEVEL=info
+# Environment=BRIDGE_CONFIG_PATH=%h/.config/resilient-llm-bridge/config.yaml
+
+[Install]
+WantedBy=default.target

@@ -1,34 +1,30 @@
-# Example ~/.codex/config.toml for using OpenAI Codex CLI through the bridge.
+# Example ~/.codex/config.toml for using OpenAI Codex CLI through resilient-llm-bridge.
 #
-# Copy this to ~/.codex/config.toml (or merge with your existing one), then
-# point it at the bridge running on http://127.0.0.1:4100.
-#
-# Replace `qwen3.6` with whatever model your upstream LiteLLM exposes. Set
-# X_NAN_KEY (or whichever env var matches your provider) in your shell.
+# Copy to ~/.codex/config.toml (or merge with your existing one) and start
+# the bridge (see README). Set X_NAN_KEY (or whichever env var matches your
+# provider) in your shell.
 
 model = "qwen3.6"
 model_provider = "nan"
 
 # Qwen3-30B-A3B-Thinking-2507 has a 131072-token context. The bridge doesn't
-# enforce this — Codex does. Pick something within the model's limit.
+# enforce this — Codex does. 32000 max output is the community-recommended
+# sweet spot to avoid mid-answer truncation while keeping latency bounded.
 model_context_window = 131072
-model_max_output_tokens = 16000
+model_max_output_tokens = 32000
 
 # Codex 0.124+ requires this, not "off".
 web_search = "disabled"
 
 [model_providers.nan]
-name = "LiteLLM-Codex-Bridge → upstream"
-# This is the bridge, NOT the upstream directly.
-base_url = "http://127.0.0.1:4100/v1"
-# Codex reads the bearer token from this env var and forwards it to the bridge,
-# which forwards it verbatim to the upstream LiteLLM.
+name = "resilient-llm-bridge (codex profile) → NaN Builders"
+# Path prefix selects the profile. /codex/v1/... gets the full transform
+# stack (input reshape, MCP drop, parallel-tool SSE rewrite, etc).
+base_url = "http://127.0.0.1:4242/codex/v1"
 env_key = "X_NAN_KEY"
 wire_api = "responses"
 
 [tools]
 # These OpenAI-hosted tools don't round-trip through a LiteLLM/vLLM upstream.
-# The bridge drops them anyway, but disabling here keeps Codex from declaring
-# them in the first place.
 view_image = false
 image_generation = false
