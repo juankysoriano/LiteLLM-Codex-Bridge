@@ -66,11 +66,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import heapq
+import itertools
 import json
 import os
 import re
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
@@ -112,6 +115,13 @@ class UpstreamConfig:
     retry_max_attempts: int = 3
     retry_initial_wait: float = 1.0
     retry_max_wait: float = 20.0
+    # Queue: how long an inbound request will wait for a slot before
+    # we 503 it. Without this, a saturated semaphore + a hung upstream
+    # held all queued requests forever. 120s gives normal queueing
+    # plenty of room while bounding worst case.
+    queue_timeout_s: float = 120.0
+    # Watchdog: log a warning when a slot has been held this long.
+    stuck_warn_s: float = 300.0
 
 
 # Feature flags. Each profile's `features` list selects which to apply.
@@ -148,6 +158,11 @@ class ProfileConfig:
     # ad-hoc curls / unknown clients that didn't ask for thinking.
     # Named profiles default to high.
     default_thinking_budget: int = 8192
+    # Queue priority for the upstream gate — lower = jumps ahead of
+    # higher-priority numbers. Interactive coding agents (codex,
+    # opencode) get 0; long-running daemons (hermes, default) get 10.
+    # Within the same priority bucket it's first-come-first-served.
+    queue_priority: int = 10
 
     def has(self, feature: str) -> bool:
         return feature in self.features
@@ -214,6 +229,7 @@ def _builtin_defaults() -> BridgeConfig:
                 # clients that didn't ask for thinking — medium is a
                 # gentler default than high.
                 default_thinking_budget=4096,
+                queue_priority=10,  # background / unknown
             ),
             "codex": ProfileConfig(
                 name="codex",
@@ -231,6 +247,7 @@ def _builtin_defaults() -> BridgeConfig:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
+                queue_priority=0,  # interactive — jumps ahead of background
             ),
             "hermes": ProfileConfig(
                 name="hermes",
@@ -244,6 +261,13 @@ def _builtin_defaults() -> BridgeConfig:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
+                # Hermes never sends a reasoning hint to custom
+                # providers (its supports_reasoning gate is host-based
+                # and rejects localhost), so this default applies to
+                # every hermes call. Medium keeps it bounded without
+                # over-thinking simple replies.
+                default_thinking_budget=4096,
+                queue_priority=10,  # background daemon
             ),
             "opencode": ProfileConfig(
                 name="opencode",
@@ -257,9 +281,11 @@ def _builtin_defaults() -> BridgeConfig:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
-                # Opencode's compiled binary skips `reasoning_effort` for
-                # any model id containing "qwen". Aliasing dodges that.
-                model_aliases={"nan-thinking": "qwen3.6"},
+                # Opencode also never emits a reasoning hint for this
+                # setup (qwen* skip-list in its compiled binary), so
+                # this default applies to every opencode call.
+                default_thinking_budget=8192,
+                queue_priority=0,  # interactive — jumps ahead of background
             ),
         },
         default_profile="default",
@@ -457,40 +483,182 @@ class _TokenBucket:
         return cur, self.capacity
 
 
+class _QueueTimeout(Exception):
+    """Raised when a request waits longer than `queue_timeout_s` for a
+    slot. The handler converts this to a 503 with a Retry-After header
+    so the client backs off instead of looping. Not retryable — by the
+    time we hit it, the upstream is sick or the queue is overwhelmed
+    and immediately retrying just makes things worse."""
+
+    def __init__(self, upstream: str, waited_s: float) -> None:
+        self.upstream = upstream
+        self.waited_s = waited_s
+        super().__init__(
+            f"queue timeout: waited {waited_s:.1f}s for an upstream={upstream} slot"
+        )
+
+
+@dataclass(order=True)
+class _Waiter:
+    """One task in the priority queue.
+
+    Sort key is (priority, seq) so heapq pops lowest priority first;
+    `seq` is a monotonic counter so ties resolve in arrival order
+    (FIFO within a priority bucket). The non-comparable fields are
+    marked `compare=False` so they don't break ordering.
+    """
+    priority: int
+    seq: int
+    future: asyncio.Future = field(compare=False)
+    profile: str = field(default="?", compare=False)
+    path: str = field(default="?", compare=False)
+
+
 class _UpstreamGate:
-    """Combined rate limiter + concurrency limiter for a single upstream."""
+    """Per-upstream rate-limit + priority-queue + per-slot tracking.
+
+    Three independent constraints:
+      * Token bucket: RPM cap. Once consumed, tokens regenerate at
+        `rate_limit_rpm/60` per second.
+      * Concurrency cap: max `rate_limit_concurrent` slots in flight.
+      * Priority heap: when slots are saturated, waiters queue in
+        priority order. Lower number wins (`codex` and `opencode` use
+        priority=0; `hermes` and `default` use priority=10).
+
+    Per-slot state is a dict so the dashboard can show oldest-age and
+    the watchdog can spot stuck slots. The whole thing is acquired
+    via the `_gated()` async context manager so cancellation always
+    frees the slot via the `finally` clause.
+    """
 
     def __init__(self, cfg: UpstreamConfig) -> None:
         self.cfg = cfg
         self.bucket = _TokenBucket(cfg.rate_limit_rpm or 1, cfg.rate_limit_rpm or 0)
-        self.sema = asyncio.Semaphore(
+        self.concurrent_limit = (
             cfg.rate_limit_concurrent if cfg.rate_limit_concurrent > 0 else 1024
         )
-        # Track in-flight count for the dashboard.
-        self._in_flight = 0
+        self._in_flight: dict[int, dict] = {}
+        self._waiters: list[_Waiter] = []
         self._lock = asyncio.Lock()
+        self._slot_id_counter = itertools.count(1)
+        self._seq_counter = itertools.count()
+        # Slots that have been logged once as stuck — don't re-spam.
+        self._stuck_logged: set[int] = set()
 
-    async def __aenter__(self) -> "_UpstreamGate":
+    async def acquire(
+        self,
+        *,
+        profile_name: str,
+        path: str,
+        priority: int,
+        queue_timeout: float,
+    ) -> int:
+        """Acquire a slot, returning a slot id used for `release()`.
+
+        Order of operations:
+          1. Wait for a rate-limit token (bucket). Cheap when not
+             saturated; consumed token can't be returned but the
+             bucket regenerates anyway.
+          2. Take a slot, jumping the priority queue if needed.
+        """
         await self.bucket.acquire()
-        await self.sema.acquire()
-        async with self._lock:
-            self._in_flight += 1
-        return self
 
-    async def __aexit__(self, *exc: Any) -> None:
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[int] = loop.create_future()
+        waiter = _Waiter(
+            priority=priority,
+            seq=next(self._seq_counter),
+            future=future,
+            profile=profile_name,
+            path=path,
+        )
+
+        # Either grant immediately if a slot is free, or push onto
+        # the heap. Both must happen under the lock to avoid
+        # double-grants when slots free at the same time.
         async with self._lock:
-            self._in_flight -= 1
-        self.sema.release()
+            if len(self._in_flight) < self.concurrent_limit:
+                slot_id = next(self._slot_id_counter)
+                self._in_flight[slot_id] = {
+                    "started": time.monotonic(),
+                    "profile": profile_name,
+                    "path": path,
+                }
+                future.set_result(slot_id)
+            else:
+                heapq.heappush(self._waiters, waiter)
+
+        started_wait = time.monotonic()
+        try:
+            return await asyncio.wait_for(future, timeout=queue_timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+            waited = time.monotonic() - started_wait
+            async with self._lock:
+                # Remove from heap if still queued.
+                try:
+                    self._waiters.remove(waiter)
+                    heapq.heapify(self._waiters)
+                except ValueError:
+                    pass
+                # Edge case: slot was granted between timeout check
+                # and our exception handler — release it so the next
+                # waiter gets a turn.
+                if future.done() and not future.cancelled():
+                    try:
+                        slot_id = future.result()
+                    except Exception:
+                        slot_id = None
+                    if slot_id is not None:
+                        self._in_flight.pop(slot_id, None)
+                        self._dispatch_next_locked()
+            if isinstance(e, asyncio.TimeoutError):
+                raise _QueueTimeout(self.cfg.name, waited) from None
+            raise
+
+    async def release(self, slot_id: int) -> None:
+        """Release a slot and wake the next waiter, if any."""
+        async with self._lock:
+            self._in_flight.pop(slot_id, None)
+            self._stuck_logged.discard(slot_id)
+            self._dispatch_next_locked()
+
+    def _dispatch_next_locked(self) -> None:
+        """Hand a slot to the highest-priority queued waiter. Caller
+        must hold `self._lock`."""
+        while self._waiters:
+            nxt = heapq.heappop(self._waiters)
+            if nxt.future.cancelled():
+                continue
+            slot_id = next(self._slot_id_counter)
+            self._in_flight[slot_id] = {
+                "started": time.monotonic(),
+                "profile": nxt.profile,
+                "path": nxt.path,
+            }
+            try:
+                nxt.future.set_result(slot_id)
+                return
+            except asyncio.InvalidStateError:
+                # Future was cancelled between the check and set_result —
+                # roll back the slot and try the next waiter.
+                self._in_flight.pop(slot_id, None)
+                continue
 
     def snapshot(self) -> dict[str, Any]:
-        cur, cap = self.bucket.snapshot()
+        cur, _ = self.bucket.snapshot()
+        now = time.monotonic()
+        ages = [round(now - s["started"], 1) for s in self._in_flight.values()]
         return {
             "name": self.cfg.name,
             "url": self.cfg.url,
             "rpm_capacity": self.cfg.rate_limit_rpm,
             "rpm_remaining": round(cur, 1),
-            "concurrent_limit": self.cfg.rate_limit_concurrent,
-            "concurrent_in_flight": self._in_flight,
+            "concurrent_limit": self.concurrent_limit,
+            "concurrent_in_flight": len(self._in_flight),
+            "queue_waiting": len(self._waiters),
+            "oldest_in_flight_s": max(ages) if ages else 0.0,
+            "queue_timeout_s": self.cfg.queue_timeout_s,
+            "stuck_warn_s": self.cfg.stuck_warn_s,
         }
 
 
@@ -505,6 +673,58 @@ def _gate_for(profile: ProfileConfig) -> _UpstreamGate:
 
 def _upstream_url(profile: ProfileConfig) -> str:
     return CONFIG.upstreams[profile.upstream].url
+
+
+@asynccontextmanager
+async def _gated(profile: ProfileConfig, *, path: str = "?"):
+    """Acquire a slot from the profile's upstream gate, with
+    priority-aware queueing and a hard queue timeout.
+
+    Always releases on exit and on cancellation. Raises `_QueueTimeout`
+    if the gate's `queue_timeout_s` is exceeded — handlers convert
+    that to a 503 with a `Retry-After` header.
+    """
+    gate = _gate_for(profile)
+    slot_id = await gate.acquire(
+        profile_name=profile.name,
+        path=path,
+        priority=profile.queue_priority,
+        queue_timeout=gate.cfg.queue_timeout_s,
+    )
+    try:
+        yield gate
+    finally:
+        await gate.release(slot_id)
+
+
+async def _gate_watchdog_loop(interval_s: float = 30.0) -> None:
+    """Background task: periodically log slots that have been held
+    longer than the per-upstream `stuck_warn_s` threshold. Doesn't
+    auto-cancel them — that's a stronger semantic and we'd rather
+    surface the issue than silently kill a long-running tool call."""
+    while True:
+        try:
+            await asyncio.sleep(interval_s)
+            now = time.monotonic()
+            for gate in _UPSTREAM_GATES.values():
+                stuck = []
+                async with gate._lock:
+                    for slot_id, info in list(gate._in_flight.items()):
+                        age = now - info["started"]
+                        if age > gate.cfg.stuck_warn_s and slot_id not in gate._stuck_logged:
+                            gate._stuck_logged.add(slot_id)
+                            stuck.append((slot_id, age, info))
+                for slot_id, age, info in stuck:
+                    print(
+                        f"[gate-watchdog] upstream={gate.cfg.name} slot={slot_id} "
+                        f"held {age:.0f}s (>{gate.cfg.stuck_warn_s:.0f}s) "
+                        f"profile={info['profile']} path={info['path']}",
+                        flush=True,
+                    )
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # never let the watchdog die
+            print(f"[gate-watchdog] error: {exc!r}", flush=True)
 
 
 # =============================================================================
@@ -761,16 +981,34 @@ def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
         _ensure_room_for_injected_thinking(body, budget)
 
 
+_DEFAULT_ANSWER_TOKENS = 4096
+
+
 def _ensure_room_for_injected_thinking(body: dict, budget: int) -> None:
-    """Bump max_tokens / max_output_tokens to accommodate injected
-    reasoning tokens plus a small answer headroom. No-op if the field
-    is already large enough or unset (unset = upstream default applies)."""
-    headroom = 1024
-    needed = budget + headroom
-    for field_name in ("max_tokens", "max_output_tokens"):
-        current = body.get(field_name)
-        if isinstance(current, int) and 0 < current < needed:
-            body[field_name] = needed
+    """Always set `max_tokens` / `max_output_tokens` to
+    (client's declared cap or _DEFAULT_ANSWER_TOKENS) + budget.
+
+    Treat the client's existing `max_tokens` as the intended ANSWER
+    size — they sized it without knowing we'd inject reasoning. Total
+    cap = answer + reasoning. When the client didn't send any cap at
+    all we substitute `_DEFAULT_ANSWER_TOKENS` so the upstream still
+    sees a bounded total instead of falling back to whatever default
+    vLLM has configured.
+
+    Picks the field that matches the request kind so we don't
+    accidentally set the wrong one:
+      * chat/completions style (body has `messages`)  → `max_tokens`
+      * responses-API style    (body has `input`)     → `max_output_tokens`
+    """
+    if "messages" in body:
+        field = "max_tokens"
+    elif "input" in body:
+        field = "max_output_tokens"
+    else:
+        field = "max_tokens"
+    current = body.get(field)
+    base = current if isinstance(current, int) and current > 0 else _DEFAULT_ANSWER_TOKENS
+    body[field] = base + budget
 
 
 def _drop_oai_only_fields(body: dict) -> None:
@@ -862,7 +1100,7 @@ async def _post_chat_for_text(
     try:
         async for attempt in _retry_policy(cfg):
             with attempt:
-                async with _gate_for(profile):
+                async with _gated(profile):
                     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
                         r = await client.post(url, json=body, headers=headers)
                 if r.status_code in _RETRYABLE_STATUS:
@@ -1077,7 +1315,7 @@ async def _stream_responses(
         # mid-stream, we only retry the connect/headers phase.
         async for attempt in _retry_policy(cfg):
             with attempt:
-                async with _gate_for(profile):
+                async with _gated(profile):
                     client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=None))
                     response = await client.send(
                         client.build_request(
@@ -1097,6 +1335,16 @@ async def _stream_responses(
 
     try:
         client, response = await _open_stream()
+    except _QueueTimeout as exc:
+        yield _sse(
+            {
+                "type": "error",
+                "status": 503,
+                "body": str(exc),
+                "retry_after_s": 10,
+            }
+        )
+        return
     except (RetryError, _UpstreamHTTPError) as exc:
         status = getattr(exc, "status", 502)
         body_text = getattr(exc, "body", str(exc))
@@ -1376,7 +1624,7 @@ async def _stream_chat_completions(
     async def _open_stream():
         async for attempt in _retry_policy(cfg):
             with attempt:
-                async with _gate_for(profile):
+                async with _gated(profile):
                     client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=None))
                     response = await client.send(
                         client.build_request(
@@ -1396,6 +1644,16 @@ async def _stream_chat_completions(
 
     try:
         client, response = await _open_stream()
+    except _QueueTimeout as exc:
+        yield _sse(
+            {
+                "type": "error",
+                "status": 503,
+                "body": str(exc),
+                "retry_after_s": 10,
+            }
+        )
+        return
     except (RetryError, _UpstreamHTTPError) as exc:
         status = getattr(exc, "status", 502)
         body_text = getattr(exc, "body", str(exc))
@@ -1453,7 +1711,7 @@ async def _post_responses_nonstream(
     try:
         async for attempt in _retry_policy(cfg):
             with attempt:
-                async with _gate_for(profile):
+                async with _gated(profile):
                     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
                         r = await client.post(upstream_url, json=body, headers=headers)
                 last_status = r.status_code
@@ -1466,6 +1724,8 @@ async def _post_responses_nonstream(
                     else {}
                 )
                 return r.status_code, payload
+    except _QueueTimeout as exc:
+        return 503, {"error": {"message": str(exc), "retry_after_s": 10}}
     except (RetryError, _UpstreamHTTPError):
         return last_status, {"error": {"message": last_body}}
     except httpx.HTTPError as e:
@@ -1479,6 +1739,26 @@ async def _post_responses_nonstream(
 
 
 app = FastAPI(title="resilient-llm-bridge")
+
+_watchdog_task: asyncio.Task | None = None
+
+
+@app.on_event("startup")
+async def _start_watchdog() -> None:
+    global _watchdog_task
+    if _watchdog_task is None or _watchdog_task.done():
+        _watchdog_task = asyncio.create_task(_gate_watchdog_loop())
+
+
+@app.on_event("shutdown")
+async def _stop_watchdog() -> None:
+    global _watchdog_task
+    if _watchdog_task and not _watchdog_task.done():
+        _watchdog_task.cancel()
+        try:
+            await _watchdog_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 def _redact_body(body: Any, max_bytes: int = 4096) -> dict:
@@ -1705,16 +1985,15 @@ async def stats() -> dict:
     windows = {"1m": 60.0, "5m": 300.0, "15m": 900.0, "1h": 3600.0}
     activity = list(_activity_history)
     usage = list(_usage_history)
+    # Lifetime is just an unbounded aggregation — same shape as windows
+    # so the dashboard can treat it uniformly (proper p50/p95, error
+    # split, by_profile, by_model).
+    lifetime = _aggregate_window(activity, usage)
+    lifetime["recoveries"] = dict(_recovery_counts)
     out: dict = {
         "now": now,
         "uptime_s": round(now - _started_at, 1),
-        "lifetime": {
-            "requests": len(activity),
-            "tokens_in": sum(int(r.get("input_tokens") or 0) for r in usage),
-            "tokens_out": sum(int(r.get("output_tokens") or 0) for r in usage),
-            "errors": sum(1 for r in activity if (r.get("status") or 0) >= 400),
-            "recoveries": dict(_recovery_counts),
-        },
+        "lifetime": lifetime,
         "windows": {},
         "upstreams": [g.snapshot() for g in _UPSTREAM_GATES.values()],
         "profiles": [
@@ -1947,7 +2226,7 @@ async def _handle_chat_completions(
     try:
         async for attempt in _retry_policy(cfg):
             with attempt:
-                async with _gate_for(profile):
+                async with _gated(profile):
                     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
                         r = await client.post(upstream_url, json=body, headers=headers)
                 last_status = r.status_code
@@ -1960,6 +2239,9 @@ async def _handle_chat_completions(
                     else {}
                 )
                 break
+    except _QueueTimeout as exc:
+        last_status = 503
+        payload = {"error": {"message": str(exc), "retry_after_s": 10}}
     except (RetryError, _UpstreamHTTPError):
         payload = {"error": {"message": last_body}}
     except httpx.HTTPError as e:
@@ -1991,7 +2273,7 @@ async def _handle_chat_completions(
             and not message.get("tool_calls")
         ):
             try:
-                async with _gate_for(profile):
+                async with _gated(profile):
                     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
                         retry_r = await client.post(upstream_url, json=body, headers=headers)
                 if retry_r.status_code < 400:
@@ -2035,7 +2317,7 @@ async def _handle_passthrough(request: Request, profile: ProfileConfig, path: st
     try:
         async for attempt in _retry_policy(cfg):
             with attempt:
-                async with _gate_for(profile):
+                async with _gated(profile):
                     async with httpx.AsyncClient(
                         timeout=httpx.Timeout(600.0, read=None)
                     ) as client:
@@ -2056,6 +2338,12 @@ async def _handle_passthrough(request: Request, profile: ProfileConfig, path: st
                 if r.status_code in _RETRYABLE_STATUS:
                     raise _UpstreamHTTPError(r.status_code, r.text)
                 break
+    except _QueueTimeout as exc:
+        last_status = 503
+        response_content = json.dumps(
+            {"error": {"message": str(exc), "retry_after_s": 10}}
+        ).encode("utf-8")
+        response_media_type = "application/json"
     except (RetryError, _UpstreamHTTPError):
         pass
     except httpx.HTTPError as e:
@@ -2162,18 +2450,19 @@ def _dashboard_html() -> str:
     .kpis {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
       gap: 0.6rem; margin-top: 0.5rem; }}
     .kpi {{ background: var(--panel); border: 1px solid var(--line);
-      border-radius: 6px; padding: 0.75rem 0.9rem; position: relative; overflow: hidden; }}
+      border-radius: 6px; padding: 0.75rem 0.9rem; display: flex;
+      flex-direction: column; gap: 0.15rem; }}
     .kpi-label {{ color: var(--dim); font-size: 0.7rem; text-transform: uppercase;
       letter-spacing: 0.08em; }}
     .kpi-value {{ font-size: 1.55rem; color: var(--accent); font-weight: 500;
-      margin-top: 0.2rem; line-height: 1.1; }}
-    .kpi-sub {{ color: var(--dim); font-size: 0.78rem; margin-top: 0.3rem; }}
+      line-height: 1.1; }}
+    .kpi-sub {{ color: var(--dim); font-size: 0.78rem; }}
     .kpi.good .kpi-value {{ color: var(--good); }}
     .kpi.warn .kpi-value {{ color: var(--warn); }}
     .kpi.bad .kpi-value {{ color: var(--bad); }}
     .kpi.accent2 .kpi-value {{ color: var(--accent2); }}
-    .kpi-spark {{ position: absolute; bottom: 0; left: 0; right: 0;
-      opacity: 0.5; height: 30px; }}
+    .kpi-spark {{ display: block; width: 100%; height: 26px;
+      margin-top: 0.4rem; opacity: 0.85; }}
 
     /* Window selector */
     .windows {{ display: inline-flex; gap: 0.3rem; margin-left: auto; }}
@@ -2359,9 +2648,10 @@ def _dashboard_html() -> str:
     <table>
       <thead><tr>
         <th>name</th><th>url</th>
-        <th>rpm cap</th><th>concurrent</th><th>in flight</th><th>utilization</th>
+        <th>rpm cap</th><th>concurrent</th><th>in flight</th>
+        <th>waiting</th><th>oldest</th><th>utilization</th>
       </tr></thead>
-      <tbody id="upstreams-body"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
+      <tbody id="upstreams-body"><tr><td colspan="8" class="empty">loading…</td></tr></tbody>
     </table>
   </div>
 
@@ -2453,6 +2743,8 @@ def _dashboard_html() -> str:
     let lastStats = null;
     let activityRows = [];
     let usageRows = [];
+    // Survives re-renders: keyed by activity row ts (stable per request).
+    const expandedKeys = new Set();
 
     document.querySelectorAll('.windows button').forEach(btn => {{
       btn.addEventListener('click', () => {{
@@ -2464,48 +2756,53 @@ def _dashboard_html() -> str:
     }});
 
     function pickWindow(stats) {{
-      if (activeWindow === 'lifetime') {{
-        const lt = stats.lifetime;
-        return {{
-          requests: lt.requests, errors: lt.errors,
-          tokens_in: lt.tokens_in, tokens_out: lt.tokens_out,
-          p50_ms: 0, p95_ms: 0, p99_ms: 0,
-          by_profile: {{}}, by_model: {{}},
-        }};
-      }}
+      if (activeWindow === 'lifetime') return stats.lifetime || {{}};
       return stats.windows[activeWindow] || {{}};
     }}
 
-    function windowSeconds() {{
-      return {{ '1m': 60, '5m': 300, '15m': 900, '1h': 3600, 'lifetime': 3600 }}[activeWindow] || 300;
+    function windowSeconds(stats) {{
+      if (activeWindow === 'lifetime') {{
+        return Math.max(stats?.uptime_s || 1, 1);
+      }}
+      return {{ '1m': 60, '5m': 300, '15m': 900, '1h': 3600 }}[activeWindow] || 300;
     }}
 
     function renderStats(stats) {{
       const w = pickWindow(stats);
-      const span = windowSeconds();
-      $('kpi-req').textContent = fmt(w.requests);
-      $('kpi-rps').textContent = `${{(w.requests / span).toFixed(2)}} rps · ${{w.errors_4xx || 0}}×4xx · ${{w.errors_5xx || 0}}×5xx`;
-      $('kpi-tok-out').textContent = fmt(w.tokens_out);
-      $('kpi-tok-rate').textContent = `${{Math.round(w.tokens_out / span)}} tok/s avg`;
-      $('kpi-tok-in').textContent = fmt(w.tokens_in);
+      const span = windowSeconds(stats);
+      const empty = !w.requests;
+      $('kpi-req').textContent = empty ? '—' : fmt(w.requests);
+      $('kpi-rps').textContent = empty
+        ? 'no requests in window'
+        : `${{(w.requests / span).toFixed(2)}} rps · ${{w.errors_4xx || 0}}×4xx · ${{w.errors_5xx || 0}}×5xx`;
+      $('kpi-tok-out').textContent = w.tokens_out ? fmt(w.tokens_out) : '—';
+      $('kpi-tok-rate').textContent = w.tokens_out
+        ? `${{Math.round(w.tokens_out / span)}} tok/s avg`
+        : '—';
+      $('kpi-tok-in').textContent = w.tokens_in ? fmt(w.tokens_in) : '—';
       const ratio = w.tokens_in > 0 ? (w.tokens_out / w.tokens_in).toFixed(2) : '—';
       $('kpi-tok-ratio').textContent = `out/in ${{ratio}}`;
-      $('kpi-p50').textContent = fmtMs(w.p50_ms || 0);
-      $('kpi-p95').textContent = `p95 ${{fmtMs(w.p95_ms || 0)}} · p99 ${{fmtMs(w.p99_ms || 0)}}`;
+      $('kpi-p50').textContent = w.p50_ms ? fmtMs(w.p50_ms) : '—';
+      $('kpi-p95').textContent = w.p95_ms
+        ? `p95 ${{fmtMs(w.p95_ms)}} · p99 ${{fmtMs(w.p99_ms || 0)}}`
+        : '—';
       const successRate = w.requests > 0
         ? (((w.requests - w.errors) / w.requests) * 100).toFixed(1) + '%'
         : '—';
       $('kpi-success').textContent = successRate;
-      $('kpi-errors').textContent = `${{w.errors || 0}} errors / ${{w.requests || 0}} req`;
-      const totalRec = Object.values(stats.lifetime.recoveries).reduce((a, b) => a + b, 0);
-      $('kpi-rec').textContent = fmt(totalRec);
-      const recParts = Object.entries(stats.lifetime.recoveries)
+      $('kpi-errors').textContent = w.requests > 0
+        ? `${{w.errors || 0}} errors / ${{w.requests}} req`
+        : '—';
+      const recoveries = (stats.lifetime && stats.lifetime.recoveries) || {{}};
+      const totalRec = Object.values(recoveries).reduce((a, b) => a + b, 0);
+      $('kpi-rec').textContent = totalRec ? fmt(totalRec) : '—';
+      const recParts = Object.entries(recoveries)
         .filter(([_, v]) => v > 0)
         .map(([k, v]) => `${{k.replace(/_/g, ' ')}}: ${{v}}`);
-      $('kpi-rec-sub').textContent = recParts.length ? recParts.join(' · ') : 'none yet';
+      $('kpi-rec-sub').textContent = recParts.length ? recParts.join(' · ') : 'none fired yet';
 
-      // Sparklines from history
-      const sec = activeWindow === 'lifetime' ? 3600 : span;
+      // Sparklines from history (same span as the KPI window).
+      const sec = span;
       const reqBins = bin(activityRows, sec, 24, _ => 1);
       const tokBins = bin(usageRows, sec, 24, e => (e.output_tokens || 0));
       const latBins = bin(activityRows, sec, 24, e => (e.duration_ms || 0));
@@ -2557,27 +2854,41 @@ def _dashboard_html() -> str:
       // Upstreams.
       const upRows = (stats.upstreams || []).map(u => {{
         const inFlight = u.concurrent_in_flight || 0;
+        const waiting = u.queue_waiting || 0;
         const cap = u.concurrent_limit || 1;
         const pct = Math.min(100, (inFlight / cap) * 100);
         const cls = pct >= 90 ? 'full' : pct >= 50 ? 'busy' : '';
+        const oldest = u.oldest_in_flight_s || 0;
+        const stuckWarn = u.stuck_warn_s || 300;
+        const oldestCls = oldest > stuckWarn ? 'lat-slow' : oldest > stuckWarn * 0.5 ? 'lat-mid' : '';
+        const oldestStr = oldest > 0 ? `${{oldest.toFixed(1)}}s` : '—';
+        const waitCls = waiting > 0 ? 'lat-mid' : '';
         return `<tr><td>${{escapeHtml(u.name)}}</td>` +
           `<td><code>${{escapeHtml(u.url)}}</code></td>` +
           `<td class="num">${{u.rpm_remaining}}/${{u.rpm_capacity}}</td>` +
           `<td class="num">${{cap}}</td>` +
           `<td class="num">${{inFlight}}</td>` +
+          `<td class="num ${{waitCls}}">${{waiting}}</td>` +
+          `<td class="num ${{oldestCls}}">${{oldestStr}}</td>` +
           `<td><div class="rate-bar"><div class="rate-bar-fill ${{cls}}" style="width:${{pct.toFixed(1)}}%"></div></div></td></tr>`;
       }}).join('');
       $('upstreams-body').innerHTML = upRows ||
-        `<tr><td colspan="6" class="empty">no upstreams</td></tr>`;
+        `<tr><td colspan="8" class="empty">no upstreams</td></tr>`;
 
       // Activity table from rolling buffer. Each main row has a hidden
-      // sibling row with the full redacted JSON body — expanded on click.
+      // sibling row with the full redacted JSON body — expanded on
+      // click. Expanded state is keyed by the row's ts (stable across
+      // renders) so periodic re-renders don't collapse open rows.
       const recent = activityRows.slice(-30).reverse();
       $('activity').innerHTML = recent.length === 0
         ? `<tr><td colspan="7" class="empty">no activity yet</td></tr>`
-        : recent.map((r, i) => {{
-            const rowId = `row-${{i}}-${{(r.ts*1000)|0}}`;
-            const main = `<tr class="activity-row" data-target="${{rowId}}">` +
+        : recent.map((r) => {{
+            const key = String(r.ts);
+            const targetId = `body-${{key.replace('.', '_')}}`;
+            const isExpanded = expandedKeys.has(key);
+            const mainCls = isExpanded ? 'activity-row expanded' : 'activity-row';
+            const bodyCls = isExpanded ? 'body-row expanded' : 'body-row';
+            const main = `<tr class="${{mainCls}}" data-key="${{key}}" data-target="${{targetId}}">` +
               `<td>${{fmtTime(r.ts)}}</td><td>${{escapeHtml(r.profile)}}</td>` +
               `<td>${{escapeHtml(r.method)}}</td><td><code>${{escapeHtml(r.path)}}</code></td>` +
               `<td class="${{statusClass(r.status)}}">${{r.status}}</td>` +
@@ -2585,17 +2896,27 @@ def _dashboard_html() -> str:
               `<td>${{renderParams(r.params)}}</td></tr>`;
             const bodyJson = r.body ? jsonHighlight(r.body) :
               '<span class="jnull">no body captured (passthrough or non-JSON request)</span>';
-            const expand = `<tr class="body-row" id="${{rowId}}">` +
+            const expand = `<tr class="${{bodyCls}}" id="${{targetId}}">` +
               `<td colspan="7"><div class="body-pre">${{bodyJson}}</div></td></tr>`;
             return main + expand;
           }}).join('');
-      // Wire click handlers for expandable rows.
+      // Wire click handlers for expandable rows. Toggle both the
+      // expandedKeys set (the source of truth across re-renders) and
+      // the live DOM classes (for instant feedback before next render).
       document.querySelectorAll('#activity .activity-row').forEach(row => {{
         row.addEventListener('click', () => {{
+          const key = row.dataset.key;
           const target = $(row.dataset.target);
           if (!target) return;
-          row.classList.toggle('expanded');
-          target.classList.toggle('expanded');
+          if (expandedKeys.has(key)) {{
+            expandedKeys.delete(key);
+            row.classList.remove('expanded');
+            target.classList.remove('expanded');
+          }} else {{
+            expandedKeys.add(key);
+            row.classList.add('expanded');
+            target.classList.add('expanded');
+          }}
         }});
       }});
     }}
