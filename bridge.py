@@ -225,6 +225,37 @@ _DROP_FIELDS = {
 }
 
 
+# --- Thinking-overflow recovery (Qwen-official force-close pattern) ----------
+#
+# When the upstream serves Qwen3-Thinking without `--reasoning-parser qwen3`,
+# the model can fill the entire `max_output_tokens` budget with `<think>...`
+# and never emit `</think>` — leaving the caller with `status: "incomplete"`,
+# `incomplete_details.reason: "max_output_tokens"`, and zero usable answer
+# text (just a partial reasoning blob). Empirically this happens on ~20%
+# of agentic-coding turns with smaller budgets; even at 32k it still hits
+# on multi-step prompts that send the model down a rabbit hole.
+#
+# Per Qwen's official quickstart
+# (https://qwen.readthedocs.io/en/latest/getting_started/quickstart.html
+#  section "When budget exhausts"), the canonical recovery is to take the
+# partial reasoning, manually close the `<think>` block, append a fixed
+# transition phrase, and re-ask the model with vLLM's
+# `continue_final_message: true` so it produces only the answer (no more
+# thinking). We use chat/completions for the recovery call because
+# `continue_final_message` is documented for that path; the result gets
+# stitched back into the original `/v1/responses` shape (see
+# `_stream_passthrough` and the non-stream branch of `responses()`).
+#
+# Cost: one extra round-trip on overflow, ≤ _RECOVERY_MAX_TOKENS extra
+# tokens consumed, and a slight delay before the user sees output.
+# Far better than the original failure mode (empty answer, Codex hangs).
+_QWEN_FORCE_CLOSE_THINK = (
+    "Considering the limited time by the user, I have to give the "
+    "solution based on the thinking directly now."
+)
+_RECOVERY_MAX_TOKENS = 4096
+
+
 def _content_to_string(content) -> str:
     """Flatten an OpenAI message `content` field down to a plain string.
 
@@ -513,6 +544,143 @@ def _transform_chat_body(body: dict) -> dict:
     return body
 
 
+# --- thinking-overflow recovery -----------------------------------------------
+
+
+def _input_to_chat_messages(input_value, instructions: str | None) -> list[dict]:
+    """Convert a `/v1/responses` `input` array into chat/completions `messages`.
+
+    Used only for the recovery path. Drops items the recovery doesn't need
+    (function_call*, reasoning) — we're just feeding the model enough
+    context to continue the assistant turn whose thinking we cut short.
+    """
+    messages: list[dict] = []
+    if isinstance(instructions, str) and instructions.strip():
+        messages.append({"role": "system", "content": instructions.strip()})
+    if not isinstance(input_value, list):
+        return messages
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type", "message")
+        if item_type != "message":
+            continue
+        role = item.get("role")
+        if not isinstance(role, str):
+            continue
+        content = _content_to_string(item.get("content"))
+        if not content:
+            continue
+        messages.append({"role": role, "content": content})
+    return messages
+
+
+async def _recover_from_thinking_overflow(
+    original_body: dict,
+    partial_reasoning: str,
+    headers: dict[str, str],
+) -> str | None:
+    """Two-tier recovery when `/v1/responses` overflowed during `<think>`.
+
+    Returns the recovered answer text, or `None` if every fallback tier
+    failed (caller surfaces the original incomplete response in that case).
+
+    **Tier 2** (this function's primary path) — `continue_final_message`:
+    re-feed the partial reasoning as a prefilled assistant turn whose
+    `<think>` block is closed manually with Qwen's recommended transition
+    phrase, then ask vLLM to *continue* that turn. The model picks up
+    after `</think>` and just emits the answer — no more thinking.
+
+    **Tier 3** (final fallback) — fresh request with thinking disabled:
+    if Tier 2 returned nothing usable, re-ask the original question from
+    scratch with `enable_thinking: false`. The answer may diverge from
+    what the model was reasoning about (since we throw the partial
+    reasoning away), but it'll be non-empty and coherent — better UX than
+    handing the user the original `incomplete` response.
+    """
+    messages = _input_to_chat_messages(
+        original_body.get("input"), original_body.get("instructions")
+    )
+    if not messages:
+        return None
+
+    # --- Tier 2: continue_final_message with the reasoning prefilled ---
+    prefill = (
+        "<think>\n"
+        + partial_reasoning.strip()
+        + "\n"
+        + _QWEN_FORCE_CLOSE_THINK
+        + "\n</think>\n\n"
+    )
+    tier2_messages = messages + [{"role": "assistant", "content": prefill}]
+    tier2_body: dict = {
+        "model": original_body.get("model"),
+        "stream": False,
+        "messages": tier2_messages,
+        "max_tokens": _RECOVERY_MAX_TOKENS,
+        "extra_body": {
+            "continue_final_message": True,
+            "add_generation_prompt": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    }
+    _apply_qwen_sampling_defaults(tier2_body)
+    tier2_text = await _post_chat_for_text(tier2_body, headers)
+    if tier2_text:
+        return tier2_text
+
+    # --- Tier 3: fresh request, thinking disabled, no prefill ---
+    # We discard the partial reasoning and just ask the model the
+    # original question without any thinking at all. Qwen3.6 honors
+    # `enable_thinking: false` (verified empirically against NaN's
+    # vLLM deployment, 2026-04-26).
+    tier3_body: dict = {
+        "model": original_body.get("model"),
+        "stream": False,
+        "messages": messages,
+        "max_tokens": _RECOVERY_MAX_TOKENS,
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+    }
+    _apply_qwen_sampling_defaults(tier3_body)
+    return await _post_chat_for_text(tier3_body, headers)
+
+
+async def _post_chat_for_text(body: dict, headers: dict[str, str]) -> str | None:
+    """POST a chat/completions body to upstream and return the assistant
+    text. Returns None on any error or empty content. Used by the
+    overflow-recovery tiers.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+            r = await client.post(
+                f"{UPSTREAM}/chat/completions", json=body, headers=headers
+            )
+        if r.status_code >= 400:
+            return None
+        payload = r.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not choices:
+        return None
+    message = (choices[0] or {}).get("message") or {}
+    content = (message.get("content") or "").strip()
+    return content or None
+
+
+def _is_responses_overflow(response_obj: dict, message_emitted: bool) -> bool:
+    """Detect the empty-content + max_output_tokens overflow pattern."""
+    if not isinstance(response_obj, dict):
+        return False
+    if response_obj.get("status") != "incomplete":
+        return False
+    reason = (response_obj.get("incomplete_details") or {}).get("reason")
+    if reason != "max_output_tokens":
+        return False
+    return not message_emitted
+
+
 # ----------------------------------------------------------------- endpoints --
 
 
@@ -631,6 +799,11 @@ async def _stream_passthrough(
     buffer = b""
     # output_index → {"id","call_id","name","args"} for in-flight function_call items.
     fc_state: dict[int, dict] = {}
+    # Recovery state: track what the model emitted before `response.completed`
+    # so we can decide whether to trigger the force-close recovery.
+    reasoning_accum = ""
+    message_item_emitted = False
+    completed_payload: dict | None = None
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=None)) as client:
         async with client.stream(
@@ -664,6 +837,18 @@ async def _stream_passthrough(
                         continue
 
                     etype = payload.get("type")
+
+                    # Track reasoning text accumulator + whether a `message`
+                    # item ever appeared. Both feed the overflow-recovery
+                    # decision after the upstream stream ends.
+                    if etype == "response.reasoning_text.delta":
+                        delta = payload.get("delta")
+                        if isinstance(delta, str):
+                            reasoning_accum += delta
+                    if etype == "response.output_item.added":
+                        item = payload.get("item") or {}
+                        if item.get("type") == "message":
+                            message_item_emitted = True
 
                     if etype == "response.output_item.added":
                         item = payload.get("item") or {}
@@ -721,15 +906,134 @@ async def _stream_passthrough(
                         continue
 
                     if etype == "response.completed":
-                        response_obj = payload.get("response")
-                        if isinstance(response_obj, dict):
-                            record = _extract_usage(model_hint, response_obj)
-                            if record:
-                                _broadcast_usage(record)
-                        yield _sse(payload)
+                        # BUFFER the completed event — we may need to
+                        # patch it after running thinking-overflow recovery.
+                        completed_payload = payload
                         continue
 
                     yield _sse(payload)
+
+    # Stream from upstream is done. Decide whether the buffered
+    # `response.completed` represents a thinking-overflow that we can
+    # recover from, or it's healthy and we just forward it as-is.
+    if completed_payload is None:
+        return
+
+    response_obj = completed_payload.get("response") or {}
+    if (
+        _is_responses_overflow(response_obj, message_item_emitted)
+        and reasoning_accum.strip()
+    ):
+        recovery_text = await _recover_from_thinking_overflow(
+            body, reasoning_accum, headers
+        )
+        if recovery_text:
+            # Synthesize the responses-API events for an assistant message
+            # carrying the recovered answer, then patch and emit
+            # `response.completed` with the merged output.
+            fake_id = f"msg_recovery_{int(time.time() * 1000)}"
+            fake_idx = len(response_obj.get("output", []) or [])
+            seq = (completed_payload.get("sequence_number") or 0) + 1
+            model_field = response_obj.get("model")
+
+            yield _sse({
+                "type": "response.output_item.added",
+                "output_index": fake_idx,
+                "item": {
+                    "id": fake_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "status": "in_progress",
+                },
+                "sequence_number": seq,
+                "model": model_field,
+            })
+            seq += 1
+            yield _sse({
+                "type": "response.content_part.added",
+                "item_id": fake_id,
+                "output_index": fake_idx,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+                "sequence_number": seq,
+                "model": model_field,
+            })
+            seq += 1
+            yield _sse({
+                "type": "response.output_text.delta",
+                "item_id": fake_id,
+                "output_index": fake_idx,
+                "content_index": 0,
+                "delta": recovery_text,
+                "sequence_number": seq,
+                "model": model_field,
+            })
+            seq += 1
+            yield _sse({
+                "type": "response.output_text.done",
+                "item_id": fake_id,
+                "output_index": fake_idx,
+                "content_index": 0,
+                "text": recovery_text,
+                "sequence_number": seq,
+                "model": model_field,
+            })
+            seq += 1
+            done_message_item = {
+                "id": fake_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": recovery_text,
+                    "annotations": [],
+                }],
+            }
+            yield _sse({
+                "type": "response.content_part.done",
+                "item_id": fake_id,
+                "output_index": fake_idx,
+                "content_index": 0,
+                "part": done_message_item["content"][0],
+                "sequence_number": seq,
+                "model": model_field,
+            })
+            seq += 1
+            yield _sse({
+                "type": "response.output_item.done",
+                "output_index": fake_idx,
+                "item": done_message_item,
+                "sequence_number": seq,
+                "model": model_field,
+            })
+            seq += 1
+
+            # Build the patched response.completed: status=completed,
+            # incomplete_details cleared, output[] extended with our message.
+            fixed_response = dict(response_obj)
+            fixed_response["status"] = "completed"
+            fixed_response["incomplete_details"] = None
+            output_list = list(response_obj.get("output") or [])
+            output_list.append(done_message_item)
+            fixed_response["output"] = output_list
+            fixed_completed = dict(completed_payload)
+            fixed_completed["response"] = fixed_response
+            fixed_completed["sequence_number"] = seq
+
+            record = _extract_usage(model_hint, fixed_response)
+            if record:
+                _broadcast_usage(record)
+            yield _sse(fixed_completed)
+            return
+
+    # No recovery needed (or recovery failed) — emit the original
+    # `response.completed` and broadcast its usage.
+    record = _extract_usage(model_hint, response_obj)
+    if record:
+        _broadcast_usage(record)
+    yield _sse(completed_payload)
 
 
 @app.post("/v1/responses")
@@ -758,6 +1062,41 @@ async def responses(request: Request):
 
     payload: dict = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
     if r.status_code < 400 and isinstance(payload, dict):
+        # Apply the same thinking-overflow recovery as the streaming path:
+        # if `status: incomplete` + `incomplete_details.reason: max_output_tokens`
+        # + no `message` item in `output[]`, run the two-tier fallback and
+        # patch the response in place. See `_recover_from_thinking_overflow`.
+        output_items = payload.get("output") or []
+        message_emitted = any(
+            isinstance(item, dict) and item.get("type") == "message"
+            for item in output_items
+        )
+        if _is_responses_overflow(payload, message_emitted):
+            partial_reasoning = ""
+            for item in output_items:
+                if isinstance(item, dict) and item.get("type") == "reasoning":
+                    for c in item.get("content") or []:
+                        if isinstance(c, dict):
+                            partial_reasoning += c.get("text") or ""
+            if partial_reasoning.strip():
+                recovery_text = await _recover_from_thinking_overflow(
+                    body, partial_reasoning, headers
+                )
+                if recovery_text:
+                    payload["status"] = "completed"
+                    payload["incomplete_details"] = None
+                    payload["output"] = list(output_items) + [{
+                        "id": f"msg_recovery_{int(time.time() * 1000)}",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": recovery_text,
+                            "annotations": [],
+                        }],
+                    }]
+
         record = _extract_usage(body.get("model"), payload)
         if record:
             _broadcast_usage(record)
