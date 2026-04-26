@@ -141,7 +141,7 @@ def run_one(
         },
     }
     if budget is not None:
-        body["extra_body"]["chat_template_kwargs"]["thinking_token_budget"] = budget
+        body["extra_body"]["thinking_token_budget"] = budget
 
     label = f"budget={budget}" if budget is not None else "no-budget"
     if not enable_thinking:

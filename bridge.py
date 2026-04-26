@@ -65,8 +65,10 @@ Configuration:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -336,6 +338,55 @@ _RECOVERY_MAX_TOKENS = 4096
 # used by truncated_content_recovery detection.
 _TERMINAL_PUNCT = (".", "?", "!", "。", "?", "!", "”", "\"", "'", "”")
 
+# Patterns for detecting "fake invocation" artifacts. When happy injects
+# `CHANGE_TITLE_INSTRUCTION` into the first turn, Qwen sometimes "calls"
+# the pseudo-tool by writing the invocation as PLAIN TEXT in the
+# assistant message — e.g. `happy__change_title(title="Initial Greeting")`
+# — instead of producing a real function_call item or a real answer to
+# the user. The bare invocation passes the "non-empty content" check
+# but is useless to the user, so silent-completion recovery has to flag
+# it as if no message had been emitted.
+_FAKE_INVOCATION_LINE_RE = re.compile(
+    r"^[a-zA-Z_][\w]*\s*\([^()]*(?:\([^()]*\)[^()]*)*\)\s*;?$"
+)
+_HAPPY_PSEUDO_TOOL_RE = re.compile(r"\bhappy__\w+\s*\(")
+
+
+def _is_fake_invocation_message_item(item: Any) -> bool:
+    """A responses-API output item that is a `message` whose entire text
+    content is a fake-invocation artifact. Used to strip such items
+    from the final output when recovery synthesizes a real answer."""
+    if not isinstance(item, dict) or item.get("type") != "message":
+        return False
+    text = ""
+    for part in item.get("content") or []:
+        if isinstance(part, dict) and part.get("type") == "output_text":
+            text += part.get("text") or ""
+    return _looks_like_fake_invocation(text)
+
+
+def _looks_like_fake_invocation(text: str) -> bool:
+    """The model emitted a function-call invocation as plain text.
+
+    Returns True when the entire emitted message is just a function call
+    expression (no surrounding prose) or contains a `happy__*(...)`
+    pseudo-tool invocation. Both shapes mean the model didn't actually
+    answer the user.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # Any happy__ pseudo-tool invocation in the text — never a real answer.
+    if _HAPPY_PSEUDO_TOOL_RE.search(stripped):
+        return True
+    # Whole message is a single function-call-looking expression.
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    return all(_FAKE_INVOCATION_LINE_RE.match(ln) for ln in lines)
+
 
 # =============================================================================
 # Rate limiting (token bucket + concurrency semaphore per upstream)
@@ -467,14 +518,31 @@ def _retry_policy(cfg: UpstreamConfig) -> AsyncRetrying:
 # Activity tracking + usage broadcast (for dashboard)
 # =============================================================================
 
-USAGE_RING_SIZE = int(os.environ.get("BRIDGE_USAGE_RING_SIZE", "32"))
-ACTIVITY_RING_SIZE = int(os.environ.get("BRIDGE_ACTIVITY_RING_SIZE", "20"))
+USAGE_RING_SIZE = int(os.environ.get("BRIDGE_USAGE_RING_SIZE", "5000"))
+ACTIVITY_RING_SIZE = int(os.environ.get("BRIDGE_ACTIVITY_RING_SIZE", "5000"))
 
 _usage_history: deque[dict] = deque(maxlen=USAGE_RING_SIZE)
 _usage_subscribers: set[asyncio.Queue[dict]] = set()
 _activity_history: deque[dict] = deque(maxlen=ACTIVITY_RING_SIZE)
 _activity_subscribers: set[asyncio.Queue[dict]] = set()
 _started_at = time.time()
+
+# Lifetime counters for recovery firings + retries. These are cheap so we
+# track them since process start; for time-windowed views the dashboard
+# aggregates from `_activity_history` / `_usage_history`.
+_recovery_counts: dict[str, int] = {
+    "thinking_overflow": 0,
+    "silent_completion": 0,
+    "fake_invocation": 0,
+    "truncated_content": 0,
+    "empty_with_stop_retry": 0,
+}
+_retry_counts: dict[str, int] = {"retried": 0, "gave_up": 0}
+
+
+def _record_recovery(kind: str) -> None:
+    if kind in _recovery_counts:
+        _recovery_counts[kind] += 1
 
 
 def _broadcast_usage(record: dict) -> None:
@@ -829,27 +897,35 @@ def _is_responses_overflow(response_obj: dict, message_emitted: bool) -> bool:
     return reason == "max_output_tokens" and not message_emitted
 
 
-def _is_responses_silent_completion(response_obj: dict, message_emitted: bool) -> bool:
-    """Detect a `status: completed` response that has no message item.
+def _is_responses_silent_completion(
+    response_obj: dict, message_emitted: bool, emitted_text: str = ""
+) -> bool:
+    """Detect a `status: completed` response that didn't actually answer.
 
-    Pattern observed with Codex sessions: happy injects the
-    `CHANGE_TITLE_INSTRUCTION` into the first user message of every
-    session, which makes Qwen3 reason about whether to call the title
-    tool. If the model decides the user just said "hello" with no real
-    task, it emits *only* the reasoning explaining its decision and
-    finishes the turn without producing an answer — the user sees a
-    successful but silent completion.
+    Two sub-cases:
 
-    Trigger: status=completed + no message item in output + we have
-    reasoning text to feed the recovery from. Same recovery as overflow:
-    `continue_final_message` with the reasoning prefilled, asking the
-    model to actually answer the user.
+    1. **No message item.** Happy injects `CHANGE_TITLE_INSTRUCTION` into
+       the first user message of every session. Qwen3 reasons about
+       whether to call the title tool, decides "no real task here",
+       emits *only* the reasoning, and finishes — the user sees a
+       successful but silent completion.
+
+    2. **Fake-invocation artifact.** Same scenario, except the model
+       *does* open a message envelope and writes the pseudo-tool
+       invocation (e.g. `happy__change_title(title="Initial Greeting")`)
+       as plain text. `message_emitted` is True but the content isn't
+       an answer.
+
+    Recovery (same as overflow): `continue_final_message` with the
+    reasoning prefilled, asking the model to actually answer the user.
     """
     if not isinstance(response_obj, dict):
         return False
     if response_obj.get("status") != "completed":
         return False
-    return not message_emitted
+    if not message_emitted:
+        return True
+    return _looks_like_fake_invocation(emitted_text)
 
 
 def _detect_truncated_message(message_text: str, finish_reason: str | None) -> bool:
@@ -908,6 +984,7 @@ async def _stream_responses(
     # State for vLLM #39426 SSE rewrite (fc_state) and overflow recovery.
     fc_state: dict[int, dict] = {}
     reasoning_accum = ""
+    message_text_accum = ""
     message_emitted = False
     completed_payload: dict | None = None
     do_parallel_fix = profile.has("parallel_tool_sse_fix")
@@ -988,6 +1065,7 @@ async def _stream_responses(
                     delta = payload.get("delta")
                     if isinstance(delta, str) and delta:
                         message_emitted = True
+                        message_text_accum += delta
 
                 # vLLM #39426 SSE rewrite (only when feature enabled)
                 if do_parallel_fix:
@@ -1067,12 +1145,20 @@ async def _stream_responses(
         response_obj, message_emitted
     )
     silent = profile.has("silent_completion_recovery") and _is_responses_silent_completion(
-        response_obj, message_emitted
+        response_obj, message_emitted, message_text_accum
     )
+    fake_invocation_kicker = silent and message_emitted  # message text was the artifact
     if (overflow or silent) and reasoning_accum.strip():
         recovered_text = await _recover_thinking_overflow(
             body, reasoning_accum, headers, profile
         )
+        if recovered_text:
+            if overflow:
+                _record_recovery("thinking_overflow")
+            elif fake_invocation_kicker:
+                _record_recovery("fake_invocation")
+            else:
+                _record_recovery("silent_completion")
 
     if recovered_text:
         # Synthesize the responses-API events for the recovered message
@@ -1167,9 +1253,12 @@ async def _stream_responses(
         fixed_response = dict(response_obj)
         fixed_response["status"] = "completed"
         fixed_response["incomplete_details"] = None
-        fixed_response["output"] = list(response_obj.get("output") or []) + [
-            done_message_item
+        cleaned_output = [
+            item
+            for item in (response_obj.get("output") or [])
+            if not _is_fake_invocation_message_item(item)
         ]
+        fixed_response["output"] = cleaned_output + [done_message_item]
         fixed_completed = dict(completed_payload)
         fixed_completed["response"] = fixed_response
         fixed_completed["sequence_number"] = seq
@@ -1309,20 +1398,148 @@ async def _post_responses_nonstream(
 app = FastAPI(title="resilient-llm-bridge")
 
 
+def _redact_body(body: Any, max_bytes: int = 4096) -> dict:
+    """Return a copy of the request body with bulky / sensitive fields
+    summarised so the dashboard can render it without leaking prompt
+    content. Keeps every top-level field so you can see the full shape
+    of what each client sends; replaces user/assistant/system content
+    with length placeholders.
+    """
+    if not isinstance(body, dict):
+        return {"_": "<non-dict body>"}
+
+    def _summary_str(s: str) -> str:
+        return f"<str {len(s)} chars>"
+
+    def _summary_content(c: Any) -> Any:
+        if isinstance(c, str):
+            return _summary_str(c)
+        if isinstance(c, list):
+            return f"<list[{len(c)}] (text/parts redacted)>"
+        return f"<{type(c).__name__}>"
+
+    def _redact_message(m: Any) -> Any:
+        if not isinstance(m, dict):
+            return m
+        out = dict(m)
+        if "content" in out:
+            out["content"] = _summary_content(out["content"])
+        return out
+
+    def _redact_input_item(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        out = dict(item)
+        if "content" in out:
+            out["content"] = _summary_content(out["content"])
+        if "input" in out:
+            out["input"] = _summary_content(out["input"])
+        return out
+
+    # Deep-copy: callers will mutate the original body via
+    # `_apply_request_transforms`. Without this we'd see post-transform
+    # values when the redacted body was supposed to capture the
+    # client-sent shape.
+    redacted = copy.deepcopy(body)
+    if isinstance(redacted.get("messages"), list):
+        redacted["messages"] = [_redact_message(m) for m in redacted["messages"]]
+    if isinstance(redacted.get("input"), list):
+        redacted["input"] = [_redact_input_item(i) for i in redacted["input"]]
+    elif isinstance(redacted.get("input"), str):
+        redacted["input"] = _summary_str(redacted["input"])
+    if isinstance(redacted.get("instructions"), str) and len(redacted["instructions"]) > 200:
+        redacted["instructions"] = _summary_str(redacted["instructions"])
+    if isinstance(redacted.get("system"), str) and len(redacted["system"]) > 200:
+        redacted["system"] = _summary_str(redacted["system"])
+    # Tools: keep names + count, drop big JSON schemas.
+    if isinstance(redacted.get("tools"), list):
+        names = []
+        for t in redacted["tools"]:
+            if isinstance(t, dict):
+                fn = t.get("function") or {}
+                names.append(t.get("name") or fn.get("name") or t.get("type") or "?")
+        redacted["tools"] = {"_count": len(redacted["tools"]), "_names": names[:20]}
+
+    encoded = json.dumps(redacted, ensure_ascii=False, default=str)
+    if len(encoded) > max_bytes:
+        # Body still too big after redaction — common for huge tool blobs
+        # or input arrays. Truncate the JSON string but keep it parseable
+        # by appending a sentinel.
+        return {"_truncated_to": max_bytes, "_preview": encoded[:max_bytes]}
+    return redacted
+
+
+def _inspect_thinking_params(body: Any, kind: str) -> dict:
+    """Snapshot the thinking-related fields a client sent on a request.
+
+    Used by the dashboard so we can see at a glance how Codex / opencode
+    / hermes wire up the budget — and immediately spot wrong placements
+    (e.g. `thinking_token_budget` under `chat_template_kwargs`, where
+    vLLM silently ignores it).
+
+    The returned shape is intentionally compact for the activity feed.
+    Only the fields that exist are included.
+    """
+    if not isinstance(body, dict):
+        return {}
+    out: dict = {}
+    if model := body.get("model"):
+        out["model"] = model
+    if (mt := body.get("max_tokens")) is not None:
+        out["max_tokens"] = mt
+    if (mot := body.get("max_output_tokens")) is not None:
+        out["max_output_tokens"] = mot
+    # /v1/responses-style reasoning hint (Codex sends this).
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        if (eff := reasoning.get("effort")) is not None:
+            out["reasoning.effort"] = eff
+        if (mrt := reasoning.get("max_tokens")) is not None:
+            out["reasoning.max_tokens"] = mrt
+    # chat/completions: top-level reasoning_effort.
+    if (eff := body.get("reasoning_effort")) is not None:
+        out["reasoning_effort"] = eff
+    extra = body.get("extra_body")
+    if isinstance(extra, dict):
+        # Top-level extra_body.thinking_token_budget — the placement that
+        # actually works on vLLM.
+        if (b := extra.get("thinking_token_budget")) is not None:
+            out["extra_body.thinking_token_budget"] = b
+        ctk = extra.get("chat_template_kwargs")
+        if isinstance(ctk, dict):
+            if (et := ctk.get("enable_thinking")) is not None:
+                out["chat_template_kwargs.enable_thinking"] = et
+            # The WRONG placements — flag them so the dashboard makes
+            # the bug obvious.
+            for wrong in ("thinking_token_budget", "thinking_budget"):
+                if (b := ctk.get(wrong)) is not None:
+                    out[f"chat_template_kwargs.{wrong} (DROPPED)"] = b
+    return out
+
+
 def _record_activity(
-    profile: ProfileConfig, path: str, method: str, status: int, duration_ms: float
+    profile: ProfileConfig,
+    path: str,
+    method: str,
+    status: int,
+    duration_ms: float,
+    params: dict | None = None,
+    body: dict | None = None,
 ) -> None:
-    _broadcast_activity(
-        {
-            "ts": time.time(),
-            "profile": profile.name,
-            "upstream": profile.upstream,
-            "path": path,
-            "method": method,
-            "status": status,
-            "duration_ms": round(duration_ms, 1),
-        }
-    )
+    record: dict = {
+        "ts": time.time(),
+        "profile": profile.name,
+        "upstream": profile.upstream,
+        "path": path,
+        "method": method,
+        "status": status,
+        "duration_ms": round(duration_ms, 1),
+    }
+    if params:
+        record["params"] = params
+    if body is not None:
+        record["body"] = body
+    _broadcast_activity(record)
 
 
 @app.get("/health")
@@ -1333,6 +1550,105 @@ async def health() -> dict:
         "profiles": list(CONFIG.profiles.keys()),
         "upstreams": [g.snapshot() for g in _UPSTREAM_GATES.values()],
     }
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (len(s) - 1) * pct
+    lo, hi = int(k), min(int(k) + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict:
+    """Aggregate a slice of activity + usage records into a stats blob."""
+    durations = [r["duration_ms"] for r in activity_rows if "duration_ms" in r]
+    statuses = [r.get("status", 0) for r in activity_rows]
+    by_profile: dict[str, dict] = {}
+    by_model: dict[str, dict] = {}
+
+    def _bucket(d: dict, key: str) -> dict:
+        if key not in d:
+            d[key] = {
+                "requests": 0,
+                "errors": 0,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "duration_ms": [],
+            }
+        return d[key]
+
+    for row in activity_rows:
+        b = _bucket(by_profile, row.get("profile") or "?")
+        b["requests"] += 1
+        if (row.get("status") or 0) >= 400:
+            b["errors"] += 1
+        if "duration_ms" in row:
+            b["duration_ms"].append(row["duration_ms"])
+    for row in usage_rows:
+        b_p = _bucket(by_profile, row.get("profile") or "?")
+        b_m = _bucket(by_model, row.get("model") or "?")
+        for b in (b_p, b_m):
+            b["tokens_in"] += int(row.get("input_tokens") or 0)
+            b["tokens_out"] += int(row.get("output_tokens") or 0)
+
+    # Finalize percentiles per bucket.
+    def _finalize(d: dict) -> dict:
+        for key, b in d.items():
+            ds = b.pop("duration_ms")
+            b["p50_ms"] = round(_percentile(ds, 0.50), 1)
+            b["p95_ms"] = round(_percentile(ds, 0.95), 1)
+        return d
+
+    return {
+        "requests": len(activity_rows),
+        "errors": sum(1 for s in statuses if s >= 400),
+        "errors_4xx": sum(1 for s in statuses if 400 <= s < 500),
+        "errors_5xx": sum(1 for s in statuses if s >= 500),
+        "tokens_in": sum(int(r.get("input_tokens") or 0) for r in usage_rows),
+        "tokens_out": sum(int(r.get("output_tokens") or 0) for r in usage_rows),
+        "p50_ms": round(_percentile(durations, 0.50), 1),
+        "p95_ms": round(_percentile(durations, 0.95), 1),
+        "p99_ms": round(_percentile(durations, 0.99), 1),
+        "by_profile": _finalize(by_profile),
+        "by_model": _finalize(by_model),
+    }
+
+
+@app.get("/stats")
+async def stats() -> dict:
+    now = time.time()
+    windows = {"1m": 60.0, "5m": 300.0, "15m": 900.0, "1h": 3600.0}
+    activity = list(_activity_history)
+    usage = list(_usage_history)
+    out: dict = {
+        "now": now,
+        "uptime_s": round(now - _started_at, 1),
+        "lifetime": {
+            "requests": len(activity),
+            "tokens_in": sum(int(r.get("input_tokens") or 0) for r in usage),
+            "tokens_out": sum(int(r.get("output_tokens") or 0) for r in usage),
+            "errors": sum(1 for r in activity if (r.get("status") or 0) >= 400),
+            "recoveries": dict(_recovery_counts),
+        },
+        "windows": {},
+        "upstreams": [g.snapshot() for g in _UPSTREAM_GATES.values()],
+        "profiles": [
+            {"name": p.name, "upstream": p.upstream, "features": sorted(p.features)}
+            for p in CONFIG.profiles.values()
+        ],
+        "history": {
+            "activity": activity[-200:],
+            "usage": usage[-200:],
+        },
+    }
+    for label, span in windows.items():
+        cutoff = now - span
+        a = [r for r in activity if r.get("ts", 0) >= cutoff]
+        u = [r for r in usage if r.get("ts", 0) >= cutoff]
+        out["windows"][label] = _aggregate_window(a, u)
+    return out
 
 
 @app.get("/usage/stream")
@@ -1400,6 +1716,8 @@ async def _handle_responses(
 ) -> StreamingResponse | JSONResponse:
     started = time.monotonic()
     body = await request.json()
+    inspected = _inspect_thinking_params(body, "responses")
+    redacted = _redact_body(body)
     body = _apply_request_transforms(body, profile, kind="responses")
     want_stream = bool(body.get("stream", False))
     headers = _build_outgoing_headers(request)
@@ -1413,6 +1731,8 @@ async def _handle_responses(
                 "POST",
                 200,
                 (time.monotonic() - started) * 1000,
+                params=inspected,
+                body=redacted,
             )
         return StreamingResponse(
             _gen(),
@@ -1428,6 +1748,7 @@ async def _handle_responses(
         # we want recovery to fire in that case too.
         output_items = payload.get("output") or []
         message_emitted = False
+        message_text_accum = ""
         for item in output_items:
             if not isinstance(item, dict) or item.get("type") != "message":
                 continue
@@ -1437,16 +1758,16 @@ async def _handle_responses(
             for part in content:
                 if not isinstance(part, dict):
                     continue
-                if part.get("type") == "output_text" and (part.get("text") or "").strip():
-                    message_emitted = True
-                    break
-            if message_emitted:
-                break
+                if part.get("type") == "output_text":
+                    text = part.get("text") or ""
+                    if text.strip():
+                        message_emitted = True
+                        message_text_accum += text
         overflow_ns = profile.has("thinking_overflow_recovery") and _is_responses_overflow(
             payload, message_emitted
         )
         silent_ns = profile.has("silent_completion_recovery") and _is_responses_silent_completion(
-            payload, message_emitted
+            payload, message_emitted, message_text_accum
         )
         if overflow_ns or silent_ns:
             partial_reasoning = ""
@@ -1460,9 +1781,24 @@ async def _handle_responses(
                     body, partial_reasoning, headers, profile
                 )
                 if recovered:
+                    if overflow_ns:
+                        _record_recovery("thinking_overflow")
+                    elif message_emitted:
+                        _record_recovery("fake_invocation")
+                    else:
+                        _record_recovery("silent_completion")
+                    # Drop any fake-invocation message item from the
+                    # original output so the client doesn't render
+                    # `happy__change_title(...)` alongside the real
+                    # answer. Reasoning/function_call items stay.
+                    cleaned_items = [
+                        item
+                        for item in output_items
+                        if not _is_fake_invocation_message_item(item)
+                    ]
                     payload["status"] = "completed"
                     payload["incomplete_details"] = None
-                    payload["output"] = list(output_items) + [
+                    payload["output"] = cleaned_items + [
                         {
                             "id": f"msg_recovery_{int(time.time() * 1000)}",
                             "type": "message",
@@ -1486,6 +1822,8 @@ async def _handle_responses(
         "POST",
         status,
         (time.monotonic() - started) * 1000,
+        params=inspected,
+        body=redacted,
     )
     return JSONResponse(content=payload, status_code=status)
 
@@ -1495,6 +1833,8 @@ async def _handle_chat_completions(
 ) -> StreamingResponse | JSONResponse:
     started = time.monotonic()
     body = await request.json()
+    inspected = _inspect_thinking_params(body, "chat_completions")
+    redacted = _redact_body(body)
     body = _apply_request_transforms(body, profile, kind="chat_completions")
     want_stream = bool(body.get("stream", False))
     headers = _build_outgoing_headers(request)
@@ -1508,6 +1848,8 @@ async def _handle_chat_completions(
                 "POST",
                 200,
                 (time.monotonic() - started) * 1000,
+                params=inspected,
+                body=redacted,
             )
         return StreamingResponse(
             _gen(),
@@ -1554,6 +1896,7 @@ async def _handle_chat_completions(
             if extra:
                 message["content"] = extra
                 choice["finish_reason"] = "stop"
+                _record_recovery("truncated_content")
         # Empty + stop retry: provider hiccup or stream parsing miss.
         # One cheap retry — if it returns the same empty result we keep
         # the original (don't loop). Tool-call responses are skipped
@@ -1575,6 +1918,7 @@ async def _handle_chat_completions(
                     retry_content = retry_message.get("content") or ""
                     if retry_content.strip():
                         payload = retry_payload
+                        _record_recovery("empty_with_stop_retry")
             except (httpx.HTTPError, ValueError):
                 pass  # keep original empty response
         record = _extract_usage(profile.name, body.get("model"), payload)
@@ -1586,6 +1930,8 @@ async def _handle_chat_completions(
         "POST",
         last_status,
         (time.monotonic() - started) * 1000,
+        params=inspected,
+        body=redacted,
     )
     return JSONResponse(content=payload, status_code=last_status)
 
@@ -1699,21 +2045,6 @@ async def default_passthrough(path: str, request: Request):
 
 
 def _dashboard_html() -> str:
-    profiles_rows = "\n".join(
-        f"""<tr><td>{p.name}</td><td>{p.upstream}</td>"""
-        f"""<td><code>{', '.join(sorted(p.features)) or '—'}</code></td></tr>"""
-        for p in CONFIG.profiles.values()
-    )
-    upstreams_rows = "\n".join(
-        f"""<tr id="up-{u.cfg.name}">
-            <td>{u.cfg.name}</td>
-            <td><code>{u.cfg.url}</code></td>
-            <td><span class="rpm">{u.cfg.rate_limit_rpm}</span> rpm</td>
-            <td><span class="conc">{u.cfg.rate_limit_concurrent}</span> max</td>
-            <td><span class="inflight">0</span> in flight</td>
-        </tr>"""
-        for u in _UPSTREAM_GATES.values()
-    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1721,127 +2052,529 @@ def _dashboard_html() -> str:
   <title>resilient-llm-bridge :: {DEFAULT_PORT}</title>
   <style>
     :root {{
-      --bg: #0a0a0a; --fg: #d4d4d4; --dim: #6e7681;
-      --accent: #79c0ff; --good: #56d364; --warn: #f0883e;
+      --bg: #0a0a0a; --panel: #111; --panel2: #161616;
+      --fg: #d4d4d4; --dim: #6e7681; --line: #1f1f1f;
+      --accent: #79c0ff; --accent2: #d2a8ff;
+      --good: #56d364; --warn: #f0883e; --bad: #ff7b72;
     }}
-    body {{ background: var(--bg); color: var(--fg); font-family:
-      ui-monospace, "SF Mono", Menlo, Consolas, monospace; padding: 1.5rem;
-      max-width: 1100px; margin: 0 auto; font-size: 13px; line-height: 1.5; }}
-    h1 {{ font-size: 1.4rem; margin: 0; color: var(--accent); }}
-    h2 {{ font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.1em;
-      color: var(--dim); margin-top: 2rem; border-bottom: 1px solid #1f1f1f;
-      padding-bottom: 0.4rem; }}
-    .header {{ display: flex; align-items: baseline; gap: 1rem; }}
-    .port {{ color: var(--good); font-size: 1.1rem; }}
-    .uptime {{ color: var(--dim); font-size: 0.9rem; margin-left: auto; }}
-    table {{ width: 100%; border-collapse: collapse; margin-top: 0.5rem; }}
-    td, th {{ text-align: left; padding: 0.4rem 0.6rem; border-bottom:
-      1px solid #161616; vertical-align: top; }}
-    th {{ color: var(--dim); font-weight: normal; }}
-    code {{ background: #141414; padding: 0.1rem 0.3rem; border-radius: 2px;
-      font-size: 0.85em; }}
-    .activity-status-2xx {{ color: var(--good); }}
-    .activity-status-4xx {{ color: var(--warn); }}
-    .activity-status-5xx {{ color: #ff7b72; }}
-    .footer {{ margin-top: 3rem; color: var(--dim); font-size: 0.85em; }}
-    .live-counter {{ font-size: 1.6rem; color: var(--accent); }}
-    .live-counter small {{ color: var(--dim); font-size: 0.55em; margin-left: 0.6rem; }}
+    * {{ box-sizing: border-box; }}
+    body {{ background: var(--bg); color: var(--fg);
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      padding: 1.2rem; max-width: 1500px; margin: 0 auto;
+      font-size: 13px; line-height: 1.45; }}
+    h1 {{ font-size: 1.5rem; margin: 0; color: var(--accent); letter-spacing: -0.5px; }}
+    h2 {{ font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.12em;
+      color: var(--dim); margin: 1.6rem 0 0.5rem 0;
+      border-bottom: 1px solid var(--line); padding-bottom: 0.4rem; font-weight: 500; }}
+    .header {{ display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; }}
+    .port {{ color: var(--good); font-size: 1.1rem; font-weight: 500; }}
+    .uptime {{ color: var(--dim); font-size: 0.9rem; }}
+    .pulse {{ display: inline-block; width: 8px; height: 8px;
+      background: var(--good); border-radius: 50%; margin-right: 0.4rem;
+      animation: pulse 1.6s ease-in-out infinite; }}
+    @keyframes pulse {{ 0%, 100% {{ opacity: 0.4; }} 50% {{ opacity: 1; }} }}
+    .uptime-bar {{ flex: 1; }}
+
+    /* KPI grid */
+    .kpis {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
+      gap: 0.6rem; margin-top: 0.5rem; }}
+    .kpi {{ background: var(--panel); border: 1px solid var(--line);
+      border-radius: 6px; padding: 0.75rem 0.9rem; position: relative; overflow: hidden; }}
+    .kpi-label {{ color: var(--dim); font-size: 0.7rem; text-transform: uppercase;
+      letter-spacing: 0.08em; }}
+    .kpi-value {{ font-size: 1.55rem; color: var(--accent); font-weight: 500;
+      margin-top: 0.2rem; line-height: 1.1; }}
+    .kpi-sub {{ color: var(--dim); font-size: 0.78rem; margin-top: 0.3rem; }}
+    .kpi.good .kpi-value {{ color: var(--good); }}
+    .kpi.warn .kpi-value {{ color: var(--warn); }}
+    .kpi.bad .kpi-value {{ color: var(--bad); }}
+    .kpi.accent2 .kpi-value {{ color: var(--accent2); }}
+    .kpi-spark {{ position: absolute; bottom: 0; left: 0; right: 0;
+      opacity: 0.5; height: 30px; }}
+
+    /* Window selector */
+    .windows {{ display: inline-flex; gap: 0.3rem; margin-left: auto; }}
+    .windows button {{ background: transparent; border: 1px solid var(--line);
+      color: var(--dim); padding: 0.2rem 0.6rem; border-radius: 4px;
+      cursor: pointer; font: inherit; font-size: 0.75rem; }}
+    .windows button.active {{ color: var(--accent); border-color: var(--accent); }}
+    .windows button:hover {{ color: var(--fg); }}
+
+    /* Two-column section */
+    .grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; margin-top: 0.5rem; }}
+    @media (max-width: 900px) {{ .grid2 {{ grid-template-columns: 1fr; }} }}
+    .card {{ background: var(--panel); border: 1px solid var(--line);
+      border-radius: 6px; padding: 0.9rem 1rem; }}
+    .card h3 {{ margin: 0 0 0.5rem 0; font-size: 0.78rem;
+      color: var(--dim); text-transform: uppercase; letter-spacing: 0.08em;
+      font-weight: 500; }}
+
+    /* Tables */
+    table {{ width: 100%; border-collapse: collapse; }}
+    td, th {{ text-align: left; padding: 0.35rem 0.5rem; border-bottom:
+      1px solid var(--panel2); vertical-align: top; }}
+    th {{ color: var(--dim); font-weight: normal; font-size: 0.78rem; }}
+    .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+    code {{ background: var(--panel2); padding: 0.08rem 0.32rem; border-radius: 2px;
+      font-size: 0.86em; }}
+
+    /* Status colors */
+    .status-2xx {{ color: var(--good); }}
+    .status-4xx {{ color: var(--warn); }}
+    .status-5xx {{ color: var(--bad); }}
+    .lat-fast {{ color: var(--good); }}
+    .lat-mid {{ color: var(--warn); }}
+    .lat-slow {{ color: var(--bad); }}
+
+    /* Param chips */
+    .params {{ font-size: 0.85em; color: var(--dim); }}
+    .params .pk {{ color: var(--accent); }}
+    .params .pv {{ color: var(--fg); }}
+    .params .dropped {{ color: var(--bad); font-weight: 500; }}
+    .params .pair {{ display: inline-block; margin-right: 0.6rem;
+      background: var(--panel2); padding: 0.05rem 0.35rem; border-radius: 3px; }}
+    .activity-row {{ cursor: pointer; }}
+    .activity-row:hover {{ background: rgba(121, 192, 255, 0.04); }}
+    .activity-row.expanded {{ background: rgba(121, 192, 255, 0.06); }}
+    .body-row {{ display: none; }}
+    .body-row.expanded {{ display: table-row; }}
+    .body-pre {{ background: var(--panel2); border-radius: 4px;
+      padding: 0.6rem 0.8rem; font-size: 0.82em; line-height: 1.4;
+      white-space: pre-wrap; word-break: break-word; max-height: 500px;
+      overflow-y: auto; color: var(--fg); }}
+    .body-pre .jk {{ color: var(--accent); }}
+    .body-pre .js {{ color: var(--good); }}
+    .body-pre .jn {{ color: var(--accent2); }}
+    .body-pre .jbool {{ color: var(--warn); }}
+    .body-pre .jnull {{ color: var(--dim); }}
+
+    /* Sparkline */
+    .spark {{ display: block; width: 100%; height: 40px; }}
+
+    /* Recovery card */
+    .recoveries {{ display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 0.4rem; }}
+    .rec {{ background: var(--panel2); border-radius: 4px; padding: 0.5rem 0.6rem; }}
+    .rec-name {{ color: var(--dim); font-size: 0.7rem; text-transform: uppercase;
+      letter-spacing: 0.05em; }}
+    .rec-count {{ color: var(--accent2); font-size: 1.1rem; margin-top: 0.1rem; }}
+
+    /* Upstream rate bars */
+    .rate-bar {{ background: var(--panel2); height: 6px; border-radius: 3px;
+      overflow: hidden; margin-top: 0.3rem; }}
+    .rate-bar-fill {{ background: var(--accent); height: 100%;
+      transition: width 0.3s ease; }}
+    .rate-bar-fill.busy {{ background: var(--warn); }}
+    .rate-bar-fill.full {{ background: var(--bad); }}
+
+    /* Live ticker */
+    .ticker {{ display: flex; align-items: center; gap: 0.5rem; }}
+    .ticker .v {{ font-size: 1.7rem; color: var(--accent); font-weight: 500; }}
+    .ticker .v.small {{ font-size: 1.05rem; color: var(--accent2); }}
+    .ticker .lbl {{ color: var(--dim); font-size: 0.78rem; }}
+    .flash {{ animation: flash 0.8s ease; }}
+    @keyframes flash {{ 0% {{ background: rgba(86, 211, 100, 0.15); }} 100% {{ background: transparent; }} }}
+
+    .footer {{ margin-top: 2rem; color: var(--dim); font-size: 0.8em;
+      border-top: 1px solid var(--line); padding-top: 0.8rem; }}
+    .footer code {{ font-size: 0.95em; }}
+    .empty {{ color: var(--dim); padding: 1rem; text-align: center; }}
   </style>
 </head>
 <body>
   <div class="header">
     <h1>resilient-llm-bridge</h1>
     <span class="port">:{DEFAULT_PORT}</span>
-    <span class="uptime" id="uptime">uptime —</span>
+    <span class="uptime"><span class="pulse"></span><span id="uptime">uptime —</span></span>
+    <div class="uptime-bar"></div>
+    <div class="windows">
+      <button data-win="1m">1m</button>
+      <button data-win="5m" class="active">5m</button>
+      <button data-win="15m">15m</button>
+      <button data-win="1h">1h</button>
+      <button data-win="lifetime">all</button>
+    </div>
   </div>
 
-  <h2>Live token counter</h2>
-  <div class="live-counter" id="counter">— <small>waiting for first completion</small></div>
+  <h2>Overview</h2>
+  <div class="kpis">
+    <div class="kpi"><div class="kpi-label">requests</div>
+      <div class="kpi-value" id="kpi-req">—</div>
+      <div class="kpi-sub" id="kpi-rps">— rps</div>
+      <svg class="kpi-spark" id="spark-req" preserveAspectRatio="none" viewBox="0 0 100 30"></svg>
+    </div>
+    <div class="kpi accent2"><div class="kpi-label">tokens out</div>
+      <div class="kpi-value" id="kpi-tok-out">—</div>
+      <div class="kpi-sub" id="kpi-tok-rate">— tok/s</div>
+      <svg class="kpi-spark" id="spark-tok" preserveAspectRatio="none" viewBox="0 0 100 30"></svg>
+    </div>
+    <div class="kpi"><div class="kpi-label">tokens in</div>
+      <div class="kpi-value" id="kpi-tok-in">—</div>
+      <div class="kpi-sub" id="kpi-tok-ratio">— ratio</div>
+    </div>
+    <div class="kpi"><div class="kpi-label">latency p50</div>
+      <div class="kpi-value" id="kpi-p50">—</div>
+      <div class="kpi-sub" id="kpi-p95">p95 —</div>
+      <svg class="kpi-spark" id="spark-lat" preserveAspectRatio="none" viewBox="0 0 100 30"></svg>
+    </div>
+    <div class="kpi good"><div class="kpi-label">success rate</div>
+      <div class="kpi-value" id="kpi-success">—</div>
+      <div class="kpi-sub" id="kpi-errors">— errors</div>
+    </div>
+    <div class="kpi accent2"><div class="kpi-label">recoveries fired</div>
+      <div class="kpi-value" id="kpi-rec">—</div>
+      <div class="kpi-sub" id="kpi-rec-sub">since start</div>
+    </div>
+  </div>
+
+  <h2>Live</h2>
+  <div class="grid2">
+    <div class="card">
+      <h3>Last completion</h3>
+      <div class="ticker">
+        <div class="v" id="live-tokens">—</div>
+        <div>
+          <div class="lbl" id="live-meta">waiting for first completion</div>
+          <div class="lbl" id="live-rate">— tok/s</div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Recoveries (lifetime)</h3>
+      <div class="recoveries" id="rec-grid"></div>
+    </div>
+  </div>
+
+  <h2>Per-profile</h2>
+  <div class="card">
+    <table>
+      <thead><tr>
+        <th>profile</th><th>upstream</th><th>features</th>
+        <th class="num">req</th><th class="num">errors</th>
+        <th class="num">tok in</th><th class="num">tok out</th>
+        <th class="num">p50</th><th class="num">p95</th>
+      </tr></thead>
+      <tbody id="profiles-body"><tr><td colspan="9" class="empty">loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <h2>Per-model</h2>
+  <div class="card">
+    <table>
+      <thead><tr>
+        <th>model</th>
+        <th class="num">req</th><th class="num">errors</th>
+        <th class="num">tok in</th><th class="num">tok out</th>
+        <th class="num">p50</th><th class="num">p95</th>
+      </tr></thead>
+      <tbody id="models-body"><tr><td colspan="7" class="empty">no completions yet</td></tr></tbody>
+    </table>
+  </div>
 
   <h2>Upstreams</h2>
-  <table>
-    <thead><tr><th>name</th><th>url</th><th>rpm</th><th>concurrent</th><th>now</th></tr></thead>
-    <tbody>{upstreams_rows}</tbody>
-  </table>
-
-  <h2>Profiles</h2>
-  <table>
-    <thead><tr><th>profile</th><th>upstream</th><th>features</th></tr></thead>
-    <tbody>{profiles_rows}</tbody>
-  </table>
+  <div class="card">
+    <table>
+      <thead><tr>
+        <th>name</th><th>url</th>
+        <th>rpm cap</th><th>concurrent</th><th>in flight</th><th>utilization</th>
+      </tr></thead>
+      <tbody id="upstreams-body"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
+    </table>
+  </div>
 
   <h2>Recent activity</h2>
-  <table>
-    <thead><tr><th>time</th><th>profile</th><th>method</th><th>path</th><th>status</th><th>ms</th></tr></thead>
-    <tbody id="activity"><tr><td colspan="6" style="color: var(--dim);">no activity yet</td></tr></tbody>
-  </table>
+  <div class="card">
+    <table>
+      <thead><tr>
+        <th>time</th><th>profile</th><th>method</th>
+        <th>path</th><th>status</th><th class="num">ms</th>
+        <th>thinking params</th>
+      </tr></thead>
+      <tbody id="activity"><tr><td colspan="7" class="empty">no activity yet</td></tr></tbody>
+    </table>
+  </div>
 
   <div class="footer">
     Endpoints: <code>/{{profile}}/v1/responses</code>,
     <code>/{{profile}}/v1/chat/completions</code>,
     <code>/v1/...</code> (default profile).
-    Upstreams + profiles defined in <code>~/.config/resilient-llm-bridge/config.yaml</code>.
+    Config: <code>~/.config/resilient-llm-bridge/config.yaml</code>.
+    Live feeds: <a href="/usage/stream" style="color:var(--accent)">/usage/stream</a>,
+    <a href="/activity/stream" style="color:var(--accent)">/activity/stream</a>,
+    <a href="/stats" style="color:var(--accent)">/stats</a>.
   </div>
 
   <script>
-    const counter = document.getElementById('counter');
-    const uptimeEl = document.getElementById('uptime');
-    const activityEl = document.getElementById('activity');
-    let activityRows = [];
+    const $ = id => document.getElementById(id);
+    const fmt = (n) => Number(n || 0).toLocaleString();
+    const fmtMs = (ms) => ms < 1000 ? `${{Math.round(ms)}}ms` : `${{(ms/1000).toFixed(2)}}s`;
+    const fmtTime = (ts) => new Date(ts * 1000).toLocaleTimeString();
 
-    function fmtTime(ts) {{
-      return new Date(ts * 1000).toLocaleTimeString();
+    function escapeHtml(s) {{
+      return String(s).replace(/[&<>"']/g, c => ({{
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+      }})[c]);
     }}
     function statusClass(s) {{
-      if (s >= 500) return 'activity-status-5xx';
-      if (s >= 400) return 'activity-status-4xx';
-      return 'activity-status-2xx';
+      if (s >= 500) return 'status-5xx';
+      if (s >= 400) return 'status-4xx';
+      return 'status-2xx';
+    }}
+    function latClass(ms) {{
+      if (ms < 1000) return 'lat-fast';
+      if (ms < 5000) return 'lat-mid';
+      return 'lat-slow';
+    }}
+    function renderParams(p) {{
+      if (!p || typeof p !== 'object') return '<span class="params">—</span>';
+      const keys = Object.keys(p);
+      if (keys.length === 0) return '<span class="params">—</span>';
+      return '<span class="params">' + keys.map(k => {{
+        const cls = k.includes('DROPPED') ? 'pk dropped' : 'pk';
+        return `<span class="pair"><span class="${{cls}}">${{escapeHtml(k)}}</span>=<span class="pv">${{escapeHtml(p[k])}}</span></span>`;
+      }}).join('') + '</span>';
     }}
 
-    async function refreshHealth() {{
+    // Sparkline renderer (SVG path from points 0..1)
+    function spark(svgId, values, color) {{
+      const svg = $(svgId);
+      if (!svg) return;
+      if (!values || values.length === 0) {{ svg.innerHTML = ''; return; }}
+      const max = Math.max(...values, 1);
+      const w = 100, h = 30;
+      const step = values.length > 1 ? w / (values.length - 1) : 0;
+      const pts = values.map((v, i) => `${{(i * step).toFixed(2)}},${{(h - (v / max) * h * 0.95 - 1).toFixed(2)}}`);
+      const line = 'M ' + pts.join(' L ');
+      const fill = `${{line}} L ${{w}},${{h}} L 0,${{h}} Z`;
+      svg.innerHTML =
+        `<path d="${{fill}}" fill="${{color}}" opacity="0.15"/>` +
+        `<path d="${{line}}" fill="none" stroke="${{color}}" stroke-width="1.2"/>`;
+    }}
+
+    // Bin events into N time buckets covering `windowSec` seconds.
+    function bin(events, windowSec, buckets, valueFn) {{
+      const now = Date.now() / 1000;
+      const start = now - windowSec;
+      const out = new Array(buckets).fill(0);
+      const span = windowSec / buckets;
+      for (const ev of events) {{
+        const t = ev.ts;
+        if (t < start) continue;
+        const idx = Math.min(buckets - 1, Math.max(0, Math.floor((t - start) / span)));
+        out[idx] += valueFn(ev);
+      }}
+      return out;
+    }}
+
+    let activeWindow = '5m';
+    let lastStats = null;
+    let activityRows = [];
+    let usageRows = [];
+
+    document.querySelectorAll('.windows button').forEach(btn => {{
+      btn.addEventListener('click', () => {{
+        document.querySelectorAll('.windows button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        activeWindow = btn.dataset.win;
+        if (lastStats) renderStats(lastStats);
+      }});
+    }});
+
+    function pickWindow(stats) {{
+      if (activeWindow === 'lifetime') {{
+        const lt = stats.lifetime;
+        return {{
+          requests: lt.requests, errors: lt.errors,
+          tokens_in: lt.tokens_in, tokens_out: lt.tokens_out,
+          p50_ms: 0, p95_ms: 0, p99_ms: 0,
+          by_profile: {{}}, by_model: {{}},
+        }};
+      }}
+      return stats.windows[activeWindow] || {{}};
+    }}
+
+    function windowSeconds() {{
+      return {{ '1m': 60, '5m': 300, '15m': 900, '1h': 3600, 'lifetime': 3600 }}[activeWindow] || 300;
+    }}
+
+    function renderStats(stats) {{
+      const w = pickWindow(stats);
+      const span = windowSeconds();
+      $('kpi-req').textContent = fmt(w.requests);
+      $('kpi-rps').textContent = `${{(w.requests / span).toFixed(2)}} rps · ${{w.errors_4xx || 0}}×4xx · ${{w.errors_5xx || 0}}×5xx`;
+      $('kpi-tok-out').textContent = fmt(w.tokens_out);
+      $('kpi-tok-rate').textContent = `${{Math.round(w.tokens_out / span)}} tok/s avg`;
+      $('kpi-tok-in').textContent = fmt(w.tokens_in);
+      const ratio = w.tokens_in > 0 ? (w.tokens_out / w.tokens_in).toFixed(2) : '—';
+      $('kpi-tok-ratio').textContent = `out/in ${{ratio}}`;
+      $('kpi-p50').textContent = fmtMs(w.p50_ms || 0);
+      $('kpi-p95').textContent = `p95 ${{fmtMs(w.p95_ms || 0)}} · p99 ${{fmtMs(w.p99_ms || 0)}}`;
+      const successRate = w.requests > 0
+        ? (((w.requests - w.errors) / w.requests) * 100).toFixed(1) + '%'
+        : '—';
+      $('kpi-success').textContent = successRate;
+      $('kpi-errors').textContent = `${{w.errors || 0}} errors / ${{w.requests || 0}} req`;
+      const totalRec = Object.values(stats.lifetime.recoveries).reduce((a, b) => a + b, 0);
+      $('kpi-rec').textContent = fmt(totalRec);
+      const recParts = Object.entries(stats.lifetime.recoveries)
+        .filter(([_, v]) => v > 0)
+        .map(([k, v]) => `${{k.replace(/_/g, ' ')}}: ${{v}}`);
+      $('kpi-rec-sub').textContent = recParts.length ? recParts.join(' · ') : 'none yet';
+
+      // Sparklines from history
+      const sec = activeWindow === 'lifetime' ? 3600 : span;
+      const reqBins = bin(activityRows, sec, 24, _ => 1);
+      const tokBins = bin(usageRows, sec, 24, e => (e.output_tokens || 0));
+      const latBins = bin(activityRows, sec, 24, e => (e.duration_ms || 0));
+      // Convert sums to averages for latency.
+      const latCounts = bin(activityRows, sec, 24, _ => 1);
+      const latAvg = latBins.map((s, i) => latCounts[i] ? s / latCounts[i] : 0);
+      spark('spark-req', reqBins, '#79c0ff');
+      spark('spark-tok', tokBins, '#d2a8ff');
+      spark('spark-lat', latAvg, '#f0883e');
+
+      // Recoveries grid
+      const rec = stats.lifetime.recoveries || {{}};
+      $('rec-grid').innerHTML = Object.entries(rec).map(([k, v]) =>
+        `<div class="rec"><div class="rec-name">${{escapeHtml(k.replace(/_/g, ' '))}}</div>` +
+        `<div class="rec-count">${{fmt(v)}}</div></div>`
+      ).join('');
+
+      // Per-profile table — merge profile config with current-window stats.
+      const byProf = w.by_profile || {{}};
+      const profRows = stats.profiles.map(p => {{
+        const b = byProf[p.name] || {{requests:0, errors:0, tokens_in:0, tokens_out:0, p50_ms:0, p95_ms:0}};
+        const feats = p.features.length ? p.features.join(', ') : '—';
+        return `<tr><td>${{escapeHtml(p.name)}}</td><td>${{escapeHtml(p.upstream)}}</td>` +
+          `<td><code>${{escapeHtml(feats)}}</code></td>` +
+          `<td class="num">${{fmt(b.requests)}}</td>` +
+          `<td class="num ${{b.errors>0?'status-4xx':''}}">${{fmt(b.errors)}}</td>` +
+          `<td class="num">${{fmt(b.tokens_in)}}</td>` +
+          `<td class="num">${{fmt(b.tokens_out)}}</td>` +
+          `<td class="num ${{latClass(b.p50_ms)}}">${{fmtMs(b.p50_ms)}}</td>` +
+          `<td class="num ${{latClass(b.p95_ms)}}">${{fmtMs(b.p95_ms)}}</td></tr>`;
+      }}).join('');
+      $('profiles-body').innerHTML = profRows ||
+        `<tr><td colspan="9" class="empty">no profiles</td></tr>`;
+
+      // Per-model table.
+      const byModel = w.by_model || {{}};
+      const modelRows = Object.entries(byModel)
+        .sort((a, b) => (b[1].tokens_out || 0) - (a[1].tokens_out || 0))
+        .map(([name, b]) => `<tr><td>${{escapeHtml(name)}}</td>` +
+          `<td class="num">${{fmt(b.requests)}}</td>` +
+          `<td class="num ${{(b.errors||0)>0?'status-4xx':''}}">${{fmt(b.errors)}}</td>` +
+          `<td class="num">${{fmt(b.tokens_in)}}</td>` +
+          `<td class="num">${{fmt(b.tokens_out)}}</td>` +
+          `<td class="num ${{latClass(b.p50_ms)}}">${{fmtMs(b.p50_ms)}}</td>` +
+          `<td class="num ${{latClass(b.p95_ms)}}">${{fmtMs(b.p95_ms)}}</td></tr>`).join('');
+      $('models-body').innerHTML = modelRows ||
+        `<tr><td colspan="7" class="empty">no completions in window</td></tr>`;
+
+      // Upstreams.
+      const upRows = (stats.upstreams || []).map(u => {{
+        const inFlight = u.concurrent_in_flight || 0;
+        const cap = u.concurrent_limit || 1;
+        const pct = Math.min(100, (inFlight / cap) * 100);
+        const cls = pct >= 90 ? 'full' : pct >= 50 ? 'busy' : '';
+        return `<tr><td>${{escapeHtml(u.name)}}</td>` +
+          `<td><code>${{escapeHtml(u.url)}}</code></td>` +
+          `<td class="num">${{u.rpm_remaining}}/${{u.rpm_capacity}}</td>` +
+          `<td class="num">${{cap}}</td>` +
+          `<td class="num">${{inFlight}}</td>` +
+          `<td><div class="rate-bar"><div class="rate-bar-fill ${{cls}}" style="width:${{pct.toFixed(1)}}%"></div></div></td></tr>`;
+      }}).join('');
+      $('upstreams-body').innerHTML = upRows ||
+        `<tr><td colspan="6" class="empty">no upstreams</td></tr>`;
+
+      // Activity table from rolling buffer. Each main row has a hidden
+      // sibling row with the full redacted JSON body — expanded on click.
+      const recent = activityRows.slice(-30).reverse();
+      $('activity').innerHTML = recent.length === 0
+        ? `<tr><td colspan="7" class="empty">no activity yet</td></tr>`
+        : recent.map((r, i) => {{
+            const rowId = `row-${{i}}-${{(r.ts*1000)|0}}`;
+            const main = `<tr class="activity-row" data-target="${{rowId}}">` +
+              `<td>${{fmtTime(r.ts)}}</td><td>${{escapeHtml(r.profile)}}</td>` +
+              `<td>${{escapeHtml(r.method)}}</td><td><code>${{escapeHtml(r.path)}}</code></td>` +
+              `<td class="${{statusClass(r.status)}}">${{r.status}}</td>` +
+              `<td class="num ${{latClass(r.duration_ms)}}">${{fmtMs(r.duration_ms)}}</td>` +
+              `<td>${{renderParams(r.params)}}</td></tr>`;
+            const bodyJson = r.body ? jsonHighlight(r.body) :
+              '<span class="jnull">no body captured (passthrough or non-JSON request)</span>';
+            const expand = `<tr class="body-row" id="${{rowId}}">` +
+              `<td colspan="7"><div class="body-pre">${{bodyJson}}</div></td></tr>`;
+            return main + expand;
+          }}).join('');
+      // Wire click handlers for expandable rows.
+      document.querySelectorAll('#activity .activity-row').forEach(row => {{
+        row.addEventListener('click', () => {{
+          const target = $(row.dataset.target);
+          if (!target) return;
+          row.classList.toggle('expanded');
+          target.classList.toggle('expanded');
+        }});
+      }});
+    }}
+
+    // Tiny JSON syntax highlighter.
+    function jsonHighlight(obj) {{
+      const json = JSON.stringify(obj, null, 2);
+      const escaped = escapeHtml(json);
+      return escaped
+        .replace(/&quot;([^&]+?)&quot;:/g, '<span class="jk">"$1"</span>:')
+        .replace(/: &quot;(.*?)&quot;([,\\n}}\\]])/g, ': <span class="js">"$1"</span>$2')
+        .replace(/: (-?\\d+\\.?\\d*)([,\\n}}\\]])/g, ': <span class="jn">$1</span>$2')
+        .replace(/: (true|false)([,\\n}}\\]])/g, ': <span class="jbool">$1</span>$2')
+        .replace(/: null([,\\n}}\\]])/g, ': <span class="jnull">null</span>$1');
+    }}
+
+    async function refreshStats() {{
       try {{
-        const r = await fetch('/health');
+        const r = await fetch('/stats');
         const d = await r.json();
         if (d.uptime_s !== undefined) {{
           const s = Math.round(d.uptime_s);
           const h = Math.floor(s / 3600);
           const m = Math.floor((s % 3600) / 60);
-          uptimeEl.textContent = h > 0 ? `uptime ${{h}}h${{m}}m` : `uptime ${{m}}m`;
+          $('uptime').textContent = h > 0 ? `uptime ${{h}}h${{m}}m` : `uptime ${{m}}m ${{s % 60}}s`;
         }}
-        for (const u of (d.upstreams || [])) {{
-          const row = document.getElementById('up-' + u.name);
-          if (row) {{
-            row.querySelector('.inflight').textContent = u.concurrent_in_flight;
-          }}
-        }}
-      }} catch {{}}
+        // Adopt server-side history once on each refresh.
+        if (Array.isArray(d.history?.activity)) activityRows = d.history.activity;
+        if (Array.isArray(d.history?.usage)) usageRows = d.history.usage;
+        lastStats = d;
+        renderStats(d);
+      }} catch (e) {{ console.error(e); }}
     }}
 
+    // SSE feeds keep things live in between /stats refreshes.
     const usage = new EventSource('/usage/stream');
     usage.onmessage = (e) => {{
       try {{
         const d = JSON.parse(e.data);
-        counter.innerHTML = `${{d.total_tokens.toLocaleString()}} <small>${{d.profile}} · ${{d.model || '?'}} · in ${{d.input_tokens.toLocaleString()}} / out ${{d.output_tokens.toLocaleString()}}</small>`;
+        usageRows.push(d);
+        if (usageRows.length > 1000) usageRows.shift();
+        const tot = d.total_tokens || ((d.input_tokens||0)+(d.output_tokens||0));
+        const live = $('live-tokens');
+        live.textContent = fmt(tot);
+        live.classList.remove('flash'); void live.offsetWidth; live.classList.add('flash');
+        $('live-meta').textContent = `${{d.profile}} · ${{d.model || '?'}} · in ${{fmt(d.input_tokens)}} / out ${{fmt(d.output_tokens)}}`;
+        $('live-rate').textContent = `${{new Date(d.ts*1000).toLocaleTimeString()}}`;
+        if (lastStats) renderStats(lastStats);
       }} catch {{}}
     }};
-
     const activity = new EventSource('/activity/stream');
     activity.onmessage = (e) => {{
       try {{
         const d = JSON.parse(e.data);
-        activityRows.unshift(d);
-        activityRows = activityRows.slice(0, 20);
-        activityEl.innerHTML = activityRows.map(r =>
-          `<tr><td>${{fmtTime(r.ts)}}</td><td>${{r.profile}}</td>` +
-          `<td>${{r.method}}</td><td><code>${{r.path}}</code></td>` +
-          `<td class="${{statusClass(r.status)}}">${{r.status}}</td>` +
-          `<td>${{r.duration_ms}}</td></tr>`
-        ).join('');
+        activityRows.push(d);
+        if (activityRows.length > 1000) activityRows.shift();
+        if (lastStats) renderStats(lastStats);
       }} catch {{}}
     }};
 
-    refreshHealth();
-    setInterval(refreshHealth, 5000);
+    refreshStats();
+    setInterval(refreshStats, 5000);
   </script>
 </body>
 </html>
