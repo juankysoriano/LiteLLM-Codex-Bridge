@@ -141,9 +141,30 @@ class ProfileConfig:
     name: str
     upstream: str
     features: set[str] = field(default_factory=set)
+    model_aliases: dict[str, str] = field(default_factory=dict)
+    # Budget injected by `effort_to_thinking_budget` when the client
+    # sends no `reasoning.effort`/`reasoning_effort` hint at all.
+    # `default` keeps medium since calls landing there are usually
+    # ad-hoc curls / unknown clients that didn't ask for thinking.
+    # Named profiles default to high.
+    default_thinking_budget: int = 8192
 
     def has(self, feature: str) -> bool:
         return feature in self.features
+
+    def resolve_model(self, model: str | None) -> str | None:
+        """Translate a client-facing model id to the upstream id.
+
+        Used to bypass client-side model-id heuristics. Concrete case:
+        opencode hard-codes a skip list that drops `reasoning_effort`
+        for any model id containing "qwen". Configuring opencode with
+        a neutral id like `nan-thinking` and aliasing it to `qwen3.6`
+        in the bridge restores the reasoning hint while still routing
+        to the right model upstream.
+        """
+        if not isinstance(model, str):
+            return model
+        return self.model_aliases.get(model, model)
 
 
 @dataclass
@@ -189,6 +210,10 @@ def _builtin_defaults() -> BridgeConfig:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
+                # Calls without a profile prefix are usually unknown
+                # clients that didn't ask for thinking — medium is a
+                # gentler default than high.
+                default_thinking_budget=4096,
             ),
             "codex": ProfileConfig(
                 name="codex",
@@ -232,6 +257,9 @@ def _builtin_defaults() -> BridgeConfig:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
+                # Opencode's compiled binary skips `reasoning_effort` for
+                # any model id containing "qwen". Aliasing dodges that.
+                model_aliases={"nan-thinking": "qwen3.6"},
             ),
         },
         default_profile="default",
@@ -676,7 +704,7 @@ def _apply_qwen_sampling_defaults(body: dict) -> None:
     body["extra_body"] = extra
 
 
-def _apply_effort_budget(body: dict) -> None:
+def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
     """Map a client's `reasoning.effort` (or `reasoning_effort`) hint to a
     concrete `thinking_token_budget` and inject it where vLLM actually
     reads it.
@@ -691,6 +719,13 @@ def _apply_effort_budget(body: dict) -> None:
 
     `enable_thinking` IS a chat-template variable (Qwen reads it from
     Jinja), so that one stays under `chat_template_kwargs`.
+
+    When neither effort nor a top-level budget were set by the client,
+    the bridge injects `profile.default_thinking_budget` AND bumps
+    `max_tokens` / `max_output_tokens` so the answer isn't truncated by
+    reasoning eating into the cap. Rationale: the client didn't expect
+    thinking at all, so its declared output cap is sized for an answer
+    only — we owe it room for the reasoning we're forcing on top.
     """
     effort: str | None = None
     reasoning = body.get("reasoning")
@@ -698,16 +733,18 @@ def _apply_effort_budget(body: dict) -> None:
         effort = reasoning["effort"]
     if effort is None and isinstance(body.get("reasoning_effort"), str):
         effort = body["reasoning_effort"]
-    if effort:
-        budget = _EFFORT_TO_THINKING_BUDGET.get(effort, _DEFAULT_THINKING_BUDGET)
-    else:
-        # Client didn't hint at all — assume `high` so reasoning is at
-        # least bounded (otherwise vLLM lets the model think forever,
-        # which is what we observed pre-fix: hermes p95=54s, max=86s).
-        budget = _DEFAULT_THINKING_BUDGET
+
     extra = body.get("extra_body")
     if not isinstance(extra, dict):
         extra = {}
+    client_set_budget = "thinking_token_budget" in extra
+    client_unaware_of_thinking = effort is None and not client_set_budget
+
+    if effort:
+        budget = _EFFORT_TO_THINKING_BUDGET.get(effort, profile.default_thinking_budget)
+    else:
+        budget = profile.default_thinking_budget
+
     # Top-level: real sampler enforcement.
     extra.setdefault("thinking_token_budget", budget)
     # Chat-template: only the `enable_thinking` flag actually does
@@ -719,6 +756,21 @@ def _apply_effort_budget(body: dict) -> None:
     chat_kwargs.setdefault("enable_thinking", True)
     extra["chat_template_kwargs"] = chat_kwargs
     body["extra_body"] = extra
+
+    if client_unaware_of_thinking:
+        _ensure_room_for_injected_thinking(body, budget)
+
+
+def _ensure_room_for_injected_thinking(body: dict, budget: int) -> None:
+    """Bump max_tokens / max_output_tokens to accommodate injected
+    reasoning tokens plus a small answer headroom. No-op if the field
+    is already large enough or unset (unset = upstream default applies)."""
+    headroom = 1024
+    needed = budget + headroom
+    for field_name in ("max_tokens", "max_output_tokens"):
+        current = body.get(field_name)
+        if isinstance(current, int) and 0 < current < needed:
+            body[field_name] = needed
 
 
 def _drop_oai_only_fields(body: dict) -> None:
@@ -748,6 +800,13 @@ def _apply_request_transforms(body: dict, profile: ProfileConfig, kind: str) -> 
     `kind` is "responses" or "chat_completions" — some transforms are
     responses-API-specific (input reshape, parallel_tool_calls override).
     """
+    # Always run model aliasing first so downstream transforms (and the
+    # upstream itself) see the resolved id.
+    if profile.model_aliases:
+        original = body.get("model")
+        resolved = profile.resolve_model(original)
+        if isinstance(resolved, str) and resolved != original:
+            body["model"] = resolved
     if profile.has("normalize_responses_input") and kind == "responses" and "input" in body:
         instructions = body.get("instructions")
         has_instructions = isinstance(instructions, str) and instructions.strip()
@@ -762,7 +821,7 @@ def _apply_request_transforms(body: dict, profile: ProfileConfig, kind: str) -> 
     if profile.has("qwen_sampling_defaults"):
         _apply_qwen_sampling_defaults(body)
     if profile.has("effort_to_thinking_budget"):
-        _apply_effort_budget(body)
+        _apply_effort_budget(body, profile)
     if profile.has("force_serial_tool_calls") and kind == "responses":
         _force_serial_tool_calls(body)
     if profile.has("drop_oai_only_fields"):
