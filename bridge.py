@@ -2175,6 +2175,31 @@ def _redact_body(body: Any, max_bytes: int = 4096) -> dict:
     return redacted
 
 
+def _diff_thinking_params(before: dict, after: dict) -> dict:
+    """Merge a pre-transform and post-transform `_inspect_thinking_params`
+    snapshot into a single map, marking fields the bridge injected /
+    changed so the dashboard can render them clearly.
+
+    Output shape: each value is `{"value": <effective>, "from": "client"|"bridge"|"changed"}`.
+    The dashboard renders bridge-injected fields with a "+bridge" tag and
+    changed values with a "→" indicator.
+    """
+    out: dict = {}
+    for k, v in after.items():
+        if k not in before:
+            out[k] = {"value": v, "from": "bridge"}
+        elif before[k] != v:
+            out[k] = {"value": v, "from": "changed", "was": before[k]}
+        else:
+            out[k] = {"value": v, "from": "client"}
+    # Keep client-only entries (they were stripped by transforms — usually
+    # the (DROPPED) markers, which we still want to surface).
+    for k, v in before.items():
+        if k not in after:
+            out[k] = {"value": v, "from": "client", "stripped": True}
+    return out
+
+
 def _inspect_thinking_params(body: Any, kind: str) -> dict:
     """Snapshot the thinking-related fields a client sent on a request.
 
@@ -2231,6 +2256,7 @@ def _record_activity(
     duration_ms: float,
     params: dict | None = None,
     body: dict | None = None,
+    forwarded: dict | None = None,
 ) -> None:
     record: dict = {
         "ts": time.time(),
@@ -2245,6 +2271,8 @@ def _record_activity(
         record["params"] = params
     if body is not None:
         record["body"] = body
+    if forwarded is not None:
+        record["forwarded"] = forwarded
     _broadcast_activity(record)
 
 
@@ -2408,6 +2436,158 @@ async def activity_stream() -> StreamingResponse:
     )
 
 
+def _dump_config_yaml(cfg: BridgeConfig) -> str:
+    """Serialize a `BridgeConfig` back to YAML.
+
+    Round-trips through PyYAML's default dumper so the file stays
+    human-editable. The shape mirrors `_load_config()`'s reader.
+    """
+    out: dict[str, Any] = {"upstreams": {}, "profiles": {}}
+    for name, u in cfg.upstreams.items():
+        out["upstreams"][name] = {
+            "url": u.url,
+            "rate_limit_rpm": u.rate_limit_rpm,
+            "rate_limit_concurrent": u.rate_limit_concurrent,
+            "queue_timeout_s": u.queue_timeout_s,
+            "stuck_warn_s": u.stuck_warn_s,
+            "retry_max_attempts": u.retry_max_attempts,
+            "retry_initial_wait": u.retry_initial_wait,
+            "retry_max_wait": u.retry_max_wait,
+        }
+    for name, p in cfg.profiles.items():
+        entry: dict[str, Any] = {
+            "upstream": p.upstream,
+            "queue_priority": p.queue_priority,
+            "default_thinking_budget": p.default_thinking_budget,
+            "features": sorted(p.features),
+        }
+        if p.model_aliases:
+            entry["model_aliases"] = dict(p.model_aliases)
+        out["profiles"][name] = entry
+    out["default_profile"] = cfg.default_profile
+    return yaml.safe_dump(out, sort_keys=False, default_flow_style=False)
+
+
+def _persist_config() -> None:
+    """Write the current in-memory `CONFIG` to disk."""
+    DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_CONFIG_PATH.write_text(_dump_config_yaml(CONFIG), encoding="utf-8")
+
+
+def _validate_profile_payload(name: str, body: dict) -> tuple[ProfileConfig | None, str | None]:
+    """Validate JSON profile input from the UI. Returns (profile, error).
+    On error, profile is None and error contains a user-facing message."""
+    if not isinstance(name, str) or not name.strip():
+        return None, "profile name is required"
+    if "/" in name or " " in name:
+        return None, "profile name can't contain spaces or slashes"
+    upstream = str(body.get("upstream") or "")
+    if upstream not in CONFIG.upstreams:
+        return None, f"unknown upstream {upstream!r}; available: {sorted(CONFIG.upstreams)}"
+    feats_raw = body.get("features") or []
+    if not isinstance(feats_raw, list):
+        return None, "features must be a list of strings"
+    feats = set(str(f) for f in feats_raw)
+    invalid = feats - ALL_FEATURES
+    if invalid:
+        return None, f"unknown features: {sorted(invalid)}"
+    aliases_raw = body.get("model_aliases") or {}
+    if not isinstance(aliases_raw, dict):
+        return None, "model_aliases must be a string→string mapping"
+    aliases = {str(k): str(v) for k, v in aliases_raw.items()}
+    try:
+        priority = int(body.get("queue_priority", 0))
+        budget = int(body.get("default_thinking_budget", 8192))
+    except (TypeError, ValueError):
+        return None, "queue_priority and default_thinking_budget must be integers"
+    if budget < 0 or budget > 64000:
+        return None, "default_thinking_budget must be between 0 and 64000"
+    return (
+        ProfileConfig(
+            name=name,
+            upstream=upstream,
+            features=feats,
+            model_aliases=aliases,
+            default_thinking_budget=budget,
+            queue_priority=priority,
+        ),
+        None,
+    )
+
+
+@app.get("/config")
+async def config_get() -> dict:
+    """Return the current config in a UI-friendly shape, plus the list
+    of available features so the editor can render checkboxes."""
+    return {
+        "upstreams": [
+            {
+                "name": u.name,
+                "url": u.url,
+                "rate_limit_rpm": u.rate_limit_rpm,
+                "rate_limit_concurrent": u.rate_limit_concurrent,
+                "queue_timeout_s": u.queue_timeout_s,
+                "stuck_warn_s": u.stuck_warn_s,
+            }
+            for u in CONFIG.upstreams.values()
+        ],
+        "profiles": [
+            {
+                "name": p.name,
+                "upstream": p.upstream,
+                "features": sorted(p.features),
+                "queue_priority": p.queue_priority,
+                "default_thinking_budget": p.default_thinking_budget,
+                "model_aliases": dict(p.model_aliases),
+            }
+            for p in CONFIG.profiles.values()
+        ],
+        "default_profile": CONFIG.default_profile,
+        "available_features": sorted(ALL_FEATURES),
+        "config_path": str(DEFAULT_CONFIG_PATH),
+    }
+
+
+@app.put("/config/profiles/{name}")
+async def config_profile_put(name: str, request: Request) -> JSONResponse:
+    """Upsert a profile. Body is the JSON shape returned by /config."""
+    body = await request.json()
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    profile, err = _validate_profile_payload(name, body)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+    CONFIG.profiles[name] = profile  # type: ignore[index]
+    try:
+        _persist_config()
+    except OSError as e:
+        return JSONResponse(
+            {"error": f"profile updated in memory but YAML write failed: {e}"},
+            status_code=500,
+        )
+    return JSONResponse({"ok": True, "profile": name})
+
+
+@app.delete("/config/profiles/{name}")
+async def config_profile_delete(name: str) -> JSONResponse:
+    if name not in CONFIG.profiles:
+        return JSONResponse({"error": "profile not found"}, status_code=404)
+    if name == CONFIG.default_profile:
+        return JSONResponse(
+            {"error": "can't delete the default profile; set a different default first"},
+            status_code=400,
+        )
+    del CONFIG.profiles[name]
+    try:
+        _persist_config()
+    except OSError as e:
+        return JSONResponse(
+            {"error": f"profile removed from memory but YAML write failed: {e}"},
+            status_code=500,
+        )
+    return JSONResponse({"ok": True, "deleted": name})
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard() -> HTMLResponse:
     return HTMLResponse(content=_dashboard_html(), status_code=200)
@@ -2421,9 +2601,11 @@ async def _handle_responses(
 ) -> StreamingResponse | JSONResponse:
     started = time.monotonic()
     body = await request.json()
-    inspected = _inspect_thinking_params(body, "responses")
+    client_params = _inspect_thinking_params(body, "responses")
     redacted = _redact_body(body)
     body = _apply_request_transforms(body, profile, kind="responses")
+    forwarded = _redact_body(body)  # post-transform — what we sent upstream
+    inspected = _diff_thinking_params(client_params, _inspect_thinking_params(body, "responses"))
     want_stream = bool(body.get("stream", False))
     headers = _build_outgoing_headers(request)
     if want_stream:
@@ -2438,6 +2620,7 @@ async def _handle_responses(
                 (time.monotonic() - started) * 1000,
                 params=inspected,
                 body=redacted,
+                forwarded=forwarded,
             )
         return StreamingResponse(
             _gen(),
@@ -2529,6 +2712,7 @@ async def _handle_responses(
         (time.monotonic() - started) * 1000,
         params=inspected,
         body=redacted,
+        forwarded=forwarded,
     )
     return JSONResponse(content=payload, status_code=status)
 
@@ -2538,9 +2722,11 @@ async def _handle_chat_completions(
 ) -> StreamingResponse | JSONResponse:
     started = time.monotonic()
     body = await request.json()
-    inspected = _inspect_thinking_params(body, "chat_completions")
+    client_params = _inspect_thinking_params(body, "chat_completions")
     redacted = _redact_body(body)
     body = _apply_request_transforms(body, profile, kind="chat_completions")
+    forwarded = _redact_body(body)  # post-transform — what we sent upstream
+    inspected = _diff_thinking_params(client_params, _inspect_thinking_params(body, "chat_completions"))
     want_stream = bool(body.get("stream", False))
     headers = _build_outgoing_headers(request)
     if want_stream:
@@ -2555,6 +2741,7 @@ async def _handle_chat_completions(
                 (time.monotonic() - started) * 1000,
                 params=inspected,
                 body=redacted,
+                forwarded=forwarded,
             )
         return StreamingResponse(
             _gen(),
@@ -2640,6 +2827,7 @@ async def _handle_chat_completions(
         (time.monotonic() - started) * 1000,
         params=inspected,
         body=redacted,
+        forwarded=forwarded,
     )
     return JSONResponse(content=payload, status_code=last_status)
 
@@ -2846,8 +3034,15 @@ def _dashboard_html() -> str:
     .params .pk {{ color: var(--accent); }}
     .params .pv {{ color: var(--fg); }}
     .params .dropped {{ color: var(--bad); font-weight: 500; }}
+    .params .pk-bridge {{ color: var(--accent2); }}
+    .params .pk-changed {{ color: var(--warn); }}
     .params .pair {{ display: inline-block; margin-right: 0.6rem;
       background: var(--panel2); padding: 0.05rem 0.35rem; border-radius: 3px; }}
+    .params .pp-tag {{ font-size: 0.78em; margin-left: 0.3rem;
+      padding: 0.02rem 0.3rem; border-radius: 2px; opacity: 0.85; }}
+    .params .pp-bridge {{ background: rgba(210, 168, 255, 0.15); color: var(--accent2); }}
+    .params .pp-changed {{ background: rgba(240, 136, 62, 0.15); color: var(--warn); }}
+    .params .pp-stripped {{ background: rgba(255, 123, 114, 0.12); color: var(--bad); }}
     .activity-row {{ cursor: pointer; }}
     .activity-row:hover {{ background: rgba(121, 192, 255, 0.04); }}
     .activity-row.expanded {{ background: rgba(121, 192, 255, 0.06); }}
@@ -2862,6 +3057,18 @@ def _dashboard_html() -> str:
     .body-pre .jn {{ color: var(--accent2); }}
     .body-pre .jbool {{ color: var(--warn); }}
     .body-pre .jnull {{ color: var(--dim); }}
+    .body-pre .jk-added {{ color: var(--good); font-weight: 500; }}
+    .body-pre .jk-changed {{ color: var(--warn); font-weight: 500; }}
+    .body-pre .jline-added {{ background: rgba(86, 211, 100, 0.06); }}
+    .body-pre .jline-changed {{ background: rgba(240, 136, 62, 0.06); }}
+    .body-pre .jbadge {{ font-size: 0.85em; margin-left: 0.4rem;
+      padding: 0.02rem 0.3rem; border-radius: 2px; opacity: 0.85; }}
+    .body-pre .jb-add {{ background: rgba(86, 211, 100, 0.15); color: var(--good); }}
+    .body-pre .jb-change {{ background: rgba(240, 136, 62, 0.15); color: var(--warn); }}
+    .body-label {{ color: var(--dim); font-size: 0.78rem;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      margin: 0.4rem 0 0.2rem 0; }}
+    .body-label .dim {{ text-transform: none; letter-spacing: 0; opacity: 0.6; }}
 
     /* Sparkline */
     .spark {{ display: block; width: 100%; height: 40px; }}
@@ -3046,8 +3253,35 @@ def _dashboard_html() -> str:
       const keys = Object.keys(p);
       if (keys.length === 0) return '<span class="params">—</span>';
       return '<span class="params">' + keys.map(k => {{
-        const cls = k.includes('DROPPED') ? 'pk dropped' : 'pk';
-        return `<span class="pair"><span class="${{cls}}">${{escapeHtml(k)}}</span>=<span class="pv">${{escapeHtml(p[k])}}</span></span>`;
+        const entry = p[k];
+        // Two value shapes are accepted: legacy primitive (still in
+        // older activity records) and the new tagged object with
+        // value/from/was/stripped fields.
+        let val, source = null, was = null, stripped = false;
+        if (entry && typeof entry === 'object' && 'value' in entry) {{
+          val = entry.value;
+          source = entry.from || null;
+          was = entry.was;
+          stripped = !!entry.stripped;
+        }} else {{
+          val = entry;
+        }}
+        const dropped = k.includes('DROPPED');
+        let kCls = 'pk';
+        let badge = '';
+        if (dropped) {{
+          kCls = 'pk dropped';
+        }} else if (source === 'bridge') {{
+          kCls = 'pk pk-bridge';
+          badge = '<span class="pp-tag pp-bridge">+bridge</span>';
+        }} else if (source === 'changed') {{
+          kCls = 'pk pk-changed';
+          badge = `<span class="pp-tag pp-changed">was ${{escapeHtml(was)}}</span>`;
+        }} else if (stripped) {{
+          kCls = 'pk dropped';
+          badge = '<span class="pp-tag pp-stripped">stripped</span>';
+        }}
+        return `<span class="pair"><span class="${{kCls}}">${{escapeHtml(k)}}</span>=<span class="pv">${{escapeHtml(val)}}</span>${{badge}}</span>`;
       }}).join('') + '</span>';
     }}
 
@@ -3239,8 +3473,21 @@ def _dashboard_html() -> str:
               `<td>${{renderParams(r.params)}}</td></tr>`;
             const bodyJson = r.body ? jsonHighlight(r.body) :
               '<span class="jnull">no body captured (passthrough or non-JSON request)</span>';
+            // Show both the client-sent body and what we forwarded
+            // upstream. The forwarded view is annotated with diff
+            // markers so bridge-injected fields stand out (green
+            // +bridge tag) and changed values show their previous
+            // value (orange "was X" tag).
+            const forwardedBlock = r.forwarded
+              ? `<div class="body-label">forwarded upstream <span class="dim">(post-transform · diff vs client)</span></div>` +
+                `<div class="body-pre">${{annotatedJson(r.forwarded, r.body)}}</div>`
+              : '';
             const expand = `<tr class="${{bodyCls}}" id="${{targetId}}">` +
-              `<td colspan="7"><div class="body-pre">${{bodyJson}}</div></td></tr>`;
+              `<td colspan="7">` +
+              `<div class="body-label">client sent <span class="dim">(pre-transform)</span></div>` +
+              `<div class="body-pre">${{bodyJson}}</div>` +
+              `${{forwardedBlock}}` +
+              `</td></tr>`;
             return main + expand;
           }}).join('');
       // Wire click handlers for expandable rows. Toggle both the
@@ -3262,6 +3509,102 @@ def _dashboard_html() -> str:
           }}
         }});
       }});
+    }}
+
+    // Diff-aware JSON renderer for the forwarded body. Walks the
+    // forwarded object alongside the client body and tags each leaf
+    // with `+added` (bridge introduced the path) or `≠ was X`
+    // (bridge changed an existing value). Falls back to the plain
+    // highlighter when no comparison body is supplied.
+    function flattenJson(obj, prefix, out) {{
+      if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {{
+        out.set(prefix, obj);
+        return;
+      }}
+      if (Object.keys(obj).length === 0) {{
+        out.set(prefix, obj);
+        return;
+      }}
+      for (const k of Object.keys(obj)) {{
+        const path = prefix ? `${{prefix}}.${{k}}` : k;
+        flattenJson(obj[k], path, out);
+      }}
+    }}
+    function diffJson(client, forwarded) {{
+      const fw = new Map(); flattenJson(forwarded, '', fw);
+      const cl = new Map(); flattenJson(client, '', cl);
+      const added = new Set();
+      const changed = new Map();
+      for (const [k, v] of fw) {{
+        if (!cl.has(k)) {{
+          added.add(k);
+        }} else if (JSON.stringify(cl.get(k)) !== JSON.stringify(v)) {{
+          changed.set(k, cl.get(k));
+        }}
+      }}
+      return {{ added, changed }};
+    }}
+    function annotatedJson(forwarded, client) {{
+      if (!forwarded) return '<span class="jnull">no body</span>';
+      if (!client) return jsonHighlight(forwarded);
+      const {{ added, changed }} = diffJson(client, forwarded);
+
+      function fmtVal(v) {{
+        if (v === null) return '<span class="jnull">null</span>';
+        if (typeof v === 'string') return `<span class="js">"${{escapeHtml(v)}}"</span>`;
+        if (typeof v === 'number') return `<span class="jn">${{v}}</span>`;
+        if (typeof v === 'boolean') return `<span class="jbool">${{v}}</span>`;
+        return escapeHtml(String(v));
+      }}
+      function pathOfChild(prefix, key) {{
+        return prefix ? `${{prefix}}.${{key}}` : key;
+      }}
+      function isUnderAdded(path) {{
+        // A child path is implicitly "added" when its parent was added.
+        let p = path;
+        while (p) {{
+          if (added.has(p)) return true;
+          const i = p.lastIndexOf('.');
+          if (i < 0) return false;
+          p = p.slice(0, i);
+        }}
+        return false;
+      }}
+      function render(obj, indent, prefix, suppressBadge) {{
+        if (obj === null || typeof obj !== 'object') return fmtVal(obj);
+        if (Array.isArray(obj)) {{
+          if (obj.length === 0) return '[]';
+          const inner = obj.map((v) =>
+            `${{indent}}  ${{render(v, indent + '  ', prefix, true)}}`
+          ).join(',\\n');
+          return `[\\n${{inner}}\\n${{indent}}]`;
+        }}
+        const keys = Object.keys(obj);
+        if (keys.length === 0) return '{{}}';
+        const lines = keys.map((k) => {{
+          const path = pathOfChild(prefix, k);
+          const isAdded = added.has(path) || isUnderAdded(path);
+          const isChanged = changed.has(path);
+          let cls = 'jk';
+          let lineCls = '';
+          let badge = '';
+          if (isAdded) {{
+            cls = 'jk jk-added';
+            lineCls = 'jline-added';
+            if (!suppressBadge) badge = '<span class="jbadge jb-add">+bridge</span>';
+          }} else if (isChanged) {{
+            cls = 'jk jk-changed';
+            lineCls = 'jline-changed';
+            badge = `<span class="jbadge jb-change">was ${{escapeHtml(JSON.stringify(changed.get(path)))}}</span>`;
+          }}
+          const valHtml = render(obj[k], indent + '  ', path, suppressBadge || isAdded);
+          const linePrefix = lineCls ? `<span class="${{lineCls}}">` : '';
+          const lineSuffix = lineCls ? `</span>` : '';
+          return `${{indent}}  ${{linePrefix}}<span class="${{cls}}">"${{escapeHtml(k)}}"</span>: ${{valHtml}}${{badge}}${{lineSuffix}}`;
+        }});
+        return `{{\\n${{lines.join(',\\n')}}\\n${{indent}}}}`;
+      }}
+      return render(forwarded, '', '', false);
     }}
 
     // Tiny JSON syntax highlighter.
