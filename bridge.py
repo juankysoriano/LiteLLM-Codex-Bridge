@@ -435,13 +435,13 @@ def _apply_effort_budget(data: dict) -> None:
     if effort is None and isinstance(data.get("reasoning_effort"), str):
         effort = data["reasoning_effort"]
 
-    budget = (
-        _EFFORT_TO_THINKING_BUDGET.get(effort)
-        if effort
-        else _DEFAULT_THINKING_BUDGET
-    )
-    if budget is None:
-        return
+    # Unknown effort strings (typos like "ultra", or future values we don't
+    # know about yet) fall back to the default cap rather than skipping
+    # the transform entirely — the caller asked for *some* thinking limit.
+    if effort:
+        budget = _EFFORT_TO_THINKING_BUDGET.get(effort, _DEFAULT_THINKING_BUDGET)
+    else:
+        budget = _DEFAULT_THINKING_BUDGET
 
     extra = data.get("extra_body")
     if not isinstance(extra, dict):
@@ -615,8 +615,10 @@ async def _stream_passthrough(
     correct per-call `function_call_arguments.done` plus a corrected
     `output_item.done` with the right `type`, `name`, `call_id`, and
     accumulated `arguments` at the right time. Non-function-call events
-    pass through byte-for-byte to keep prefix-cache hashes and
-    timing-sensitive UI stable.
+    are re-serialised from the parsed JSON payload (so identical content
+    but not necessarily byte-identical to upstream — JSON whitespace and
+    key ordering may differ); SSE comments / keepalive lines are
+    forwarded byte-for-byte.
 
     Server-side alternative for upstream operators: configure LiteLLM to
     use `use_chat_completions_api: true` on the model entry — that
