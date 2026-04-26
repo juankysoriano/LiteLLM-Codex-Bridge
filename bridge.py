@@ -158,11 +158,11 @@ class ProfileConfig:
     # ad-hoc curls / unknown clients that didn't ask for thinking.
     # Named profiles default to high.
     default_thinking_budget: int = 8192
-    # Queue priority for the upstream gate — lower = jumps ahead of
-    # higher-priority numbers. Interactive coding agents (codex,
-    # opencode) get 0; long-running daemons (hermes, default) get 10.
+    # Queue priority for the upstream gate — HIGHER = jumps ahead of
+    # lower-priority numbers. Interactive coding agents (codex,
+    # opencode) get 10; long-running daemons (hermes, default) get 0.
     # Within the same priority bucket it's first-come-first-served.
-    queue_priority: int = 10
+    queue_priority: int = 0
 
     def has(self, feature: str) -> bool:
         return feature in self.features
@@ -229,7 +229,7 @@ def _builtin_defaults() -> BridgeConfig:
                 # clients that didn't ask for thinking — medium is a
                 # gentler default than high.
                 default_thinking_budget=4096,
-                queue_priority=10,  # background / unknown
+                queue_priority=0,  # background / unknown
             ),
             "codex": ProfileConfig(
                 name="codex",
@@ -247,7 +247,7 @@ def _builtin_defaults() -> BridgeConfig:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
-                queue_priority=0,  # interactive — jumps ahead of background
+                queue_priority=10,  # interactive — jumps ahead of background
             ),
             "hermes": ProfileConfig(
                 name="hermes",
@@ -267,7 +267,7 @@ def _builtin_defaults() -> BridgeConfig:
                 # every hermes call. Medium keeps it bounded without
                 # over-thinking simple replies.
                 default_thinking_budget=4096,
-                queue_priority=10,  # background daemon
+                queue_priority=1,  # background daemon, but ahead of `default`
             ),
             "opencode": ProfileConfig(
                 name="opencode",
@@ -285,15 +285,160 @@ def _builtin_defaults() -> BridgeConfig:
                 # setup (qwen* skip-list in its compiled binary), so
                 # this default applies to every opencode call.
                 default_thinking_budget=8192,
-                queue_priority=0,  # interactive — jumps ahead of background
+                queue_priority=10,  # interactive — jumps ahead of background
             ),
         },
         default_profile="default",
     )
 
 
+_SAMPLE_CONFIG_YAML = """\
+# resilient-llm-bridge config — every key is optional; whatever you
+# leave out falls back to the dataclass default. Reload requires
+# `systemctl --user restart resilient-llm-bridge.service`.
+#
+# Schema:
+#   upstreams: <name>: { url, rate_limit_rpm, rate_limit_concurrent,
+#                        queue_timeout_s, stuck_warn_s,
+#                        retry_max_attempts, retry_initial_wait,
+#                        retry_max_wait }
+#   profiles:  <name>: { upstream, features:[...], queue_priority,
+#                        default_thinking_budget, model_aliases:{...} }
+#   default_profile: <name>      # which profile catches /v1/... (no prefix)
+#
+# Available `features` (toggle on/off per profile):
+#   qwen_sampling_defaults      inject Qwen3 sampling (top_k, min_p, …)
+#   drop_oai_only_fields        strip OpenAI-only fields the upstream rejects
+#   effort_to_thinking_budget   reasoning.effort → thinking_token_budget
+#   normalize_responses_input   reshape input items for strict validators
+#   drop_namespace_tools        drop namespace/MCP/web_search/image tools
+#   force_serial_tool_calls     parallel_tool_calls=false override
+#   parallel_tool_sse_fix       vLLM #39426 workaround
+#   thinking_overflow_recovery  incomplete + max_output_tokens → recover
+#   silent_completion_recovery  completed + no message item → recover
+#   truncated_content_recovery  length + cut mid-thought → continue
+#   empty_with_stop_retry       empty + stop → one cheap retry
+#
+# `queue_priority`: HIGHER number = jumps ahead in the upstream queue
+# when slots are saturated. Same priority resolves FIFO. Suggested:
+#   10  interactive coding agents (codex, opencode)
+#    1  background agents (hermes)
+#    0  default / unknown clients
+
+upstreams:
+  nan:
+    url: "https://api.nan.builders/v1"
+    rate_limit_rpm: 100
+    rate_limit_concurrent: 5
+    queue_timeout_s: 120.0    # 503 if a request waits longer than this
+    stuck_warn_s: 300.0       # watchdog logs slots held longer than this
+
+profiles:
+  default:
+    upstream: nan
+    queue_priority: 0
+    default_thinking_budget: 4096   # medium — for unknown clients
+    features:
+      - qwen_sampling_defaults
+      - drop_oai_only_fields
+      - effort_to_thinking_budget
+      - thinking_overflow_recovery
+      - silent_completion_recovery
+      - truncated_content_recovery
+      - empty_with_stop_retry
+
+  codex:
+    upstream: nan
+    queue_priority: 10
+    default_thinking_budget: 8192
+    features:
+      - qwen_sampling_defaults
+      - drop_oai_only_fields
+      - effort_to_thinking_budget
+      - normalize_responses_input
+      - drop_namespace_tools
+      - force_serial_tool_calls
+      - parallel_tool_sse_fix
+      - thinking_overflow_recovery
+      - silent_completion_recovery
+      - truncated_content_recovery
+      - empty_with_stop_retry
+
+  hermes:
+    upstream: nan
+    queue_priority: 1
+    default_thinking_budget: 4096
+    features:
+      - qwen_sampling_defaults
+      - drop_oai_only_fields
+      - effort_to_thinking_budget
+      - thinking_overflow_recovery
+      - silent_completion_recovery
+      - truncated_content_recovery
+      - empty_with_stop_retry
+
+  opencode:
+    upstream: nan
+    queue_priority: 10
+    default_thinking_budget: 8192
+    # Optional model id rewrites (client-id -> upstream-id), in case
+    # you want to dodge a client-side model heuristic. Example:
+    # model_aliases:
+    #   nan-thinking: qwen3.6
+    features:
+      - qwen_sampling_defaults
+      - drop_oai_only_fields
+      - effort_to_thinking_budget
+      - thinking_overflow_recovery
+      - silent_completion_recovery
+      - truncated_content_recovery
+      - empty_with_stop_retry
+
+default_profile: default
+"""
+
+
+def _coerce(value: Any, kind: type, default: Any) -> Any:
+    """Best-effort cast a YAML scalar to `kind`, falling back to
+    `default` on failure. Logs a warning so misconfigs surface fast."""
+    if value is None:
+        return default
+    try:
+        return kind(value)
+    except (TypeError, ValueError):
+        print(
+            f"[config] expected {kind.__name__} for value {value!r}, "
+            f"using default {default!r}",
+            flush=True,
+        )
+        return default
+
+
+def _ensure_sample_config() -> None:
+    """Write a documented template YAML on first run so the user has
+    something to edit. No-op if the file already exists."""
+    if DEFAULT_CONFIG_PATH.exists():
+        return
+    try:
+        DEFAULT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DEFAULT_CONFIG_PATH.write_text(_SAMPLE_CONFIG_YAML, encoding="utf-8")
+        print(
+            f"[config] wrote sample config to {DEFAULT_CONFIG_PATH} — "
+            f"edit and restart to apply.",
+            flush=True,
+        )
+    except OSError as exc:
+        print(f"[config] could not write sample config: {exc}", flush=True)
+
+
 def _load_config() -> BridgeConfig:
-    """Load configuration from YAML, falling back to bundled defaults."""
+    """Load configuration from YAML, falling back to bundled defaults.
+
+    Every field is optional — missing values fall back to whatever the
+    dataclass defines as default. Unknown fields are ignored with a
+    warning. Unknown features are dropped per profile (also warned).
+    """
+    _ensure_sample_config()
     if not DEFAULT_CONFIG_PATH.exists():
         return _builtin_defaults()
     try:
@@ -307,32 +452,65 @@ def _load_config() -> BridgeConfig:
 
     upstreams: dict[str, UpstreamConfig] = {}
     for name, body in (raw.get("upstreams") or {}).items():
+        if not isinstance(body, dict):
+            print(f"[config] upstream {name!r} must be a mapping; skipped", flush=True)
+            continue
         upstreams[name] = UpstreamConfig(
             name=name,
             url=str(body.get("url") or "").rstrip("/"),
-            rate_limit_rpm=int(body.get("rate_limit_rpm") or 0),
-            rate_limit_concurrent=int(body.get("rate_limit_concurrent") or 0),
-            retry_max_attempts=int(body.get("retry_max_attempts") or 3),
-            retry_initial_wait=float(body.get("retry_initial_wait") or 1.0),
-            retry_max_wait=float(body.get("retry_max_wait") or 20.0),
+            rate_limit_rpm=_coerce(body.get("rate_limit_rpm"), int, 0),
+            rate_limit_concurrent=_coerce(body.get("rate_limit_concurrent"), int, 0),
+            retry_max_attempts=_coerce(body.get("retry_max_attempts"), int, 3),
+            retry_initial_wait=_coerce(body.get("retry_initial_wait"), float, 1.0),
+            retry_max_wait=_coerce(body.get("retry_max_wait"), float, 20.0),
+            queue_timeout_s=_coerce(body.get("queue_timeout_s"), float, 120.0),
+            stuck_warn_s=_coerce(body.get("stuck_warn_s"), float, 300.0),
         )
     if not upstreams:
         upstreams = _builtin_defaults().upstreams
 
     profiles: dict[str, ProfileConfig] = {}
     for name, body in (raw.get("profiles") or {}).items():
-        feats = set(body.get("features") or [])
+        if not isinstance(body, dict):
+            print(f"[config] profile {name!r} must be a mapping; skipped", flush=True)
+            continue
+        upstream_name = str(body.get("upstream") or "")
+        if upstream_name and upstream_name not in upstreams:
+            print(
+                f"[config] profile {name!r} references unknown upstream "
+                f"{upstream_name!r}; skipped",
+                flush=True,
+            )
+            continue
+        feats_raw = body.get("features") or []
+        if not isinstance(feats_raw, list):
+            print(f"[config] profile {name!r} features must be a list; ignored", flush=True)
+            feats_raw = []
+        feats = set(str(f) for f in feats_raw)
         invalid = feats - ALL_FEATURES
         if invalid:
             print(
-                f"[config] profile {name!r} references unknown features: {invalid}",
+                f"[config] profile {name!r} references unknown features: {sorted(invalid)}",
                 flush=True,
             )
             feats -= invalid
+        aliases_raw = body.get("model_aliases") or {}
+        if not isinstance(aliases_raw, dict):
+            print(
+                f"[config] profile {name!r} model_aliases must be a mapping; ignored",
+                flush=True,
+            )
+            aliases_raw = {}
+        model_aliases = {str(k): str(v) for k, v in aliases_raw.items()}
         profiles[name] = ProfileConfig(
             name=name,
-            upstream=str(body.get("upstream") or ""),
+            upstream=upstream_name,
             features=feats,
+            model_aliases=model_aliases,
+            default_thinking_budget=_coerce(
+                body.get("default_thinking_budget"), int, 8192
+            ),
+            queue_priority=_coerce(body.get("queue_priority"), int, 0),
         )
     if not profiles:
         profiles = _builtin_defaults().profiles
@@ -498,20 +676,24 @@ class _QueueTimeout(Exception):
         )
 
 
-@dataclass(order=True)
+@dataclass
 class _Waiter:
     """One task in the priority queue.
 
-    Sort key is (priority, seq) so heapq pops lowest priority first;
-    `seq` is a monotonic counter so ties resolve in arrival order
-    (FIFO within a priority bucket). The non-comparable fields are
-    marked `compare=False` so they don't break ordering.
+    HIGHER priority pops first (heapq min-heap, but `__lt__` is
+    inverted on priority). Ties resolve FIFO via `seq` — a monotonic
+    counter taken at enqueue time.
     """
     priority: int
     seq: int
-    future: asyncio.Future = field(compare=False)
-    profile: str = field(default="?", compare=False)
-    path: str = field(default="?", compare=False)
+    future: asyncio.Future
+    profile: str = "?"
+    path: str = "?"
+
+    def __lt__(self, other: "_Waiter") -> bool:
+        if self.priority != other.priority:
+            return self.priority > other.priority
+        return self.seq < other.seq
 
 
 class _UpstreamGate:
@@ -522,8 +704,8 @@ class _UpstreamGate:
         `rate_limit_rpm/60` per second.
       * Concurrency cap: max `rate_limit_concurrent` slots in flight.
       * Priority heap: when slots are saturated, waiters queue in
-        priority order. Lower number wins (`codex` and `opencode` use
-        priority=0; `hermes` and `default` use priority=10).
+        priority order. Higher number wins (`codex` and `opencode`
+        use priority=10; `hermes` and `default` use priority=0).
 
     Per-slot state is a dict so the dashboard can show oldest-age and
     the watchdog can spot stuck slots. The whole thing is acquired
@@ -1308,6 +1490,16 @@ async def _stream_responses(
     message_text_accum = ""
     message_emitted = False
     completed_payload: dict | None = None
+    # Track in-flight message items so we can synthesize the closing
+    # events that NaN's /v1/responses stream sometimes omits. Keyed by
+    # output_index. Each entry tracks {id, role, text, content_index,
+    # last_seq, model, content_part_added, output_text_done,
+    # content_part_done}. Codex CLI requires output_item.done for an
+    # agentMessage to fire its `item/completed` event — without it,
+    # happy never receives an `agent_message`, which manifests as
+    # "session spawned but no response ever shows".
+    open_messages: dict[int, dict] = {}
+    last_seq = 0
     do_parallel_fix = profile.has("parallel_tool_sse_fix")
 
     async def _open_stream():
@@ -1392,11 +1584,53 @@ async def _stream_responses(
                     delta = payload.get("delta")
                     if isinstance(delta, str):
                         reasoning_accum += delta
+                if isinstance(payload.get("sequence_number"), int):
+                    last_seq = max(last_seq, payload["sequence_number"])
+
+                if etype == "response.output_item.added":
+                    item = payload.get("item") or {}
+                    if item.get("type") == "message":
+                        idx = payload.get("output_index")
+                        if isinstance(idx, int):
+                            open_messages[idx] = {
+                                "id": item.get("id") or f"msg_{idx}_{int(time.time()*1000)}",
+                                "role": item.get("role") or "assistant",
+                                "text": "",
+                                "content_index": 0,
+                                "model": payload.get("model"),
+                                "content_part_added": False,
+                                "output_text_done": False,
+                                "content_part_done": False,
+                            }
+                if etype == "response.content_part.added":
+                    idx = payload.get("output_index")
+                    if isinstance(idx, int) and idx in open_messages:
+                        open_messages[idx]["content_part_added"] = True
+                        ci = payload.get("content_index")
+                        if isinstance(ci, int):
+                            open_messages[idx]["content_index"] = ci
                 if etype == "response.output_text.delta":
                     delta = payload.get("delta")
                     if isinstance(delta, str) and delta:
                         message_emitted = True
                         message_text_accum += delta
+                        idx = payload.get("output_index")
+                        if isinstance(idx, int) and idx in open_messages:
+                            open_messages[idx]["text"] += delta
+                if etype == "response.output_text.done":
+                    idx = payload.get("output_index")
+                    if isinstance(idx, int) and idx in open_messages:
+                        open_messages[idx]["output_text_done"] = True
+                if etype == "response.content_part.done":
+                    idx = payload.get("output_index")
+                    if isinstance(idx, int) and idx in open_messages:
+                        open_messages[idx]["content_part_done"] = True
+                if etype == "response.output_item.done":
+                    idx = payload.get("output_index")
+                    if isinstance(idx, int) and idx in open_messages:
+                        # Upstream closed it properly — nothing to
+                        # synthesize for this index.
+                        open_messages.pop(idx, None)
 
                 # vLLM #39426 SSE rewrite (only when feature enabled)
                 if do_parallel_fix:
@@ -1467,6 +1701,44 @@ async def _stream_responses(
         return
 
     response_obj = completed_payload.get("response") or {}
+
+    # Diagnostic trace — useful for debugging silent/empty responses
+    # like "happy spawns codex but no answer ever shows". Logged for
+    # every responses-API completion. Cheap and easy to grep.
+    if profile.name in {"codex", "default"}:
+        items = response_obj.get("output") or []
+        item_summary = []
+        for it in items:
+            if not isinstance(it, dict):
+                item_summary.append(type(it).__name__)
+                continue
+            t = it.get("type", "?")
+            if t == "message":
+                texts = []
+                for p in it.get("content") or []:
+                    if isinstance(p, dict) and p.get("type") == "output_text":
+                        texts.append((p.get("text") or "")[:80])
+                item_summary.append(f"message[role={it.get('role')},text={texts!r}]")
+            elif t == "function_call":
+                item_summary.append(f"function_call[name={it.get('name')}]")
+            elif t == "reasoning":
+                summary_parts = it.get("summary") or []
+                item_summary.append(
+                    f"reasoning[summary_parts={len(summary_parts)},"
+                    f"content_chars={sum(len((c.get('text') or '')) for c in it.get('content') or [] if isinstance(c, dict))}]"
+                )
+            else:
+                item_summary.append(t)
+        print(
+            f"[codex-trace] profile={profile.name} status={response_obj.get('status')!r}"
+            f" finish_reason={response_obj.get('incomplete_details') or 'OK'}"
+            f" items={item_summary}"
+            f" message_emitted={message_emitted}"
+            f" message_text_chars={len(message_text_accum)}"
+            f" message_text_preview={message_text_accum[:120]!r}"
+            f" reasoning_chars={len(reasoning_accum)}",
+            flush=True,
+        )
 
     # Try recoveries in order. Each is gated by the profile feature flag.
     # Both overflow and silent-completion use the same continue_final_message
@@ -1598,6 +1870,77 @@ async def _stream_responses(
             _broadcast_usage(record)
         yield _sse(fixed_completed)
         return
+
+    # NaN's /v1/responses stream sometimes omits the closing events for
+    # message items (output_text.done, content_part.done,
+    # output_item.done) — Codex CLI then never fires its own
+    # `item/completed`, so happy never receives an `agent_message`
+    # event. Synthesize the missing events here so the answer is
+    # actually delivered to the client.
+    seq = last_seq
+    for idx, st in list(open_messages.items()):
+        if not st["text"]:
+            # The item was opened but never produced text — likely a
+            # tool_call wrapper, leave it alone.
+            continue
+        if not st["output_text_done"]:
+            seq += 1
+            yield _sse(
+                {
+                    "type": "response.output_text.done",
+                    "item_id": st["id"],
+                    "output_index": idx,
+                    "content_index": st["content_index"],
+                    "text": st["text"],
+                    "sequence_number": seq,
+                    "model": st["model"],
+                }
+            )
+        if not st["content_part_done"]:
+            seq += 1
+            yield _sse(
+                {
+                    "type": "response.content_part.done",
+                    "item_id": st["id"],
+                    "output_index": idx,
+                    "content_index": st["content_index"],
+                    "part": {
+                        "type": "output_text",
+                        "text": st["text"],
+                        "annotations": [],
+                    },
+                    "sequence_number": seq,
+                    "model": st["model"],
+                }
+            )
+        seq += 1
+        yield _sse(
+            {
+                "type": "response.output_item.done",
+                "output_index": idx,
+                "item": {
+                    "id": st["id"],
+                    "type": "message",
+                    "role": st["role"],
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": st["text"],
+                            "annotations": [],
+                        }
+                    ],
+                },
+                "sequence_number": seq,
+                "model": st["model"],
+            }
+        )
+        open_messages.pop(idx, None)
+    if seq != last_seq:
+        # We synthesized events — bump the sequence_number on the
+        # buffered completed payload so it doesn't go backwards.
+        completed_payload = dict(completed_payload)
+        completed_payload["sequence_number"] = seq + 1
 
     # No recovery applied — emit the original completed event.
     record = _extract_usage(profile.name, model_hint, response_obj)
