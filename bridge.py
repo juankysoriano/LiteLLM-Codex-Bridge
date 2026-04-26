@@ -3070,6 +3070,70 @@ def _dashboard_html() -> str:
       margin: 0.4rem 0 0.2rem 0; }}
     .body-label .dim {{ text-transform: none; letter-spacing: 0; opacity: 0.6; }}
 
+    /* Profile editor — compact */
+    .editor-hint {{ color: var(--dim); font-size: 0.78em;
+      margin: 0 0 0.5rem 0; }}
+    .editor-actions {{ margin-top: 0.5rem; display: flex; align-items: center; gap: 0.6rem; }}
+    .editor-btn {{ background: var(--panel2); border: 1px solid var(--line);
+      color: var(--fg); padding: 0.18rem 0.5rem; border-radius: 3px;
+      cursor: pointer; font: inherit; font-size: 0.76rem; }}
+    .editor-btn:hover {{ border-color: var(--accent); color: var(--accent); }}
+    .editor-btn.danger {{ color: var(--bad); }}
+    .editor-btn.danger:hover {{ border-color: var(--bad); }}
+    .editor-btn.primary {{ background: rgba(121, 192, 255, 0.1); color: var(--accent); border-color: var(--accent); }}
+    .editor-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+    .editor-status {{ font-size: 0.76rem; color: var(--dim); }}
+    .editor-status.ok {{ color: var(--good); }}
+    .editor-status.err {{ color: var(--bad); }}
+
+    .profile-row {{ background: var(--panel2); border-radius: 4px;
+      padding: 0.4rem 0.55rem; margin-bottom: 0.35rem;
+      border: 1px solid transparent; }}
+    .profile-row.dirty {{ border-color: var(--warn); }}
+    .pf-head {{ display: flex; align-items: center;
+      gap: 0.5rem; flex-wrap: wrap; }}
+    .pf-head .pf-name {{ font-weight: 500; color: var(--accent);
+      font-size: 0.85rem; min-width: 6rem; }}
+    .pf-head .pf-name input {{ background: transparent; border: none;
+      color: var(--accent); font: inherit; font-size: 0.85rem;
+      font-weight: 500; padding: 0.05rem 0.2rem; border-radius: 2px;
+      border-bottom: 1px dashed var(--accent); width: 10rem; }}
+    .pf-head .pf-default {{ color: var(--dim); font-size: 0.7rem;
+      text-transform: uppercase; letter-spacing: 0.05em;
+      padding: 0.05rem 0.3rem; border: 1px solid var(--line); border-radius: 2px; }}
+    .pf-inline {{ display: inline-flex; align-items: center; gap: 0.25rem; }}
+    .pf-inline label {{ font-size: 0.7rem; color: var(--dim); }}
+    .pf-inline select, .pf-inline input {{ background: var(--panel);
+      border: 1px solid var(--line); color: var(--fg);
+      padding: 0.1rem 0.3rem; font: inherit; font-size: 0.78rem;
+      border-radius: 2px; }}
+    .pf-inline input[type="number"] {{ width: 4.5rem; }}
+    .pf-inline input:focus, .pf-inline select:focus {{ border-color: var(--accent); outline: none; }}
+    .pf-actions-inline {{ margin-left: auto; display: inline-flex; gap: 0.35rem; }}
+
+    .pf-secondary {{ display: flex; align-items: flex-start;
+      gap: 0.6rem; margin-top: 0.3rem; }}
+    .pf-secondary .pf-features {{ flex: 1; display: flex; flex-wrap: wrap;
+      gap: 0.2rem 0.3rem; }}
+    .pf-secondary .pf-aliases {{ flex: 0 0 auto; min-width: 14rem; }}
+    .pf-feature {{ display: inline-flex; align-items: center; gap: 0.2rem;
+      cursor: pointer; user-select: none; font-size: 0.72rem;
+      padding: 0.05rem 0.3rem; border: 1px solid var(--line); border-radius: 2px;
+      background: var(--panel); color: var(--dim); }}
+    .pf-feature.on {{ color: var(--accent); border-color: var(--accent); }}
+    .pf-feature input {{ display: none; }}
+
+    .pf-aliases-label {{ font-size: 0.7rem; text-transform: uppercase;
+      letter-spacing: 0.05em; color: var(--dim); margin-bottom: 0.15rem; }}
+    .pf-alias-row {{ display: flex; gap: 0.2rem; margin-bottom: 0.15rem; align-items: center; }}
+    .pf-alias-row input {{ flex: 1; background: var(--panel);
+      border: 1px solid var(--line); color: var(--fg); padding: 0.1rem 0.3rem;
+      font: inherit; font-size: 0.74rem; border-radius: 2px; min-width: 0; }}
+    .pf-alias-arrow {{ color: var(--dim); font-size: 0.78em; }}
+    .pf-alias-del {{ background: transparent; border: 1px solid var(--line);
+      color: var(--bad); padding: 0 0.3rem; border-radius: 2px;
+      font: inherit; font-size: 0.74rem; cursor: pointer; }}
+
     /* Sparkline */
     .spark {{ display: block; width: 100%; height: 40px; }}
 
@@ -3178,6 +3242,20 @@ def _dashboard_html() -> str:
       </tr></thead>
       <tbody id="profiles-body"><tr><td colspan="9" class="empty">loading…</td></tr></tbody>
     </table>
+  </div>
+
+  <h2>Profile editor</h2>
+  <div class="card">
+    <p class="editor-hint">
+      Edit, add, or remove profiles. Saves go to
+      <code id="editor-config-path">~/.config/resilient-llm-bridge/config.yaml</code>
+      and apply immediately (no restart).
+    </p>
+    <div id="profile-editor"></div>
+    <div class="editor-actions">
+      <button class="editor-btn" id="profile-add">+ new profile</button>
+      <span class="editor-status" id="editor-status"></span>
+    </div>
   </div>
 
   <h2>Per-model</h2>
@@ -3471,23 +3549,16 @@ def _dashboard_html() -> str:
               `<td class="${{statusClass(r.status)}}">${{r.status}}</td>` +
               `<td class="num ${{latClass(r.duration_ms)}}">${{fmtMs(r.duration_ms)}}</td>` +
               `<td>${{renderParams(r.params)}}</td></tr>`;
-            const bodyJson = r.body ? jsonHighlight(r.body) :
-              '<span class="jnull">no body captured (passthrough or non-JSON request)</span>';
-            // Show both the client-sent body and what we forwarded
-            // upstream. The forwarded view is annotated with diff
-            // markers so bridge-injected fields stand out (green
-            // +bridge tag) and changed values show their previous
-            // value (orange "was X" tag).
-            const forwardedBlock = r.forwarded
-              ? `<div class="body-label">forwarded upstream <span class="dim">(post-transform · diff vs client)</span></div>` +
-                `<div class="body-pre">${{annotatedJson(r.forwarded, r.body)}}</div>`
-              : '';
+            // Forwarded body is enough — it shows everything the
+            // client sent plus inline diff markers (green +bridge for
+            // injected fields, orange "was X" for changed values).
+            const bodyJson = r.forwarded
+              ? annotatedJson(r.forwarded, r.body)
+              : (r.body
+                  ? jsonHighlight(r.body)
+                  : '<span class="jnull">no body captured</span>');
             const expand = `<tr class="${{bodyCls}}" id="${{targetId}}">` +
-              `<td colspan="7">` +
-              `<div class="body-label">client sent <span class="dim">(pre-transform)</span></div>` +
-              `<div class="body-pre">${{bodyJson}}</div>` +
-              `${{forwardedBlock}}` +
-              `</td></tr>`;
+              `<td colspan="7"><div class="body-pre">${{bodyJson}}</div></td></tr>`;
             return main + expand;
           }}).join('');
       // Wire click handlers for expandable rows. Toggle both the
@@ -3665,6 +3736,289 @@ def _dashboard_html() -> str:
 
     refreshStats();
     setInterval(refreshStats, 5000);
+
+    /* ========================================================================
+       Profile editor
+       ======================================================================== */
+    let editorState = null;  // {{profiles: [...], originals: Map<name,obj>, upstreams, available_features, default_profile}}
+    const editorStatus = $('editor-status');
+
+    function setStatus(text, kind) {{
+      editorStatus.textContent = text || '';
+      editorStatus.className = 'editor-status' + (kind ? ' ' + kind : '');
+    }}
+    function fadeStatus(text, kind, ms) {{
+      setStatus(text, kind);
+      window.setTimeout(() => {{
+        if (editorStatus.textContent === text) setStatus('');
+      }}, ms || 3000);
+    }}
+
+    function emptyAliases() {{ return []; }}
+    function aliasesToList(map) {{
+      return Object.entries(map || {{}}).map(([from, to]) => ({{ from, to }}));
+    }}
+    function aliasesToMap(list) {{
+      const out = {{}};
+      for (const item of (list || [])) {{
+        const f = (item.from || '').trim();
+        const t = (item.to || '').trim();
+        if (f && t) out[f] = t;
+      }}
+      return out;
+    }}
+
+    function profileToEditable(p) {{
+      return {{
+        name: p.name,
+        upstream: p.upstream,
+        queue_priority: p.queue_priority,
+        default_thinking_budget: p.default_thinking_budget,
+        features: new Set(p.features || []),
+        aliases: aliasesToList(p.model_aliases),
+        isNew: false,
+      }};
+    }}
+
+    async function loadEditor() {{
+      try {{
+        const r = await fetch('/config');
+        if (!r.ok) throw new Error('config returned ' + r.status);
+        const d = await r.json();
+        $('editor-config-path').textContent = d.config_path || '~/.config/resilient-llm-bridge/config.yaml';
+        editorState = {{
+          profiles: (d.profiles || []).map(profileToEditable),
+          originals: new Map((d.profiles || []).map((p) => [p.name, JSON.stringify(p)])),
+          upstreams: (d.upstreams || []).map((u) => u.name),
+          available_features: d.available_features || [],
+          default_profile: d.default_profile,
+        }};
+        renderEditor();
+      }} catch (e) {{
+        setStatus('failed to load config: ' + (e?.message || e), 'err');
+      }}
+    }}
+
+    function isDirty(prof) {{
+      if (prof.isNew) return true;
+      const original = editorState.originals.get(prof.name);
+      if (!original) return true;
+      const current = JSON.stringify({{
+        name: prof.name,
+        upstream: prof.upstream,
+        features: [...prof.features].sort(),
+        queue_priority: prof.queue_priority,
+        default_thinking_budget: prof.default_thinking_budget,
+        model_aliases: aliasesToMap(prof.aliases),
+      }});
+      return current !== original;
+    }}
+
+    function renderEditor() {{
+      if (!editorState) return;
+      const root = $('profile-editor');
+      const upstreamOpts = editorState.upstreams
+        .map((u) => `<option value="${{escapeHtml(u)}}">${{escapeHtml(u)}}</option>`).join('');
+      const html = editorState.profiles.map((prof, idx) => {{
+        const dirty = isDirty(prof);
+        const featuresHtml = editorState.available_features.map((f) => {{
+          const on = prof.features.has(f);
+          return `<label class="pf-feature ${{on ? 'on' : ''}}" data-idx="${{idx}}" data-feature="${{escapeHtml(f)}}">` +
+            `<input type="checkbox" ${{on ? 'checked' : ''}}>` +
+            `${{escapeHtml(f)}}</label>`;
+        }}).join('');
+        const aliasesHtml = (prof.aliases || []).map((al, ai) =>
+          `<div class="pf-alias-row">` +
+            `<input data-idx="${{idx}}" data-alias-idx="${{ai}}" data-alias-key="from" placeholder="from" value="${{escapeHtml(al.from)}}">` +
+            `<span class="pf-alias-arrow">→</span>` +
+            `<input data-idx="${{idx}}" data-alias-idx="${{ai}}" data-alias-key="to" placeholder="to" value="${{escapeHtml(al.to)}}">` +
+            `<button class="pf-alias-del" data-idx="${{idx}}" data-alias-del="${{ai}}" type="button">×</button>` +
+          `</div>`
+        ).join('');
+        const selected = (val) => prof.upstream === val ? 'selected' : '';
+        const upstreamSel = editorState.upstreams.map((u) =>
+          `<option value="${{escapeHtml(u)}}" ${{selected(u)}}>${{escapeHtml(u)}}</option>`
+        ).join('');
+        return `<div class="profile-row ${{dirty ? 'dirty' : ''}}" data-idx="${{idx}}">` +
+          `<div class="pf-head">` +
+            (prof.isNew
+              ? `<span class="pf-name"><input data-idx="${{idx}}" data-key="name" value="${{escapeHtml(prof.name)}}" placeholder="name"></span>`
+              : `<span class="pf-name">${{escapeHtml(prof.name)}}</span>`) +
+            (prof.name === editorState.default_profile
+              ? `<span class="pf-default">default</span>`
+              : '') +
+            `<span class="pf-inline"><label>upstream</label>` +
+              `<select data-idx="${{idx}}" data-key="upstream">${{upstreamSel}}</select></span>` +
+            `<span class="pf-inline" title="higher = jumps ahead of others"><label>priority</label>` +
+              `<input type="number" data-idx="${{idx}}" data-key="queue_priority" value="${{prof.queue_priority}}"></span>` +
+            `<span class="pf-inline"><label>budget</label>` +
+              `<input type="number" min="0" max="64000" data-idx="${{idx}}" data-key="default_thinking_budget" value="${{prof.default_thinking_budget}}"></span>` +
+            `<span class="pf-actions-inline">` +
+              `<button class="editor-btn danger" data-idx="${{idx}}" data-action="delete" type="button">delete</button>` +
+              `<button class="editor-btn primary" data-idx="${{idx}}" data-action="save" type="button" ${{dirty ? '' : 'disabled'}}>${{prof.isNew ? 'create' : 'save'}}</button>` +
+            `</span>` +
+          `</div>` +
+          `<div class="pf-secondary">` +
+            `<div class="pf-features">${{featuresHtml}}</div>` +
+            `<div class="pf-aliases">` +
+              `<div class="pf-aliases-label">model aliases</div>` +
+              `${{aliasesHtml}}` +
+              `<button class="editor-btn" data-idx="${{idx}}" data-action="alias-add" type="button">+ alias</button>` +
+            `</div>` +
+          `</div>` +
+        `</div>`;
+      }}).join('');
+      root.innerHTML = html;
+      wireEditorHandlers();
+    }}
+
+    function wireEditorHandlers() {{
+      const root = $('profile-editor');
+      root.querySelectorAll('input[data-key], select[data-key]').forEach((el) => {{
+        el.addEventListener('input', (e) => {{
+          const t = e.target;
+          const idx = Number(t.dataset.idx);
+          const key = t.dataset.key;
+          const prof = editorState.profiles[idx];
+          if (!prof) return;
+          if (key === 'queue_priority' || key === 'default_thinking_budget') {{
+            prof[key] = Number(t.value);
+          }} else {{
+            prof[key] = t.value;
+          }}
+          renderEditor();
+        }});
+      }});
+      root.querySelectorAll('.pf-feature').forEach((el) => {{
+        el.addEventListener('click', (e) => {{
+          if (e.target.tagName === 'INPUT') return; // let the checkbox handle itself
+          e.preventDefault();
+          const idx = Number(el.dataset.idx);
+          const feature = el.dataset.feature;
+          const prof = editorState.profiles[idx];
+          if (!prof) return;
+          if (prof.features.has(feature)) prof.features.delete(feature);
+          else prof.features.add(feature);
+          renderEditor();
+        }});
+      }});
+      root.querySelectorAll('input[data-alias-key]').forEach((el) => {{
+        el.addEventListener('input', (e) => {{
+          const t = e.target;
+          const idx = Number(t.dataset.idx);
+          const ai = Number(t.dataset.aliasIdx);
+          const which = t.dataset.aliasKey;
+          const prof = editorState.profiles[idx];
+          if (!prof || !prof.aliases[ai]) return;
+          prof.aliases[ai][which] = t.value;
+          // No re-render on every keystroke (cursor jumps); only refresh dirty flag.
+          const row = root.querySelector(`.profile-row[data-idx="${{idx}}"]`);
+          if (row) row.classList.toggle('dirty', isDirty(prof));
+          const saveBtn = root.querySelector(`button[data-idx="${{idx}}"][data-action="save"]`);
+          if (saveBtn) saveBtn.disabled = !isDirty(prof);
+        }});
+      }});
+      root.querySelectorAll('button[data-action]').forEach((el) => {{
+        el.addEventListener('click', () => {{
+          const idx = Number(el.dataset.idx);
+          const action = el.dataset.action;
+          const prof = editorState.profiles[idx];
+          if (!prof) return;
+          if (action === 'alias-add') {{
+            prof.aliases.push({{ from: '', to: '' }});
+            renderEditor();
+          }} else if (action === 'delete') {{
+            void deleteProfile(idx);
+          }} else if (action === 'save') {{
+            void saveProfile(idx);
+          }}
+        }});
+      }});
+      root.querySelectorAll('button[data-alias-del]').forEach((el) => {{
+        el.addEventListener('click', () => {{
+          const idx = Number(el.dataset.idx);
+          const ai = Number(el.dataset.aliasDel);
+          const prof = editorState.profiles[idx];
+          if (!prof) return;
+          prof.aliases.splice(ai, 1);
+          renderEditor();
+        }});
+      }});
+    }}
+
+    async function saveProfile(idx) {{
+      const prof = editorState.profiles[idx];
+      if (!prof) return;
+      const trimmedName = (prof.name || '').trim();
+      if (!trimmedName) {{
+        setStatus('profile name required', 'err');
+        return;
+      }}
+      setStatus(`saving ${{trimmedName}}…`);
+      const payload = {{
+        upstream: prof.upstream,
+        features: [...prof.features],
+        queue_priority: prof.queue_priority,
+        default_thinking_budget: prof.default_thinking_budget,
+        model_aliases: aliasesToMap(prof.aliases),
+      }};
+      try {{
+        const r = await fetch('/config/profiles/' + encodeURIComponent(trimmedName), {{
+          method: 'PUT',
+          headers: {{ 'content-type': 'application/json' }},
+          body: JSON.stringify(payload),
+        }});
+        const d = await r.json().catch(() => ({{}}));
+        if (!r.ok) throw new Error(d.error || ('save returned ' + r.status));
+        fadeStatus(`saved ${{trimmedName}}`, 'ok');
+        await loadEditor();
+      }} catch (e) {{
+        setStatus(`save failed: ${{e?.message || e}}`, 'err');
+      }}
+    }}
+
+    async function deleteProfile(idx) {{
+      const prof = editorState.profiles[idx];
+      if (!prof) return;
+      if (prof.isNew) {{
+        editorState.profiles.splice(idx, 1);
+        renderEditor();
+        return;
+      }}
+      if (!window.confirm(`Delete profile "${{prof.name}}"?`)) return;
+      setStatus(`deleting ${{prof.name}}…`);
+      try {{
+        const r = await fetch('/config/profiles/' + encodeURIComponent(prof.name), {{
+          method: 'DELETE',
+        }});
+        const d = await r.json().catch(() => ({{}}));
+        if (!r.ok) throw new Error(d.error || ('delete returned ' + r.status));
+        fadeStatus(`deleted ${{prof.name}}`, 'ok');
+        await loadEditor();
+      }} catch (e) {{
+        setStatus(`delete failed: ${{e?.message || e}}`, 'err');
+      }}
+    }}
+
+    $('profile-add').addEventListener('click', () => {{
+      if (!editorState) return;
+      const upstream = editorState.upstreams[0] || '';
+      editorState.profiles.push({{
+        name: '',
+        upstream,
+        queue_priority: 0,
+        default_thinking_budget: 4096,
+        features: new Set(['qwen_sampling_defaults', 'effort_to_thinking_budget',
+          'thinking_overflow_recovery', 'silent_completion_recovery',
+          'truncated_content_recovery', 'empty_with_stop_retry',
+          'drop_oai_only_fields']),
+        aliases: emptyAliases(),
+        isNew: true,
+      }});
+      renderEditor();
+    }});
+
+    loadEditor();
   </script>
 </body>
 </html>
