@@ -962,12 +962,129 @@ def _retry_policy(cfg: UpstreamConfig) -> AsyncRetrying:
 
 USAGE_RING_SIZE = int(os.environ.get("BRIDGE_USAGE_RING_SIZE", "5000"))
 ACTIVITY_RING_SIZE = int(os.environ.get("BRIDGE_ACTIVITY_RING_SIZE", "5000"))
+LOG_MAX_FILES = int(os.environ.get("BRIDGE_LOG_MAX_FILES", "7"))
+LOG_MAX_BYTES = int(os.environ.get("BRIDGE_LOG_MAX_BYTES", str(512 * 1024 * 1024)))
 
 _usage_history: deque[dict] = deque(maxlen=USAGE_RING_SIZE)
 _usage_subscribers: set[asyncio.Queue[dict]] = set()
 _activity_history: deque[dict] = deque(maxlen=ACTIVITY_RING_SIZE)
 _activity_subscribers: set[asyncio.Queue[dict]] = set()
 _started_at = time.time()
+
+# Disk log data dir (same location as config)
+_CONFIG_DIR = Path(
+    os.environ.get(
+        "BRIDGE_CONFIG_PATH",
+        os.path.expanduser("~/.config/resilient-llm-bridge/config.yaml"),
+    )
+).parent
+LOG_DIR = Path(os.environ.get("BRIDGE_LOG_DIR", str(_CONFIG_DIR / "logs")))
+
+# Current log file handles (opened per-session, rotated by size)
+_activity_log_file = None
+_usage_log_file = None
+_activity_log_size = 0
+_usage_log_size = 0
+_log_lock = asyncio.Lock() if False else None  # lock is not needed — single-threaded ASGI
+
+
+def _ensure_log_dir() -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _rotate_log(filename: str, current_size: int) -> int:
+    """Rotate JSONL log files. Keep at most LOG_MAX_FILES files, total <= LOG_MAX_BYTES."""
+    _ensure_log_dir()
+    base = LOG_DIR / filename
+    # Remove oldest if we already have LOG_MAX_FILES files
+    existing = sorted(LOG_DIR.glob(filename.replace("*", ".*") + ".*"))
+    while len(existing) >= LOG_MAX_FILES:
+        oldest = existing.pop(0)
+        try:
+            oldest.unlink()
+        except OSError:
+            pass
+    # Rename current to numbered
+    if base.exists():
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        rotated = LOG_DIR / f"{filename}.{ts}"
+        # Avoid collision
+        counter = 0
+        while (rotated := LOG_DIR / f"{filename}.{ts}-{counter}").exists():
+            counter += 1
+        try:
+            base.rename(rotated)
+        except OSError:
+            pass
+    return 0
+
+
+def _write_log(filename: str, record: dict) -> None:
+    """Append a single JSON record to the named log file, rotating if needed."""
+    _ensure_log_dir()
+    global _activity_log_file, _usage_log_file, _activity_log_size, _usage_log_size
+
+    target = LOG_DIR / filename
+    fh = None
+    try:
+        if filename == "activity.jsonl":
+            fh = _activity_log_file
+            if fh is None or fh.closed:
+                fh = open(target, "a", encoding="utf-8")
+                _activity_log_file = fh
+        else:
+            fh = _usage_log_file
+            if fh is None or fh.closed:
+                fh = open(target, "a", encoding="utf-8")
+                _usage_log_file = fh
+
+        line = json.dumps(record, default=str, ensure_ascii=False) + "\n"
+        line_bytes = len(line.encode("utf-8"))
+
+        # Rotate if this write would exceed the per-file budget
+        budget = max(1, LOG_MAX_BYTES // LOG_MAX_FILES)
+        if (filename == "activity.jsonl" and _activity_log_size + line_bytes > budget) or \
+           (filename == "usage.jsonl" and _usage_log_size + line_bytes > budget):
+            if fh and not fh.closed:
+                try:
+                    fh.flush()
+                    fh.close()
+                except OSError:
+                    pass
+            _rotate_log(filename, 0)
+            if filename == "activity.jsonl":
+                _activity_log_size = 0
+            else:
+                _usage_log_size = 0
+            fh = open(target, "a", encoding="utf-8")
+            if filename == "activity.jsonl":
+                _activity_log_file = fh
+            else:
+                _usage_log_file = fh
+
+        fh.write(line)
+        fh.flush()
+
+        if filename == "activity.jsonl":
+            _activity_log_size += line_bytes
+        else:
+            _usage_log_size += line_bytes
+    except OSError:
+        pass
+
+
+def _cleanup_old_logs() -> None:
+    """Remove any orphaned log files that exceed the cap."""
+    _ensure_log_dir()
+    all_logs = sorted(LOG_DIR.glob("activity.jsonl.*")) + sorted(LOG_DIR.glob("usage.jsonl.*"))
+    total = sum(f.stat().st_size for f in all_logs if f.exists())
+    while len(all_logs) > LOG_MAX_FILES and total > LOG_MAX_BYTES:
+        oldest = all_logs.pop(0)
+        try:
+            total -= oldest.stat().st_size
+            oldest.unlink()
+        except OSError:
+            pass
 
 # Lifetime counters for recovery firings + retries. These are cheap so we
 # track them since process start; for time-windowed views the dashboard
@@ -991,9 +1108,12 @@ def _broadcast_usage(record: dict) -> None:
     _usage_history.append(record)
     print(
         f"usage profile={record.get('profile')} model={record.get('model')}"
-        f" in={record.get('input_tokens')} out={record.get('output_tokens')}",
+        f" in={record.get('input_tokens')} out={record.get('output_tokens')}"
+        f" think={record.get('thinking_tokens')}"
+        f" total_out={record.get('total_output_tokens')}",
         flush=True,
     )
+    _write_log("usage.jsonl", record)
     for queue in list(_usage_subscribers):
         try:
             queue.put_nowait(record)
@@ -1003,6 +1123,7 @@ def _broadcast_usage(record: dict) -> None:
 
 def _broadcast_activity(record: dict) -> None:
     _activity_history.append(record)
+    _write_log("activity.jsonl", record)
     for queue in list(_activity_subscribers):
         try:
             queue.put_nowait(record)
@@ -2428,6 +2549,7 @@ def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict
                 "tokens_in": 0,
                 "tokens_out": 0,
                 "duration_ms": [],
+                "total_duration_ms": 0,
             }
         return d[key]
 
@@ -2438,6 +2560,7 @@ def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict
             b["errors"] += 1
         if "duration_ms" in row:
             b["duration_ms"].append(row["duration_ms"])
+            b["total_duration_ms"] += row["duration_ms"]
     for row in usage_rows:
         b_p = _bucket(by_profile, row.get("profile") or "?")
         b_m = _bucket(by_model, row.get("model") or "?")
@@ -2460,6 +2583,7 @@ def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict
         "errors_5xx": sum(1 for s in statuses if s >= 500),
         "tokens_in": sum(int(r.get("input_tokens") or 0) for r in usage_rows),
         "tokens_out": sum(int(r.get("total_output_tokens") or r.get("output_tokens") or 0) for r in usage_rows),
+        "total_duration_ms": sum(r.get("duration_ms", 0) for r in activity_rows),
         "p50_ms": round(_percentile(durations, 0.50), 1),
         "p95_ms": round(_percentile(durations, 0.95), 1),
         "p99_ms": round(_percentile(durations, 0.99), 1),
@@ -2500,6 +2624,37 @@ async def stats() -> dict:
         u = [r for r in usage if r.get("ts", 0) >= cutoff]
         out["windows"][label] = _aggregate_window(a, u)
     return out
+
+
+@app.get("/history")
+async def history() -> dict:
+    """Return last entries from disk logs for dashboard initial load."""
+    activity: list[dict] = []
+    usage: list[dict] = []
+    for fname in ("activity.jsonl", "usage.jsonl"):
+        path = LOG_DIR / fname
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+        except OSError:
+            continue
+        # Strip body/forwarded from activity entries — too large for
+        # dashboard initial load. Decode failures are tolerated (log
+        # files can have a partially-flushed last line).
+        for line in lines[-200:]:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if fname == "activity.jsonl":
+                obj.pop("body", None)
+                obj.pop("forwarded", None)
+                activity.append(obj)
+            else:
+                usage.append(obj)
+    return {"activity": activity, "usage": usage}
 
 
 @app.get("/usage/stream")
@@ -3028,6 +3183,118 @@ async def profile_chat_completions(profile_name: str, request: Request):
     return await _handle_chat_completions(request, profile)
 
 
+def _synthesize_model_metadata(profile: ProfileConfig, model_id: str) -> dict:
+    """Produce an OpenAI-style /v1/models/{id} response enriched with
+    the per-upstream context_window so clients (notably hermes) can
+    skip the 200K default fallback and use the real number for their
+    compaction thresholds.
+
+    Resolves aliases through the profile so a client asking for
+    `nan-thinking` gets back `id: "nan-thinking"` (matches what they
+    configured) but the metadata reflects the real upstream model.
+    """
+    cfg = CONFIG.upstreams[profile.upstream]
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": int(_started_at),
+        "owned_by": cfg.name,
+        "context_length": cfg.context_window,
+        "max_context_length": cfg.context_window,
+        "max_completion_tokens": 32000,
+        "capabilities": {
+            "reasoning": True,
+            "tool_call": True,
+            "completion": True,
+        },
+    }
+
+
+def _enrich_models_list(payload: dict, profile: ProfileConfig) -> dict:
+    """Add context_length / max_completion_tokens to upstream's
+    /v1/models response so hermes' recursive metadata walker picks
+    them up. Idempotent — preserves whatever the upstream already
+    declared and only fills missing fields.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    models = payload.get("data")
+    if not isinstance(models, list):
+        return payload
+    cfg = CONFIG.upstreams[profile.upstream]
+    enriched: list = []
+    for m in models:
+        if not isinstance(m, dict):
+            enriched.append(m)
+            continue
+        m = dict(m)
+        m.setdefault("context_length", cfg.context_window)
+        m.setdefault("max_context_length", cfg.context_window)
+        m.setdefault("max_completion_tokens", 32000)
+        enriched.append(m)
+    payload = dict(payload)
+    payload["data"] = enriched
+    return payload
+
+
+@app.get("/{profile_name}/v1/models/{model_id:path}")
+async def profile_model_details(profile_name: str, model_id: str, request: Request):
+    """Synthesize per-model metadata. NaN-style backends serve the
+    list at /v1/models but return 404 here; hermes falls back to a
+    200K context default which makes its compaction thresholds
+    misalign with the real 131K limit. We give it the truth instead."""
+    profile = CONFIG.profile(profile_name)
+    return JSONResponse(_synthesize_model_metadata(profile, model_id))
+
+
+@app.get("/{profile_name}/v1/models")
+async def profile_models_list(profile_name: str, request: Request):
+    """Proxy the upstream's /v1/models and enrich each entry with
+    context_length etc. so clients don't have to guess."""
+    profile = CONFIG.profile(profile_name)
+    started = time.monotonic()
+    upstream_url = f"{_upstream_url(profile)}/models"
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in {"host", "content-length"}
+    }
+    cfg = CONFIG.upstreams[profile.upstream]
+    try:
+        async for attempt in _retry_policy(cfg):
+            with attempt:
+                async with _gated(profile):
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+                        r = await client.get(upstream_url, headers=headers)
+                if r.status_code in _RETRYABLE_STATUS:
+                    raise _UpstreamHTTPError(r.status_code, r.text)
+                payload: Any
+                try:
+                    payload = r.json()
+                except (ValueError, json.JSONDecodeError):
+                    payload = None
+                _record_activity(
+                    profile,
+                    f"/{profile.name}/v1/models",
+                    "GET",
+                    r.status_code,
+                    (time.monotonic() - started) * 1000,
+                )
+                if r.status_code >= 400 or not isinstance(payload, dict):
+                    return Response(
+                        content=r.content,
+                        status_code=r.status_code,
+                        media_type=r.headers.get("content-type"),
+                    )
+                return JSONResponse(_enrich_models_list(payload, profile))
+    except (RetryError, _UpstreamHTTPError) as exc:
+        status = getattr(exc, "status", 502)
+        body_text = getattr(exc, "body", str(exc))
+        return JSONResponse(_coerce_error_payload(status, body_text), status_code=status)
+    except _QueueTimeout as exc:
+        return JSONResponse(_coerce_error_payload(503, str(exc)), status_code=503)
+    return JSONResponse({"error": {"message": "unreachable"}}, status_code=502)
+
+
 @app.api_route(
     "/{profile_name}/v1/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -3542,8 +3809,9 @@ def _dashboard_html() -> str:
         ? 'no requests in window'
         : `${{fmtRate(w.requests / span)}} rps · ${{w.errors_4xx || 0}}×4xx · ${{w.errors_5xx || 0}}×5xx`;
       $('kpi-tok-out').textContent = w.tokens_out ? fmt(w.tokens_out) : '—';
-      $('kpi-tok-rate').textContent = w.tokens_out
-        ? `${{fmtRate(w.tokens_out / span)}} tok/s avg`
+      const procSec = (w.total_duration_ms || 0) / 1000;
+      $('kpi-tok-rate').textContent = (w.tokens_out && procSec > 0)
+        ? `${{fmtRate(w.tokens_out / procSec)}} tok/s avg`
         : '—';
       $('kpi-tok-in').textContent = w.tokens_in ? fmt(w.tokens_in) : '—';
       const ratio = w.tokens_in > 0 ? fmtRate(w.tokens_out / w.tokens_in) : '—';
@@ -3664,7 +3932,7 @@ def _dashboard_html() -> str:
             const bodyCls = isExpanded ? 'body-row expanded' : 'body-row';
             const usage = findUsageFor(r.profile, r.ts);
             const tokIn = usage ? fmt(usage.input_tokens) : '—';
-            const tokOut = usage ? fmt(usage.output_tokens) : '—';
+            const tokOut = usage ? fmt(usage.total_output_tokens || usage.output_tokens) : '—';
             const main = `<tr class="${{mainCls}}" data-key="${{key}}" data-target="${{targetId}}">` +
               `<td>${{fmtTime(r.ts)}}</td><td>${{escapeHtml(r.profile)}}</td>` +
               `<td>${{escapeHtml(r.method)}}</td><td><code>${{escapeHtml(r.path)}}</code></td>` +
@@ -3858,7 +4126,22 @@ def _dashboard_html() -> str:
     }};
 
     refreshStats();
-    setInterval(refreshStats, 5000);
+    setInterval(refreshStats, 1000);
+
+    // Load disk history on initial page load.
+    fetch('/history')
+      .then(r => r.json())
+      .then(d => {{
+        if (Array.isArray(d.activity)) {{
+          activityRows = d.activity;
+          if (activityRows.length > 1000) activityRows = activityRows.slice(-1000);
+        }}
+        if (Array.isArray(d.usage)) {{
+          usageRows = d.usage;
+          if (usageRows.length > 1000) usageRows = usageRows.slice(-1000);
+        }}
+      }})
+      .catch(() => {{}});
 
     /* ========================================================================
        Profile editor
