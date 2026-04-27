@@ -122,6 +122,16 @@ class UpstreamConfig:
     queue_timeout_s: float = 120.0
     # Watchdog: log a warning when a slot has been held this long.
     stuck_warn_s: float = 300.0
+    # Model context window — used to cap the bumped `max_tokens` when
+    # the bridge injects a thinking budget, so we don't push the
+    # request past the model's limit (manifested as a 400
+    # ContextWindowExceeded from the upstream). 131072 = Qwen3
+    # default; tune per upstream if you point at other models.
+    context_window: int = 131072
+    # Safety margin between the estimated prompt size and the cap
+    # we set on `max_tokens`. Tokenization is approximate (chars /
+    # 3.5), so we leave headroom rather than be optimistic.
+    context_safety_margin: int = 1024
 
 
 # Feature flags. Each profile's `features` list selects which to apply.
@@ -538,7 +548,7 @@ _SYSTEM_NOTE_PREFIX = "[system note]\n"
 # Numbers track the Qwen3-30B-A3B-Thinking-2507 model card's anti-verbose
 # defaults. Currently a no-op against deployments missing
 # `--reasoning-parser qwen3` on vLLM (the param is silently dropped).
-_EFFORT_TO_THINKING_BUDGET = {"low": 1024, "medium": 4096, "high": 8192, "xhigh": 16384}
+_EFFORT_TO_THINKING_BUDGET = {"low": 512, "medium": 1024, "high": 2048, "xhigh": 4096}
 _DEFAULT_THINKING_BUDGET = 8192
 
 # Qwen3 thinking-mode sampling. From generation_config.json shipped with
@@ -1010,10 +1020,12 @@ def _extract_usage(profile_name: str, model_hint: str | None, payload: dict) -> 
         "model": model_hint or payload.get("model"),
         "input_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
         "output_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+        "thinking_tokens": int(usage.get("thinking_tokens") or 0),
         "total_tokens": int(usage.get("total_tokens") or 0),
     }
     if record["total_tokens"] == 0:
         record["total_tokens"] = record["input_tokens"] + record["output_tokens"]
+    record["total_output_tokens"] = record["thinking_tokens"] + record["output_tokens"]
     return record
 
 
@@ -1160,27 +1172,72 @@ def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
     body["extra_body"] = extra
 
     if client_unaware_of_thinking:
-        _ensure_room_for_injected_thinking(body, budget)
+        _ensure_room_for_injected_thinking(body, budget, profile)
 
 
 _DEFAULT_ANSWER_TOKENS = 4096
 
 
-def _ensure_room_for_injected_thinking(body: dict, budget: int) -> None:
-    """Always set `max_tokens` / `max_output_tokens` to
-    (client's declared cap or _DEFAULT_ANSWER_TOKENS) + budget.
+def _estimate_prompt_tokens(body: dict) -> int:
+    """Cheap char-based estimate of how many tokens the prompt will
+    consume on the upstream. We don't ship a tokenizer — the bridge
+    runs on a different process and can't import the model's BPE
+    files — so we use the standard 1 token ≈ 3.5 chars heuristic
+    (Qwen runs slightly higher than that, OpenAI tokenizers slightly
+    lower, but both round close enough for capping purposes).
 
-    Treat the client's existing `max_tokens` as the intended ANSWER
-    size — they sized it without knowing we'd inject reasoning. Total
-    cap = answer + reasoning. When the client didn't send any cap at
-    all we substitute `_DEFAULT_ANSWER_TOKENS` so the upstream still
-    sees a bounded total instead of falling back to whatever default
-    vLLM has configured.
+    Walks the obvious string-bearing fields: messages.content,
+    instructions, input items, tools schemas, system prompts. Doesn't
+    try to be exact — false-low estimate would let the upstream
+    enforce, false-high reduces our injected cap a bit.
+    """
+    chars = 0
+    if isinstance(body.get("instructions"), str):
+        chars += len(body["instructions"])
+    if isinstance(body.get("system"), str):
+        chars += len(body["system"])
+    for msg in body.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        c = msg.get("content")
+        if isinstance(c, str):
+            chars += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    chars += len(str(part.get("text") or ""))
+    for item in body.get("input") or []:
+        if not isinstance(item, dict):
+            continue
+        c = item.get("content")
+        if isinstance(c, str):
+            chars += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    chars += len(str(part.get("text") or ""))
+    # Tools schemas count too — they're inlined in the prompt.
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        try:
+            chars += len(json.dumps(tools, default=str))
+        except (TypeError, ValueError):
+            pass
+    return int(chars / 3.5)
 
-    Picks the field that matches the request kind so we don't
-    accidentally set the wrong one:
-      * chat/completions style (body has `messages`)  → `max_tokens`
-      * responses-API style    (body has `input`)     → `max_output_tokens`
+
+def _ensure_room_for_injected_thinking(
+    body: dict, budget: int, profile: ProfileConfig
+) -> None:
+    """Set `max_tokens` / `max_output_tokens` to (client cap or
+    `_DEFAULT_ANSWER_TOKENS`) + budget, but **clamp** so we never
+    push the request past the upstream's `context_window`.
+
+    The clamp matters for long sessions: a client running with a
+    generous `max_tokens=32000` cap on a 130K-token conversation
+    plus our 8K budget injection blew past the limit and the
+    upstream returned 400 ContextWindowExceeded. Estimate the
+    prompt and cap so `prompt + max_tokens < context_window`.
     """
     if "messages" in body:
         field = "max_tokens"
@@ -1190,7 +1247,23 @@ def _ensure_room_for_injected_thinking(body: dict, budget: int) -> None:
         field = "max_tokens"
     current = body.get(field)
     base = current if isinstance(current, int) and current > 0 else _DEFAULT_ANSWER_TOKENS
-    body[field] = base + budget
+    target = base + budget
+
+    upstream_cfg = CONFIG.upstreams.get(profile.upstream)
+    if upstream_cfg is not None:
+        context_window = upstream_cfg.context_window
+        margin = upstream_cfg.context_safety_margin
+        prompt_est = _estimate_prompt_tokens(body)
+        max_allowed = context_window - prompt_est - margin
+        # Always leave at least the budget worth of room — if the
+        # prompt is so big we can't fit even the budget, drop the
+        # cap to a tight `budget + 256` slot and let the upstream
+        # decide whether to fail (better than us forcing a number
+        # we know will fail).
+        max_allowed = max(max_allowed, budget + 256)
+        if target > max_allowed:
+            target = max_allowed
+    body[field] = max(target, 1)
 
 
 def _drop_oai_only_fields(body: dict) -> None:
@@ -1455,6 +1528,65 @@ def _sse(obj: dict) -> bytes:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+def _coerce_error_payload(status: int, body_text: str) -> dict:
+    """Parse the upstream's error text into an OpenAI-shaped envelope
+    (`{error: {message, type, code}}`) so downstream clients can
+    render it. Forwards the upstream's own envelope verbatim when
+    it's already in that shape.
+
+    The bridge previously wrapped errors in `{type:"error", status,
+    body}`, which neither opencode (`@ai-sdk/openai-compatible`) nor
+    codex CLI knows how to parse — both expect either `choices` or a
+    nested `error` object. The Zod failure manifests in happy as a
+    cryptic "expected array, received undefined" instead of the real
+    upstream message.
+    """
+    try:
+        parsed = json.loads(body_text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+        return parsed
+    if isinstance(parsed, dict) and "message" in parsed:
+        return {
+            "error": {
+                "message": str(parsed.get("message")),
+                "type": parsed.get("type") or "upstream_error",
+                "code": str(parsed.get("code") or status),
+            }
+        }
+    return {
+        "error": {
+            "message": body_text or f"upstream HTTP {status}",
+            "type": "upstream_error",
+            "code": str(status),
+        }
+    }
+
+
+def _sse_chat_error(status: int, body_text: str) -> bytes:
+    """Emit a chat/completions-style SSE error event. The shape
+    `{error: {message, type, code}}` is what AI-SDK / OpenAI clients
+    parse on streaming errors."""
+    return _sse(_coerce_error_payload(status, body_text))
+
+
+def _sse_responses_error(status: int, body_text: str) -> bytes:
+    """Emit a responses-API style error event. OpenAI's spec uses an
+    event with `type: "error"` plus `code`/`message` fields. We
+    flatten the payload so both fields are at the top level."""
+    payload = _coerce_error_payload(status, body_text)
+    err = payload.get("error", {}) if isinstance(payload, dict) else {}
+    return _sse(
+        {
+            "type": "error",
+            "code": err.get("code") or str(status),
+            "message": err.get("message") or body_text or "upstream error",
+            "param": err.get("param"),
+        }
+    )
+
+
 def _build_outgoing_headers(request: Request) -> dict[str, str]:
     headers: dict[str, str] = {
         "content-type": "application/json",
@@ -1528,25 +1660,18 @@ async def _stream_responses(
     try:
         client, response = await _open_stream()
     except _QueueTimeout as exc:
-        yield _sse(
-            {
-                "type": "error",
-                "status": 503,
-                "body": str(exc),
-                "retry_after_s": 10,
-            }
-        )
+        yield _sse_responses_error(503, str(exc))
         return
     except (RetryError, _UpstreamHTTPError) as exc:
         status = getattr(exc, "status", 502)
         body_text = getattr(exc, "body", str(exc))
-        yield _sse({"type": "error", "status": status, "body": body_text})
+        yield _sse_responses_error(status, body_text)
         return
 
     try:
         if response.status_code >= 400:
             error_text = (await response.aread()).decode("utf-8", errors="ignore")
-            yield _sse({"type": "error", "status": response.status_code, "body": error_text})
+            yield _sse_responses_error(response.status_code, error_text)
             return
 
         buffer = b""
@@ -1988,25 +2113,18 @@ async def _stream_chat_completions(
     try:
         client, response = await _open_stream()
     except _QueueTimeout as exc:
-        yield _sse(
-            {
-                "type": "error",
-                "status": 503,
-                "body": str(exc),
-                "retry_after_s": 10,
-            }
-        )
+        yield _sse_chat_error(503, str(exc))
         return
     except (RetryError, _UpstreamHTTPError) as exc:
         status = getattr(exc, "status", 502)
         body_text = getattr(exc, "body", str(exc))
-        yield _sse({"type": "error", "status": status, "body": body_text})
+        yield _sse_chat_error(status, body_text)
         return
 
     try:
         if response.status_code >= 400:
             error_text = (await response.aread()).decode("utf-8", errors="ignore")
-            yield _sse({"type": "error", "status": response.status_code, "body": error_text})
+            yield _sse_chat_error(response.status_code, error_text)
             return
         buffer = b""
         async for chunk in response.aiter_bytes():
@@ -2325,7 +2443,7 @@ def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict
         b_m = _bucket(by_model, row.get("model") or "?")
         for b in (b_p, b_m):
             b["tokens_in"] += int(row.get("input_tokens") or 0)
-            b["tokens_out"] += int(row.get("output_tokens") or 0)
+            b["tokens_out"] += int(row.get("total_output_tokens") or row.get("output_tokens") or 0)
 
     # Finalize percentiles per bucket.
     def _finalize(d: dict) -> dict:
@@ -2341,7 +2459,7 @@ def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict
         "errors_4xx": sum(1 for s in statuses if 400 <= s < 500),
         "errors_5xx": sum(1 for s in statuses if s >= 500),
         "tokens_in": sum(int(r.get("input_tokens") or 0) for r in usage_rows),
-        "tokens_out": sum(int(r.get("output_tokens") or 0) for r in usage_rows),
+        "tokens_out": sum(int(r.get("total_output_tokens") or r.get("output_tokens") or 0) for r in usage_rows),
         "p50_ms": round(_percentile(durations, 0.50), 1),
         "p95_ms": round(_percentile(durations, 0.95), 1),
         "p99_ms": round(_percentile(durations, 0.99), 1),
@@ -3071,68 +3189,68 @@ def _dashboard_html() -> str:
     .body-label .dim {{ text-transform: none; letter-spacing: 0; opacity: 0.6; }}
 
     /* Profile editor — compact */
-    .editor-hint {{ color: var(--dim); font-size: 0.78em;
-      margin: 0 0 0.5rem 0; }}
-    .editor-actions {{ margin-top: 0.5rem; display: flex; align-items: center; gap: 0.6rem; }}
+    .editor-hint {{ color: var(--dim); font-size: 0.72em;
+      margin: 0 0 0.35rem 0; line-height: 1.35; }}
+    .editor-actions {{ margin-top: 0.35rem; display: flex; align-items: center; gap: 0.5rem; }}
     .editor-btn {{ background: var(--panel2); border: 1px solid var(--line);
-      color: var(--fg); padding: 0.18rem 0.5rem; border-radius: 3px;
-      cursor: pointer; font: inherit; font-size: 0.76rem; }}
+      color: var(--fg); padding: 0.12rem 0.4rem; border-radius: 2px;
+      cursor: pointer; font: inherit; font-size: 0.7rem; }}
     .editor-btn:hover {{ border-color: var(--accent); color: var(--accent); }}
     .editor-btn.danger {{ color: var(--bad); }}
     .editor-btn.danger:hover {{ border-color: var(--bad); }}
     .editor-btn.primary {{ background: rgba(121, 192, 255, 0.1); color: var(--accent); border-color: var(--accent); }}
-    .editor-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
-    .editor-status {{ font-size: 0.76rem; color: var(--dim); }}
+    .editor-btn:disabled {{ opacity: 0.4; cursor: not-allowed; }}
+    .editor-status {{ font-size: 0.7rem; color: var(--dim); }}
     .editor-status.ok {{ color: var(--good); }}
     .editor-status.err {{ color: var(--bad); }}
 
-    .profile-row {{ background: var(--panel2); border-radius: 4px;
-      padding: 0.4rem 0.55rem; margin-bottom: 0.35rem;
+    .profile-row {{ background: var(--panel2); border-radius: 3px;
+      padding: 0.25rem 0.4rem; margin-bottom: 0.2rem;
       border: 1px solid transparent; }}
     .profile-row.dirty {{ border-color: var(--warn); }}
     .pf-head {{ display: flex; align-items: center;
-      gap: 0.5rem; flex-wrap: wrap; }}
+      gap: 0.35rem; flex-wrap: wrap; }}
     .pf-head .pf-name {{ font-weight: 500; color: var(--accent);
-      font-size: 0.85rem; min-width: 6rem; }}
+      font-size: 0.78rem; min-width: 4rem; white-space: nowrap; }}
     .pf-head .pf-name input {{ background: transparent; border: none;
-      color: var(--accent); font: inherit; font-size: 0.85rem;
-      font-weight: 500; padding: 0.05rem 0.2rem; border-radius: 2px;
-      border-bottom: 1px dashed var(--accent); width: 10rem; }}
-    .pf-head .pf-default {{ color: var(--dim); font-size: 0.7rem;
+      color: var(--accent); font: inherit; font-size: 0.78rem;
+      font-weight: 500; padding: 0.02rem 0.15rem; border-radius: 1px;
+      border-bottom: 1px dashed var(--accent); width: 8rem; }}
+    .pf-head .pf-default {{ color: var(--dim); font-size: 0.6rem;
       text-transform: uppercase; letter-spacing: 0.05em;
-      padding: 0.05rem 0.3rem; border: 1px solid var(--line); border-radius: 2px; }}
-    .pf-inline {{ display: inline-flex; align-items: center; gap: 0.25rem; }}
-    .pf-inline label {{ font-size: 0.7rem; color: var(--dim); }}
+      padding: 0.02rem 0.2rem; border: 1px solid var(--line); border-radius: 1px; }}
+    .pf-inline {{ display: inline-flex; align-items: center; gap: 0.15rem; }}
+    .pf-inline label {{ font-size: 0.62rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; }}
     .pf-inline select, .pf-inline input {{ background: var(--panel);
       border: 1px solid var(--line); color: var(--fg);
-      padding: 0.1rem 0.3rem; font: inherit; font-size: 0.78rem;
-      border-radius: 2px; }}
-    .pf-inline input[type="number"] {{ width: 4.5rem; }}
+      padding: 0.06rem 0.2rem; font: inherit; font-size: 0.7rem;
+      border-radius: 1px; }}
+    .pf-inline input[type="number"] {{ width: 4rem; }}
     .pf-inline input:focus, .pf-inline select:focus {{ border-color: var(--accent); outline: none; }}
-    .pf-actions-inline {{ margin-left: auto; display: inline-flex; gap: 0.35rem; }}
+    .pf-actions-inline {{ margin-left: auto; display: inline-flex; gap: 0.25rem; }}
 
     .pf-secondary {{ display: flex; align-items: flex-start;
-      gap: 0.6rem; margin-top: 0.3rem; }}
+      gap: 0.4rem; margin-top: 0.2rem; }}
     .pf-secondary .pf-features {{ flex: 1; display: flex; flex-wrap: wrap;
-      gap: 0.2rem 0.3rem; }}
-    .pf-secondary .pf-aliases {{ flex: 0 0 auto; min-width: 14rem; }}
-    .pf-feature {{ display: inline-flex; align-items: center; gap: 0.2rem;
-      cursor: pointer; user-select: none; font-size: 0.72rem;
-      padding: 0.05rem 0.3rem; border: 1px solid var(--line); border-radius: 2px;
+      gap: 0.12rem 0.2rem; }}
+    .pf-secondary .pf-aliases {{ flex: 0 0 auto; min-width: 10rem; }}
+    .pf-feature {{ display: inline-flex; align-items: center; gap: 0.12rem;
+      cursor: pointer; user-select: none; font-size: 0.62rem;
+      padding: 0.03rem 0.2rem; border: 1px solid var(--line); border-radius: 1px;
       background: var(--panel); color: var(--dim); }}
     .pf-feature.on {{ color: var(--accent); border-color: var(--accent); }}
     .pf-feature input {{ display: none; }}
 
-    .pf-aliases-label {{ font-size: 0.7rem; text-transform: uppercase;
-      letter-spacing: 0.05em; color: var(--dim); margin-bottom: 0.15rem; }}
-    .pf-alias-row {{ display: flex; gap: 0.2rem; margin-bottom: 0.15rem; align-items: center; }}
+    .pf-aliases-label {{ font-size: 0.6rem; text-transform: uppercase;
+      letter-spacing: 0.04em; color: var(--dim); margin-bottom: 0.08rem; }}
+    .pf-alias-row {{ display: flex; gap: 0.12rem; margin-bottom: 0.08rem; align-items: center; }}
     .pf-alias-row input {{ flex: 1; background: var(--panel);
-      border: 1px solid var(--line); color: var(--fg); padding: 0.1rem 0.3rem;
-      font: inherit; font-size: 0.74rem; border-radius: 2px; min-width: 0; }}
-    .pf-alias-arrow {{ color: var(--dim); font-size: 0.78em; }}
+      border: 1px solid var(--line); color: var(--fg); padding: 0.05rem 0.2rem;
+      font: inherit; font-size: 0.66rem; border-radius: 1px; min-width: 0; }}
+    .pf-alias-arrow {{ color: var(--dim); font-size: 0.7em; }}
     .pf-alias-del {{ background: transparent; border: 1px solid var(--line);
-      color: var(--bad); padding: 0 0.3rem; border-radius: 2px;
-      font: inherit; font-size: 0.74rem; cursor: pointer; }}
+      color: var(--bad); padding: 0 0.2rem; border-radius: 1px;
+      font: inherit; font-size: 0.66rem; cursor: pointer; }}
 
     /* Sparkline */
     .spark {{ display: block; width: 100%; height: 40px; }}
@@ -3231,20 +3349,7 @@ def _dashboard_html() -> str:
     </div>
   </div>
 
-  <h2>Per-profile</h2>
-  <div class="card">
-    <table>
-      <thead><tr>
-        <th>profile</th><th>upstream</th><th>features</th>
-        <th class="num">req</th><th class="num">errors</th>
-        <th class="num">tok in</th><th class="num">tok out</th>
-        <th class="num">p50</th><th class="num">p95</th>
-      </tr></thead>
-      <tbody id="profiles-body"><tr><td colspan="9" class="empty">loading…</td></tr></tbody>
-    </table>
-  </div>
-
-  <h2>Profile editor</h2>
+  <h2>Profiles</h2>
   <div class="card">
     <p class="editor-hint">
       Edit, add, or remove profiles. Saves go to
@@ -3289,9 +3394,10 @@ def _dashboard_html() -> str:
       <thead><tr>
         <th>time</th><th>profile</th><th>method</th>
         <th>path</th><th>status</th><th class="num">ms</th>
+        <th class="num">↑</th><th class="num">↓</th>
         <th>thinking params</th>
       </tr></thead>
-      <tbody id="activity"><tr><td colspan="7" class="empty">no activity yet</td></tr></tbody>
+      <tbody id="activity"><tr><td colspan="9" class="empty">no activity yet</td></tr></tbody>
     </table>
   </div>
 
@@ -3310,6 +3416,11 @@ def _dashboard_html() -> str:
     const fmt = (n) => Number(n || 0).toLocaleString();
     const fmtMs = (ms) => ms < 1000 ? `${{Math.round(ms)}}ms` : `${{(ms/1000).toFixed(2)}}s`;
     const fmtTime = (ts) => new Date(ts * 1000).toLocaleTimeString();
+    const fmtRate = (n) => {{
+      if (!n || n === 0) return '0';
+      const s = n.toFixed(4);
+      return s.replace(/0+$/, '').replace(/\.$/, '');
+    }};
 
     function escapeHtml(s) {{
       return String(s).replace(/[&<>"']/g, c => ({{
@@ -3429,13 +3540,13 @@ def _dashboard_html() -> str:
       $('kpi-req').textContent = empty ? '—' : fmt(w.requests);
       $('kpi-rps').textContent = empty
         ? 'no requests in window'
-        : `${{(w.requests / span).toFixed(2)}} rps · ${{w.errors_4xx || 0}}×4xx · ${{w.errors_5xx || 0}}×5xx`;
+        : `${{fmtRate(w.requests / span)}} rps · ${{w.errors_4xx || 0}}×4xx · ${{w.errors_5xx || 0}}×5xx`;
       $('kpi-tok-out').textContent = w.tokens_out ? fmt(w.tokens_out) : '—';
       $('kpi-tok-rate').textContent = w.tokens_out
-        ? `${{Math.round(w.tokens_out / span)}} tok/s avg`
+        ? `${{fmtRate(w.tokens_out / span)}} tok/s avg`
         : '—';
       $('kpi-tok-in').textContent = w.tokens_in ? fmt(w.tokens_in) : '—';
-      const ratio = w.tokens_in > 0 ? (w.tokens_out / w.tokens_in).toFixed(2) : '—';
+      const ratio = w.tokens_in > 0 ? fmtRate(w.tokens_out / w.tokens_in) : '—';
       $('kpi-tok-ratio').textContent = `out/in ${{ratio}}`;
       $('kpi-p50').textContent = w.p50_ms ? fmtMs(w.p50_ms) : '—';
       $('kpi-p95').textContent = w.p95_ms
@@ -3459,7 +3570,7 @@ def _dashboard_html() -> str:
       // Sparklines from history (same span as the KPI window).
       const sec = span;
       const reqBins = bin(activityRows, sec, 24, _ => 1);
-      const tokBins = bin(usageRows, sec, 24, e => (e.output_tokens || 0));
+       const tokBins = bin(usageRows, sec, 24, e => (e.total_output_tokens || e.output_tokens || 0));
       const latBins = bin(activityRows, sec, 24, e => (e.duration_ms || 0));
       // Convert sums to averages for latency.
       const latCounts = bin(activityRows, sec, 24, _ => 1);
@@ -3474,23 +3585,6 @@ def _dashboard_html() -> str:
         `<div class="rec"><div class="rec-name">${{escapeHtml(k.replace(/_/g, ' '))}}</div>` +
         `<div class="rec-count">${{fmt(v)}}</div></div>`
       ).join('');
-
-      // Per-profile table — merge profile config with current-window stats.
-      const byProf = w.by_profile || {{}};
-      const profRows = stats.profiles.map(p => {{
-        const b = byProf[p.name] || {{requests:0, errors:0, tokens_in:0, tokens_out:0, p50_ms:0, p95_ms:0}};
-        const feats = p.features.length ? p.features.join(', ') : '—';
-        return `<tr><td>${{escapeHtml(p.name)}}</td><td>${{escapeHtml(p.upstream)}}</td>` +
-          `<td><code>${{escapeHtml(feats)}}</code></td>` +
-          `<td class="num">${{fmt(b.requests)}}</td>` +
-          `<td class="num ${{b.errors>0?'status-4xx':''}}">${{fmt(b.errors)}}</td>` +
-          `<td class="num">${{fmt(b.tokens_in)}}</td>` +
-          `<td class="num">${{fmt(b.tokens_out)}}</td>` +
-          `<td class="num ${{latClass(b.p50_ms)}}">${{fmtMs(b.p50_ms)}}</td>` +
-          `<td class="num ${{latClass(b.p95_ms)}}">${{fmtMs(b.p95_ms)}}</td></tr>`;
-      }}).join('');
-      $('profiles-body').innerHTML = profRows ||
-        `<tr><td colspan="9" class="empty">no profiles</td></tr>`;
 
       // Per-model table.
       const byModel = w.by_model || {{}};
@@ -3534,20 +3628,49 @@ def _dashboard_html() -> str:
       // sibling row with the full redacted JSON body — expanded on
       // click. Expanded state is keyed by the row's ts (stable across
       // renders) so periodic re-renders don't collapse open rows.
+      // Build a lookup: profile -> usage records sorted by ts.
+      const usageByProfile = {{}};
+      for (const u of usageRows) {{
+        const p = u.profile || '?';
+        if (!usageByProfile[p]) usageByProfile[p] = [];
+        usageByProfile[p].push(u);
+      }}
+      // Sort each list by ts ascending.
+      for (const p in usageByProfile) usageByProfile[p].sort((a, b) => a.ts - b.ts);
+
+      function findUsageFor(profile, ts) {{
+        const list = usageByProfile[profile];
+        if (!list || list.length === 0) return null;
+        // Walk backwards from the end — pick the last usage record
+        // whose ts <= activity ts + 1s (usage arrives slightly after).
+        let best = null;
+        for (let i = list.length - 1; i >= 0; i--) {{
+          if (list[i].ts <= ts + 1) {{
+            best = list[i];
+            break;
+          }}
+        }}
+        return best;
+      }}
+
       const recent = activityRows.slice(-30).reverse();
       $('activity').innerHTML = recent.length === 0
-        ? `<tr><td colspan="7" class="empty">no activity yet</td></tr>`
+        ? `<tr><td colspan="9" class="empty">no activity yet</td></tr>`
         : recent.map((r) => {{
             const key = String(r.ts);
             const targetId = `body-${{key.replace('.', '_')}}`;
             const isExpanded = expandedKeys.has(key);
             const mainCls = isExpanded ? 'activity-row expanded' : 'activity-row';
             const bodyCls = isExpanded ? 'body-row expanded' : 'body-row';
+            const usage = findUsageFor(r.profile, r.ts);
+            const tokIn = usage ? fmt(usage.input_tokens) : '—';
+            const tokOut = usage ? fmt(usage.output_tokens) : '—';
             const main = `<tr class="${{mainCls}}" data-key="${{key}}" data-target="${{targetId}}">` +
               `<td>${{fmtTime(r.ts)}}</td><td>${{escapeHtml(r.profile)}}</td>` +
               `<td>${{escapeHtml(r.method)}}</td><td><code>${{escapeHtml(r.path)}}</code></td>` +
               `<td class="${{statusClass(r.status)}}">${{r.status}}</td>` +
               `<td class="num ${{latClass(r.duration_ms)}}">${{fmtMs(r.duration_ms)}}</td>` +
+              `<td class="num">${{tokIn}}</td><td class="num">${{tokOut}}</td>` +
               `<td>${{renderParams(r.params)}}</td></tr>`;
             // Forwarded body is enough — it shows everything the
             // client sent plus inline diff markers (green +bridge for
@@ -3558,7 +3681,7 @@ def _dashboard_html() -> str:
                   ? jsonHighlight(r.body)
                   : '<span class="jnull">no body captured</span>');
             const expand = `<tr class="${{bodyCls}}" id="${{targetId}}">` +
-              `<td colspan="7"><div class="body-pre">${{bodyJson}}</div></td></tr>`;
+              `<td colspan="9"><div class="body-pre">${{bodyJson}}</div></td></tr>`;
             return main + expand;
           }}).join('');
       // Wire click handlers for expandable rows. Toggle both the
@@ -3839,6 +3962,12 @@ def _dashboard_html() -> str:
         const upstreamSel = editorState.upstreams.map((u) =>
           `<option value="${{escapeHtml(u)}}" ${{selected(u)}}>${{escapeHtml(u)}}</option>`
         ).join('');
+        const featuresTag = `<div class="pf-features">${{featuresHtml}}</div>`;
+        const aliasesTag = `<div class="pf-aliases">` +
+          `<div class="pf-aliases-label">aliases</div>` +
+          `${{aliasesHtml}}` +
+          `<button class="editor-btn" data-idx="${{idx}}" data-action="alias-add" type="button">+ alias</button>` +
+        `</div>`;
         return `<div class="profile-row ${{dirty ? 'dirty' : ''}}" data-idx="${{idx}}">` +
           `<div class="pf-head">` +
             (prof.isNew
@@ -3849,23 +3978,16 @@ def _dashboard_html() -> str:
               : '') +
             `<span class="pf-inline"><label>upstream</label>` +
               `<select data-idx="${{idx}}" data-key="upstream">${{upstreamSel}}</select></span>` +
-            `<span class="pf-inline" title="higher = jumps ahead of others"><label>priority</label>` +
-              `<input type="number" data-idx="${{idx}}" data-key="queue_priority" value="${{prof.queue_priority}}"></span>` +
+            `<span class="pf-inline" title="higher = jumps ahead"><label>pri</label>` +
+              `<input type="number" data-idx="${{idx}}" data-key="queue_priority" value="${{prof.queue_priority}}" style="width:2.5rem"></span>` +
             `<span class="pf-inline"><label>budget</label>` +
-              `<input type="number" min="0" max="64000" data-idx="${{idx}}" data-key="default_thinking_budget" value="${{prof.default_thinking_budget}}"></span>` +
+              `<input type="number" min="0" max="64000" data-idx="${{idx}}" data-key="default_thinking_budget" value="${{prof.default_thinking_budget}}" style="width:4rem"></span>` +
             `<span class="pf-actions-inline">` +
               `<button class="editor-btn danger" data-idx="${{idx}}" data-action="delete" type="button">delete</button>` +
               `<button class="editor-btn primary" data-idx="${{idx}}" data-action="save" type="button" ${{dirty ? '' : 'disabled'}}>${{prof.isNew ? 'create' : 'save'}}</button>` +
             `</span>` +
           `</div>` +
-          `<div class="pf-secondary">` +
-            `<div class="pf-features">${{featuresHtml}}</div>` +
-            `<div class="pf-aliases">` +
-              `<div class="pf-aliases-label">model aliases</div>` +
-              `${{aliasesHtml}}` +
-              `<button class="editor-btn" data-idx="${{idx}}" data-action="alias-add" type="button">+ alias</button>` +
-            `</div>` +
-          `</div>` +
+          `<div class="pf-secondary">${{featuresTag}}${{aliasesTag}}</div>` +
         `</div>`;
       }}).join('');
       root.innerHTML = html;
