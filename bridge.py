@@ -169,12 +169,23 @@ class ProfileConfig:
     upstream: str
     features: set[str] = field(default_factory=set)
     model_aliases: dict[str, str] = field(default_factory=dict)
-    # Budget injected by `effort_to_thinking_budget` when the client
-    # sends no `reasoning.effort`/`reasoning_effort` hint at all.
-    # `default` keeps medium since calls landing there are usually
-    # ad-hoc curls / unknown clients that didn't ask for thinking.
-    # Named profiles default to high.
-    default_thinking_budget: int = 8192
+    # Authoritative thinking budget:
+    #   None         → profile is silent; the bridge respects whatever
+    #                  the client sent and translates `effort` →
+    #                  budget if the client gave a hint without an
+    #                  explicit budget.
+    #   <positive>   → profile FORCES this budget; overrides any client
+    #                  effort/budget signal.
+    default_thinking_budget: int | None = None
+    # Tristate authoritative thinking switch:
+    #   None  → profile is silent on thinking; the bridge respects
+    #           whatever the client sent (or didn't send).
+    #   True  → profile FORCES thinking on, regardless of what the
+    #           client sent.
+    #   False → profile FORCES thinking off, regardless of what the
+    #           client sent.
+    # The `default` profile is the only built-in that sets this.
+    thinking_enabled: bool | None = None
     # Queue priority for the upstream gate — HIGHER = jumps ahead of
     # lower-priority numbers. Interactive coding agents (codex,
     # opencode) get 10; long-running daemons (hermes, default) get 0.
@@ -242,9 +253,12 @@ def _builtin_defaults() -> BridgeConfig:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
-                # Calls without a profile prefix are usually unknown
-                # clients that didn't ask for thinking — medium is a
-                # gentler default than high.
+                # `default` is the only built-in profile that opts into
+                # forced thinking — anonymous clients can't tell us
+                # their preference so we apply a sensible default
+                # (medium). Named profiles below leave thinking_enabled
+                # at the dataclass default (False) and pass through.
+                thinking_enabled=True,
                 default_thinking_budget=4096,
                 queue_priority=0,  # background / unknown
             ),
@@ -264,7 +278,10 @@ def _builtin_defaults() -> BridgeConfig:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
-                default_thinking_budget=8192,
+                # No thinking overrides — Codex always sends
+                # `reasoning.effort`; the bridge translates that to a
+                # budget via the effort map, which implicitly activates
+                # thinking on the upstream.
                 queue_priority=10,  # interactive — jumps ahead of background
             ),
             "hermes": ProfileConfig(
@@ -279,12 +296,11 @@ def _builtin_defaults() -> BridgeConfig:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
-                # Hermes never sends a reasoning hint to custom
-                # providers (its supports_reasoning gate is host-based
-                # and rejects localhost), so this default applies to
-                # every hermes call. Medium keeps it bounded without
-                # over-thinking simple replies.
-                default_thinking_budget=4096,
+                # No thinking overrides. Hermes can't send a reasoning
+                # hint to a non-whitelisted host (its supports_reasoning
+                # gate is host-based) so it sends nothing — and we
+                # honor that. No thinking unless Hermes ever starts
+                # forwarding hints.
                 queue_priority=1,  # background daemon, but ahead of `default`
             ),
             "opencode": ProfileConfig(
@@ -299,10 +315,10 @@ def _builtin_defaults() -> BridgeConfig:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
-                # Opencode also never emits a reasoning hint for this
-                # setup (qwen* skip-list in its compiled binary), so
-                # this default applies to every opencode call.
-                default_thinking_budget=8192,
+                # No thinking overrides — opencode now sends its own
+                # `reasoning_effort` (configured via
+                # `models.<id>.options.reasoningEffort` in
+                # opencode.json), which the bridge translates.
                 queue_priority=10,  # interactive — jumps ahead of background
             ),
         },
@@ -520,14 +536,35 @@ def _load_config() -> BridgeConfig:
             )
             aliases_raw = {}
         model_aliases = {str(k): str(v) for k, v in aliases_raw.items()}
+        # default_thinking_budget is now Optional[int]: missing/null
+        # leaves it as None (no budget injected). Numeric values still
+        # parse; non-numeric/non-null falls back to None.
+        raw_budget = body.get("default_thinking_budget")
+        if raw_budget is None:
+            budget_val: int | None = None
+        else:
+            try:
+                budget_val = int(raw_budget)
+            except (TypeError, ValueError):
+                budget_val = None
+        # thinking_enabled is tristate. Absent in YAML → None (profile
+        # silent, bridge respects client). Boolean in YAML → profile
+        # is authoritative and overrides client.
+        if "thinking_enabled" not in body:
+            thinking_enabled_val: bool | None = None
+        else:
+            raw_enabled = body.get("thinking_enabled")
+            if raw_enabled is None:
+                thinking_enabled_val = None
+            else:
+                thinking_enabled_val = bool(raw_enabled)
         profiles[name] = ProfileConfig(
             name=name,
             upstream=upstream_name,
             features=feats,
             model_aliases=model_aliases,
-            default_thinking_budget=_coerce(
-                body.get("default_thinking_budget"), int, 8192
-            ),
+            default_thinking_budget=budget_val,
+            thinking_enabled=thinking_enabled_val,
             queue_priority=_coerce(body.get("queue_priority"), int, 0),
         )
     if not profiles:
@@ -1411,64 +1448,81 @@ def _apply_qwen_sampling_defaults(body: dict) -> None:
     body["extra_body"] = extra
 
 
+_CLIENT_DISABLE_EFFORTS = {"none", "off", "disabled", "false", "no"}
+
+
 def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
-    """Map a client's `reasoning.effort` (or `reasoning_effort`) hint to a
-    concrete `thinking_token_budget` and inject it where vLLM actually
-    reads it.
+    """Resolve the thinking-related fields based on profile policy.
 
-    Placement matters: `thinking_token_budget` is a `SamplingParams`
-    field enforced by vLLM's `ThinkingTokenBudgetLogitsProcessor`, which
-    only sees TOP-LEVEL extra_body keys. The same field nested under
-    `chat_template_kwargs` is never read by Qwen3-Thinking's chat
-    template and gets silently dropped — verified empirically: with the
-    correct placement reasoning_tokens ≈ budget, with the wrong one it
-    matches the no-budget baseline.
+    Two-layer precedence: **profile wins when set, otherwise client wins**.
 
-    `enable_thinking` IS a chat-template variable (Qwen reads it from
-    Jinja), so that one stays under `chat_template_kwargs`.
+    For each of `enable_thinking` and `thinking_token_budget`:
 
-    When neither effort nor a top-level budget were set by the client,
-    the bridge injects `profile.default_thinking_budget` AND bumps
-    `max_tokens` / `max_output_tokens` so the answer isn't truncated by
-    reasoning eating into the cap. Rationale: the client didn't expect
-    thinking at all, so its declared output cap is sized for an answer
-    only — we owe it room for the reasoning we're forcing on top.
+      * If the profile config defines the field
+        (`thinking_enabled` is not None, or `default_thinking_budget`
+        is a positive int), the bridge OVERRIDES whatever the client
+        sent — the profile's value goes upstream regardless.
+      * If the profile config is silent on the field, the bridge
+        respects what the client sent. For budget specifically, when
+        the client gave an `effort` hint (e.g. Codex's
+        `reasoning.effort=high`) without an explicit
+        `extra_body.thinking_token_budget`, the bridge translates the
+        effort via `_EFFORT_TO_THINKING_BUDGET` — translation, not
+        override. Effort values in `_CLIENT_DISABLE_EFFORTS` are
+        translated to `enable_thinking=false`.
+
+    Placement:
+      - `thinking_token_budget` → top-level of `extra_body` (vLLM
+        SamplingParams reads it there)
+      - `enable_thinking` → `extra_body.chat_template_kwargs`
+        (Qwen3 chat template reads it there)
     """
-    effort: str | None = None
-    reasoning = body.get("reasoning")
-    if isinstance(reasoning, dict) and isinstance(reasoning.get("effort"), str):
-        effort = reasoning["effort"]
-    if effort is None and isinstance(body.get("reasoning_effort"), str):
-        effort = body["reasoning_effort"]
-
     extra = body.get("extra_body")
     if not isinstance(extra, dict):
         extra = {}
-    client_set_budget = "thinking_token_budget" in extra
-    client_unaware_of_thinking = effort is None and not client_set_budget
-
-    if effort:
-        budget = _EFFORT_TO_THINKING_BUDGET.get(effort, profile.default_thinking_budget)
-    else:
-        budget = profile.default_thinking_budget
-
-    # Top-level: real sampler enforcement.
-    extra.setdefault("thinking_token_budget", budget)
-    # Chat-template: only the `enable_thinking` flag actually does
-    # anything here on Qwen3-Thinking; we leave it set for consistency
-    # with hybrid Qwen3 deployments.
     chat_kwargs = extra.get("chat_template_kwargs")
     if not isinstance(chat_kwargs, dict):
         chat_kwargs = {}
-    chat_kwargs.setdefault("enable_thinking", True)
-    extra["chat_template_kwargs"] = chat_kwargs
+
+    # ----- enable_thinking decision -----
+    if profile.thinking_enabled is not None:
+        # Profile is authoritative — override.
+        chat_kwargs["enable_thinking"] = profile.thinking_enabled
+    # else: leave whatever the client sent (or didn't send) intact.
+
+    # ----- thinking_token_budget decision -----
+    if isinstance(profile.default_thinking_budget, int) and profile.default_thinking_budget > 0:
+        # Profile is authoritative — override any client effort/budget.
+        extra["thinking_token_budget"] = profile.default_thinking_budget
+    else:
+        # Profile silent — translate client signals. Skip if the client
+        # already put an explicit budget in extra_body (their value
+        # wins).
+        if "thinking_token_budget" not in extra:
+            effort: str | None = None
+            reasoning = body.get("reasoning")
+            if isinstance(reasoning, dict) and isinstance(reasoning.get("effort"), str):
+                effort = reasoning["effort"].strip().lower()
+            if effort is None and isinstance(body.get("reasoning_effort"), str):
+                effort = body["reasoning_effort"].strip().lower()
+            if effort and effort in _EFFORT_TO_THINKING_BUDGET:
+                extra["thinking_token_budget"] = _EFFORT_TO_THINKING_BUDGET[effort]
+            elif (
+                effort
+                and effort in _CLIENT_DISABLE_EFFORTS
+                and profile.thinking_enabled is None
+            ):
+                # Client said no thinking via `effort=none`; surface as
+                # explicit `enable_thinking=false`. Skip if the profile
+                # already overrode (profile-set wins).
+                chat_kwargs["enable_thinking"] = False
+
+    if chat_kwargs:
+        extra["chat_template_kwargs"] = chat_kwargs
     body["extra_body"] = extra
-
-    if client_unaware_of_thinking:
-        _ensure_room_for_injected_thinking(body, budget, profile)
-
-
-_DEFAULT_ANSWER_TOKENS = 4096
+    # No more max_tokens inflation: `_ensure_room_for_injected_thinking`
+    # is gone. The thinking budget enforces upstream now (verified
+    # 2026-04-30), so there's no runaway reasoning to "make room" for.
 
 
 def _estimate_prompt_tokens(body: dict) -> int:
@@ -1532,11 +1586,9 @@ def _estimate_prompt_tokens(body: dict) -> int:
 def _clamp_max_tokens_to_context(body: dict, profile: ProfileConfig) -> None:
     """Cap the client's declared `max_tokens` / `max_output_tokens` so
     `prompt + max_tokens ≤ context_window − safety_margin`. Runs
-    unconditionally on every request — separate from the thinking-budget
-    bump in `_ensure_room_for_injected_thinking`, which only fires when
-    we inject thinking on a client that didn't ask for it.
+    unconditionally on every request.
 
-    Why unconditional: clients that compute their own
+    Why: clients that compute their own
     `max_tokens = context_window − input_tokens` (e.g. opencode) hit a
     classic off-by-one when the input grows between turns — request
     arrives at exactly `context_window + N` and the upstream rejects
@@ -1568,46 +1620,6 @@ def _clamp_max_tokens_to_context(body: dict, profile: ProfileConfig) -> None:
     max_allowed = max(max_allowed, 256)
     if current > max_allowed:
         body[field] = max_allowed
-
-
-def _ensure_room_for_injected_thinking(
-    body: dict, budget: int, profile: ProfileConfig
-) -> None:
-    """Set `max_tokens` / `max_output_tokens` to (client cap or
-    `_DEFAULT_ANSWER_TOKENS`) + budget, but **clamp** so we never
-    push the request past the upstream's `context_window`.
-
-    The clamp matters for long sessions: a client running with a
-    generous `max_tokens=32000` cap on a 130K-token conversation
-    plus our 8K budget injection blew past the limit and the
-    upstream returned 400 ContextWindowExceeded. Estimate the
-    prompt and cap so `prompt + max_tokens < context_window`.
-    """
-    if "messages" in body:
-        field = "max_tokens"
-    elif "input" in body:
-        field = "max_output_tokens"
-    else:
-        field = "max_tokens"
-    current = body.get(field)
-    base = current if isinstance(current, int) and current > 0 else _DEFAULT_ANSWER_TOKENS
-    target = base + budget
-
-    upstream_cfg = CONFIG.upstreams.get(profile.upstream)
-    if upstream_cfg is not None:
-        context_window = upstream_cfg.context_window
-        margin = upstream_cfg.context_safety_margin
-        prompt_est = _estimate_prompt_tokens(body)
-        max_allowed = context_window - prompt_est - margin
-        # Always leave at least the budget worth of room — if the
-        # prompt is so big we can't fit even the budget, drop the
-        # cap to a tight `budget + 256` slot and let the upstream
-        # decide whether to fail (better than us forcing a number
-        # we know will fail).
-        max_allowed = max(max_allowed, budget + 256)
-        if target > max_allowed:
-            target = max_allowed
-    body[field] = max(target, 1)
 
 
 def _drop_oai_only_fields(body: dict) -> None:
@@ -1788,9 +1800,17 @@ async def _recover_truncated_content(
     continue. No reasoning involved; assumes the upstream already moved
     past `</think>`.
     """
-    messages = _input_to_chat_messages(
-        original_body.get("input"), original_body.get("instructions")
-    )
+    # Fired exclusively from the chat/completions handler, so the body has
+    # `messages` natively. Fall back to converting `input` only as a
+    # safety net for callers that might pass a responses-API body in the
+    # future.
+    raw_messages = original_body.get("messages")
+    if isinstance(raw_messages, list) and raw_messages:
+        messages = [m for m in raw_messages if isinstance(m, dict)]
+    else:
+        messages = _input_to_chat_messages(
+            original_body.get("input"), original_body.get("instructions")
+        )
     if not messages:
         return None
     cont_body: dict = {
@@ -1959,7 +1979,14 @@ async def _stream_responses(
     body: dict,
     headers: dict[str, str],
     profile: ProfileConfig,
+    state: dict | None = None,
 ) -> AsyncIterator[bytes]:
+    """Stream a /v1/responses request, applying SSE rewrites and post-stream
+    recovery. `state` is an optional out-dict the caller can pass in to read
+    `state["recovery"]` (the recovery kind that fired, if any) after the
+    generator drains."""
+    if state is None:
+        state = {}
     model_hint = body.get("model")
     cfg = CONFIG.upstreams[profile.upstream]
     upstream_url = f"{_upstream_url(profile)}/responses"
@@ -2230,11 +2257,13 @@ async def _stream_responses(
         )
         if recovered_text:
             if overflow:
-                _record_recovery("thinking_overflow")
+                kind = "thinking_overflow"
             elif fake_invocation_kicker:
-                _record_recovery("fake_invocation")
+                kind = "fake_invocation"
             else:
-                _record_recovery("silent_completion")
+                kind = "silent_completion"
+            _record_recovery(kind)
+            state["recovery"] = kind
 
     if recovered_text:
         # Synthesize the responses-API events for the recovered message
@@ -2506,8 +2535,13 @@ async def _stream_chat_completions(
     body: dict,
     headers: dict[str, str],
     profile: ProfileConfig,
+    state: dict | None = None,
 ) -> AsyncIterator[bytes]:
-    """Forward chat/completions SSE byte-for-byte, sniffing usage."""
+    """Forward chat/completions SSE byte-for-byte, sniffing usage. `state`
+    is reserved for future stream-side recoveries (currently chat/completions
+    streaming applies none)."""
+    if state is None:
+        state = {}
     model_hint = body.get("model")
     cfg = CONFIG.upstreams[profile.upstream]
     upstream_url = f"{_upstream_url(profile)}/chat/completions"
@@ -2784,6 +2818,16 @@ def _inspect_thinking_params(body: Any, kind: str) -> dict:
         # actually works on vLLM.
         if (b := extra.get("thinking_token_budget")) is not None:
             out["extra_body.thinking_token_budget"] = b
+        # Hermes / Nous Portal style reasoning hint (only sent when the
+        # client thinks the upstream is reasoning-capable; for our
+        # bridge URL Hermes won't send this, but it shows up if anyone
+        # ever points at us via a whitelisted hostname).
+        eb_reasoning = extra.get("reasoning")
+        if isinstance(eb_reasoning, dict):
+            if (eff := eb_reasoning.get("effort")) is not None:
+                out["extra_body.reasoning.effort"] = eff
+            if (en := eb_reasoning.get("enabled")) is not None:
+                out["extra_body.reasoning.enabled"] = en
         ctk = extra.get("chat_template_kwargs")
         if isinstance(ctk, dict):
             if (et := ctk.get("enable_thinking")) is not None:
@@ -2805,6 +2849,8 @@ def _record_activity(
     params: dict | None = None,
     body: dict | None = None,
     forwarded: dict | None = None,
+    model: str | None = None,
+    recovery: str | None = None,
 ) -> None:
     record: dict = {
         "ts": time.time(),
@@ -2815,6 +2861,10 @@ def _record_activity(
         "status": status,
         "duration_ms": round(duration_ms, 1),
     }
+    if model:
+        record["model"] = model
+    if recovery:
+        record["recovery"] = recovery
     if params:
         record["params"] = params
     if body is not None:
@@ -2914,20 +2964,37 @@ def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict
             }
         return d[key]
 
+    # Activity rows now carry both `profile` and `model` (post-transform
+    # upstream id), so each request increments BOTH a profile bucket and
+    # a model bucket — fixes the previous "Per-model" panel showing 0
+    # requests / 0ms p50 because only by_profile was incremented from
+    # activity and by_model only got tokens from usage rows.
     for row in activity_rows:
-        b = _bucket(by_profile, row.get("profile") or "?")
-        b["requests"] += 1
-        if (row.get("status") or 0) >= 400:
-            b["errors"] += 1
-        if "duration_ms" in row:
-            b["duration_ms"].append(row["duration_ms"])
-            b["total_duration_ms"] += row["duration_ms"]
+        b_p = _bucket(by_profile, row.get("profile") or "?")
+        b_m = _bucket(by_model, row.get("model") or "?")
+        for b in (b_p, b_m):
+            b["requests"] += 1
+            if (row.get("status") or 0) >= 400:
+                b["errors"] += 1
+            if "duration_ms" in row:
+                b["duration_ms"].append(row["duration_ms"])
+                b["total_duration_ms"] += row["duration_ms"]
     for row in usage_rows:
         b_p = _bucket(by_profile, row.get("profile") or "?")
         b_m = _bucket(by_model, row.get("model") or "?")
         for b in (b_p, b_m):
             b["tokens_in"] += int(row.get("input_tokens") or 0)
             b["tokens_out"] += int(row.get("total_output_tokens") or row.get("output_tokens") or 0)
+
+    # Per-window recovery counts derived from activity rows. The lifetime
+    # counter (_recovery_counts) survives the bounded activity buffer;
+    # this view tracks recoveries inside the requested window so the
+    # dashboard can answer "did one fire in the last 5m?".
+    recoveries: dict[str, int] = {k: 0 for k in _recovery_counts}
+    for row in activity_rows:
+        kind = row.get("recovery")
+        if isinstance(kind, str) and kind in recoveries:
+            recoveries[kind] += 1
 
     # Finalize percentiles per bucket.
     def _finalize(d: dict) -> dict:
@@ -2950,6 +3017,7 @@ def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict
         "p99_ms": round(_percentile(durations, 0.99), 1),
         "by_profile": _finalize(by_profile),
         "by_model": _finalize(by_model),
+        "recoveries": recoveries,
     }
 
 
@@ -3092,9 +3160,18 @@ def _dump_config_yaml(cfg: BridgeConfig) -> str:
         entry: dict[str, Any] = {
             "upstream": p.upstream,
             "queue_priority": p.queue_priority,
-            "default_thinking_budget": p.default_thinking_budget,
             "features": sorted(p.features),
         }
+        # Only emit thinking_enabled when the profile has set it
+        # explicitly (True or False). None means "profile silent" —
+        # omit the key so the YAML stays minimal.
+        if p.thinking_enabled is not None:
+            entry["thinking_enabled"] = p.thinking_enabled
+        # Only persist `default_thinking_budget` when the profile has
+        # one set — None is the canonical "no opinion, let upstream
+        # decide" default and we don't want to round-trip nulls.
+        if p.default_thinking_budget is not None:
+            entry["default_thinking_budget"] = p.default_thinking_budget
         if p.model_aliases:
             entry["model_aliases"] = dict(p.model_aliases)
         out["profiles"][name] = entry
@@ -3131,11 +3208,28 @@ def _validate_profile_payload(name: str, body: dict) -> tuple[ProfileConfig | No
     aliases = {str(k): str(v) for k, v in aliases_raw.items()}
     try:
         priority = int(body.get("queue_priority", 0))
-        budget = int(body.get("default_thinking_budget", 8192))
     except (TypeError, ValueError):
-        return None, "queue_priority and default_thinking_budget must be integers"
-    if budget < 0 or budget > 64000:
-        return None, "default_thinking_budget must be between 0 and 64000"
+        return None, "queue_priority must be an integer"
+    # default_thinking_budget is now Optional[int]: missing/null means
+    # "no budget injected — let upstream decide". Numeric value clamps
+    # the reasoning depth.
+    raw_budget = body.get("default_thinking_budget", None)
+    if raw_budget is None or raw_budget == "":
+        budget: int | None = None
+    else:
+        try:
+            budget = int(raw_budget)
+        except (TypeError, ValueError):
+            return None, "default_thinking_budget must be an integer or null"
+        if budget < 0 or budget > 64000:
+            return None, "default_thinking_budget must be between 0 and 64000"
+        if budget == 0:
+            budget = None  # treat 0 as "no budget"
+    if "thinking_enabled" not in body:
+        thinking_enabled: bool | None = None
+    else:
+        raw_enabled = body.get("thinking_enabled")
+        thinking_enabled = None if raw_enabled is None else bool(raw_enabled)
     return (
         ProfileConfig(
             name=name,
@@ -3143,6 +3237,7 @@ def _validate_profile_payload(name: str, body: dict) -> tuple[ProfileConfig | No
             features=feats,
             model_aliases=aliases,
             default_thinking_budget=budget,
+            thinking_enabled=thinking_enabled,
             queue_priority=priority,
         ),
         None,
@@ -3172,6 +3267,7 @@ async def config_get() -> dict:
                 "features": sorted(p.features),
                 "queue_priority": p.queue_priority,
                 "default_thinking_budget": p.default_thinking_budget,
+                "thinking_enabled": p.thinking_enabled,
                 "model_aliases": dict(p.model_aliases),
             }
             for p in CONFIG.profiles.values()
@@ -3242,9 +3338,11 @@ async def _handle_responses(
     inspected = _diff_thinking_params(client_params, _inspect_thinking_params(body, "responses"))
     want_stream = bool(body.get("stream", False))
     headers = _build_outgoing_headers(request)
+    model_id = body.get("model") if isinstance(body.get("model"), str) else None
     if want_stream:
+        stream_state: dict = {}
         async def _gen():
-            async for chunk in _stream_responses(body, headers, profile):
+            async for chunk in _stream_responses(body, headers, profile, stream_state):
                 yield chunk
             _record_activity(
                 profile,
@@ -3255,6 +3353,8 @@ async def _handle_responses(
                 params=inspected,
                 body=redacted,
                 forwarded=forwarded,
+                model=model_id,
+                recovery=stream_state.get("recovery"),
             )
         return StreamingResponse(
             _gen(),
@@ -3262,6 +3362,7 @@ async def _handle_responses(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     status, payload = await _post_responses_nonstream(body, headers, profile)
+    recovery_kind: str | None = None
     if status < 400 and isinstance(payload, dict):
         # Apply recovery to the non-streaming response object. A "message
         # item" only counts if it actually carries non-empty text content
@@ -3304,11 +3405,12 @@ async def _handle_responses(
                 )
                 if recovered:
                     if overflow_ns:
-                        _record_recovery("thinking_overflow")
+                        recovery_kind = "thinking_overflow"
                     elif message_emitted:
-                        _record_recovery("fake_invocation")
+                        recovery_kind = "fake_invocation"
                     else:
-                        _record_recovery("silent_completion")
+                        recovery_kind = "silent_completion"
+                    _record_recovery(recovery_kind)
                     # Drop any fake-invocation message item from the
                     # original output so the client doesn't render
                     # `happy__change_title(...)` alongside the real
@@ -3347,6 +3449,8 @@ async def _handle_responses(
         params=inspected,
         body=redacted,
         forwarded=forwarded,
+        model=model_id,
+        recovery=recovery_kind,
     )
     return JSONResponse(content=payload, status_code=status)
 
@@ -3375,9 +3479,11 @@ async def _handle_chat_completions(
     inspected = _diff_thinking_params(client_params, _inspect_thinking_params(body, "chat_completions"))
     want_stream = bool(body.get("stream", False))
     headers = _build_outgoing_headers(request)
+    model_id = body.get("model") if isinstance(body.get("model"), str) else None
     if want_stream:
+        stream_state: dict = {}
         async def _gen():
-            async for chunk in _stream_chat_completions(body, headers, profile):
+            async for chunk in _stream_chat_completions(body, headers, profile, stream_state):
                 yield chunk
             _record_activity(
                 profile,
@@ -3388,6 +3494,8 @@ async def _handle_chat_completions(
                 params=inspected,
                 body=redacted,
                 forwarded=forwarded,
+                model=model_id,
+                recovery=stream_state.get("recovery"),
             )
         return StreamingResponse(
             _gen(),
@@ -3423,6 +3531,7 @@ async def _handle_chat_completions(
     except httpx.HTTPError as e:
         last_status = 502
         payload = {"error": {"message": f"upstream error: {e}"}}
+    recovery_kind: str | None = None
     if last_status < 400 and isinstance(payload, dict):
         choice = (payload.get("choices") or [{}])[0]
         finish = choice.get("finish_reason")
@@ -3437,7 +3546,8 @@ async def _handle_chat_completions(
             if extra:
                 message["content"] = extra
                 choice["finish_reason"] = "stop"
-                _record_recovery("truncated_content")
+                recovery_kind = "truncated_content"
+                _record_recovery(recovery_kind)
         # Empty + stop retry: provider hiccup or stream parsing miss.
         # One cheap retry — if it returns the same empty result we keep
         # the original (don't loop). Tool-call responses are skipped
@@ -3459,7 +3569,8 @@ async def _handle_chat_completions(
                     retry_content = retry_message.get("content") or ""
                     if retry_content.strip():
                         payload = retry_payload
-                        _record_recovery("empty_with_stop_retry")
+                        recovery_kind = "empty_with_stop_retry"
+                        _record_recovery(recovery_kind)
             except (httpx.HTTPError, ValueError):
                 pass  # keep original empty response
         record = _extract_usage(profile.name, body.get("model"), payload)
@@ -3474,6 +3585,8 @@ async def _handle_chat_completions(
         params=inspected,
         body=redacted,
         forwarded=forwarded,
+        model=model_id,
+        recovery=recovery_kind,
     )
     return JSONResponse(content=payload, status_code=last_status)
 
@@ -3897,11 +4010,47 @@ def _dashboard_html() -> str:
 
     /* Recovery card */
     .recoveries {{ display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 0.4rem; }}
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.4rem; }}
     .rec {{ background: var(--panel2); border-radius: 4px; padding: 0.5rem 0.6rem; }}
+    .rec.zero {{ opacity: 0.55; }}
     .rec-name {{ color: var(--dim); font-size: 0.7rem; text-transform: uppercase;
       letter-spacing: 0.05em; }}
-    .rec-count {{ color: var(--accent2); font-size: 1.1rem; margin-top: 0.1rem; }}
+    .rec-count {{ color: var(--accent2); font-size: 1.1rem; margin-top: 0.1rem;
+      display: flex; align-items: baseline; gap: 0.4rem; }}
+    .rec-window {{ color: var(--accent2); font-weight: 500; }}
+    .rec-lifetime {{ color: var(--dim); font-size: 0.78rem; font-weight: 400; }}
+
+    /* Activity filter bar */
+    .filter-bar {{ display: flex; flex-wrap: wrap; align-items: center;
+      gap: 0.5rem; margin: 0 0 0.6rem 0; padding: 0.4rem 0.6rem;
+      background: var(--panel2); border-radius: 4px;
+      border: 1px solid var(--line); font-size: 0.78rem; }}
+    .filter-bar label {{ color: var(--dim); font-size: 0.7rem;
+      text-transform: uppercase; letter-spacing: 0.05em; }}
+    .filter-bar select, .filter-bar input[type="text"] {{
+      background: var(--panel); border: 1px solid var(--line);
+      color: var(--fg); padding: 0.15rem 0.4rem; font: inherit;
+      font-size: 0.78rem; border-radius: 3px; }}
+    .filter-bar input[type="text"] {{ min-width: 8rem; }}
+    .filter-bar select:focus, .filter-bar input:focus {{
+      border-color: var(--accent); outline: none; }}
+    .filter-toggle {{ background: transparent; border: 1px solid var(--line);
+      color: var(--dim); padding: 0.15rem 0.55rem; border-radius: 3px;
+      cursor: pointer; font: inherit; font-size: 0.75rem; }}
+    .filter-toggle:hover {{ color: var(--fg); }}
+    .filter-toggle.active {{ color: var(--accent); border-color: var(--accent); }}
+    .filter-toggle.active.errors {{ color: var(--bad); border-color: var(--bad); }}
+    .filter-toggle.active.recoveries {{ color: var(--accent2); border-color: var(--accent2); }}
+    .filter-count {{ color: var(--dim); margin-left: auto; font-size: 0.74rem; }}
+    .filter-clear {{ color: var(--dim); cursor: pointer; padding: 0.05rem 0.35rem;
+      border-radius: 2px; font-size: 0.74rem; }}
+    .filter-clear:hover {{ color: var(--bad); }}
+
+    /* Recovery badge in the activity row */
+    .rec-badge {{ display: inline-block; margin-left: 0.4rem;
+      padding: 0.02rem 0.35rem; border-radius: 2px;
+      background: rgba(210, 168, 255, 0.15); color: var(--accent2);
+      font-size: 0.72rem; letter-spacing: 0.02em; }}
 
     /* Upstream rate bars */
     .rate-bar {{ background: var(--panel2); height: 6px; border-radius: 3px;
@@ -4030,6 +4179,24 @@ def _dashboard_html() -> str:
 
   <h2>Recent activity</h2>
   <div class="card">
+    <div class="filter-bar">
+      <button type="button" class="filter-toggle errors" id="flt-errors">errors only</button>
+      <button type="button" class="filter-toggle recoveries" id="flt-recoveries">recoveries only</button>
+      <span class="pf-inline">
+        <label>profile</label>
+        <select id="flt-profile"><option value="">(all)</option></select>
+      </span>
+      <span class="pf-inline">
+        <label>model</label>
+        <select id="flt-model"><option value="">(all)</option></select>
+      </span>
+      <span class="pf-inline">
+        <label>path</label>
+        <input type="text" id="flt-path" placeholder="substring match">
+      </span>
+      <span class="filter-clear" id="flt-clear" title="clear all filters">clear</span>
+      <span class="filter-count" id="flt-count">—</span>
+    </div>
     <table>
       <thead><tr>
         <th>time</th><th>profile</th><th>method</th>
@@ -4151,6 +4318,16 @@ def _dashboard_html() -> str:
     let usageRows = [];
     // Survives re-renders: keyed by activity row ts (stable per request).
     const expandedKeys = new Set();
+    // Activity filter state. Mutated by the filter bar handlers; read
+    // by `applyFilters()` on every render. `pathQuery` is a substring
+    // match (case-insensitive); empty string disables.
+    const filters = {{
+      errorsOnly: false,
+      recoveriesOnly: false,
+      profile: '',
+      model: '',
+      pathQuery: '',
+    }};
 
     document.querySelectorAll('.windows button').forEach(btn => {{
       btn.addEventListener('click', () => {{
@@ -4159,6 +4336,76 @@ def _dashboard_html() -> str:
         activeWindow = btn.dataset.win;
         if (lastStats) renderStats(lastStats);
       }});
+    }});
+
+    // Activity filter bar wiring. Each control updates `filters` and
+    // re-renders. The dropdowns are kept in sync with the values seen
+    // in the activity buffer (so a profile/model that hasn't appeared
+    // yet doesn't show up). Path is a case-insensitive substring match.
+    function matchesFilters(r) {{
+      if (filters.errorsOnly && (Number(r.status) || 0) < 400) return false;
+      if (filters.recoveriesOnly && !r.recovery) return false;
+      if (filters.profile && r.profile !== filters.profile) return false;
+      if (filters.model && r.model !== filters.model) return false;
+      if (filters.pathQuery) {{
+        const p = (r.path || '').toLowerCase();
+        if (!p.includes(filters.pathQuery)) return false;
+      }}
+      return true;
+    }}
+    function syncDropdown(id, values, currentSelection) {{
+      const sel = $(id);
+      if (!sel) return;
+      // Keep "(all)" as the first option, then sorted unique values.
+      // Don't blow away the user's selection on every render.
+      const desired = ['', ...[...values].sort()];
+      const have = Array.from(sel.options).map(o => o.value);
+      const same = desired.length === have.length && desired.every((v, i) => v === have[i]);
+      if (same) return;
+      const prev = currentSelection || sel.value || '';
+      sel.innerHTML = desired.map(v =>
+        `<option value="${{escapeHtml(v)}}"${{v === prev ? ' selected' : ''}}>` +
+          (v === '' ? '(all)' : escapeHtml(v)) +
+        `</option>`
+      ).join('');
+    }}
+    function rerenderActivity() {{
+      if (lastStats) renderStats(lastStats);
+    }}
+    $('flt-errors').addEventListener('click', () => {{
+      filters.errorsOnly = !filters.errorsOnly;
+      $('flt-errors').classList.toggle('active', filters.errorsOnly);
+      rerenderActivity();
+    }});
+    $('flt-recoveries').addEventListener('click', () => {{
+      filters.recoveriesOnly = !filters.recoveriesOnly;
+      $('flt-recoveries').classList.toggle('active', filters.recoveriesOnly);
+      rerenderActivity();
+    }});
+    $('flt-profile').addEventListener('change', (e) => {{
+      filters.profile = e.target.value;
+      rerenderActivity();
+    }});
+    $('flt-model').addEventListener('change', (e) => {{
+      filters.model = e.target.value;
+      rerenderActivity();
+    }});
+    $('flt-path').addEventListener('input', (e) => {{
+      filters.pathQuery = (e.target.value || '').toLowerCase();
+      rerenderActivity();
+    }});
+    $('flt-clear').addEventListener('click', () => {{
+      filters.errorsOnly = false;
+      filters.recoveriesOnly = false;
+      filters.profile = '';
+      filters.model = '';
+      filters.pathQuery = '';
+      $('flt-errors').classList.remove('active');
+      $('flt-recoveries').classList.remove('active');
+      $('flt-profile').value = '';
+      $('flt-model').value = '';
+      $('flt-path').value = '';
+      rerenderActivity();
     }});
 
     function pickWindow(stats) {{
@@ -4220,12 +4467,26 @@ def _dashboard_html() -> str:
       spark('spark-tok', tokBins, '#d2a8ff');
       spark('spark-lat', latAvg, '#f0883e');
 
-      // Recoveries grid
-      const rec = stats.lifetime.recoveries || {{}};
-      $('rec-grid').innerHTML = Object.entries(rec).map(([k, v]) =>
-        `<div class="rec"><div class="rec-name">${{escapeHtml(k.replace(/_/g, ' '))}}</div>` +
-        `<div class="rec-count">${{fmt(v)}}</div></div>`
-      ).join('');
+      // Recoveries grid: per-window (active) AND lifetime, side by side.
+      // Lifetime comes from the global counter (survives buffer truncation);
+      // window comes from aggregating activity rows in the slice.
+      const lifetimeRec = (stats.lifetime && stats.lifetime.recoveries) || {{}};
+      const windowRec = (w && w.recoveries) || {{}};
+      const recKinds = Object.keys(lifetimeRec).length
+        ? Object.keys(lifetimeRec)
+        : Object.keys(windowRec);
+      const winLabel = activeWindow === 'lifetime' ? 'all' : activeWindow;
+      $('rec-grid').innerHTML = recKinds.map((k) => {{
+        const wn = Number(windowRec[k] || 0);
+        const lf = Number(lifetimeRec[k] || 0);
+        const cls = (wn === 0 && lf === 0) ? 'rec zero' : 'rec';
+        return `<div class="${{cls}}">` +
+          `<div class="rec-name">${{escapeHtml(k.replace(/_/g, ' '))}}</div>` +
+          `<div class="rec-count">` +
+            `<span class="rec-window">${{fmt(wn)}}</span>` +
+            `<span class="rec-lifetime">${{winLabel}} · ${{fmt(lf)}} all</span>` +
+          `</div></div>`;
+      }}).join('');
 
       // Per-model table.
       const byModel = w.by_model || {{}};
@@ -4294,9 +4555,25 @@ def _dashboard_html() -> str:
         return best;
       }}
 
-      const recent = activityRows.slice(-30).reverse();
+      // Refresh the profile/model dropdowns from whatever's been seen.
+      // Keep the user's current selection; just append any new options.
+      const seenProfiles = new Set(activityRows.map((r) => r.profile).filter(Boolean));
+      const seenModels = new Set(activityRows.map((r) => r.model).filter(Boolean));
+      syncDropdown('flt-profile', seenProfiles, filters.profile);
+      syncDropdown('flt-model', seenModels, filters.model);
+
+      // Apply filters to the full activity buffer, then take the last 30
+      // matching rows. Order matters: filtering first means we see 30
+      // matches even if the latest 30 unfiltered rows have none of them.
+      const filtered = activityRows.filter(matchesFilters);
+      const recent = filtered.slice(-30).reverse();
+      $('flt-count').textContent = filtered.length === activityRows.length
+        ? `${{activityRows.length}} requests`
+        : `${{filtered.length}} of ${{activityRows.length}} match`;
       $('activity').innerHTML = recent.length === 0
-        ? `<tr><td colspan="9" class="empty">no activity yet</td></tr>`
+        ? `<tr><td colspan="9" class="empty">${{
+            activityRows.length === 0 ? 'no activity yet' : 'no rows match the current filters'
+          }}</td></tr>`
         : recent.map((r) => {{
             const key = String(r.ts);
             const targetId = `body-${{key.replace('.', '_')}}`;
@@ -4306,9 +4583,12 @@ def _dashboard_html() -> str:
             const usage = findUsageFor(r.profile, r.ts);
             const tokIn = usage ? fmt(usage.input_tokens) : '—';
             const tokOut = usage ? fmt(usage.total_output_tokens || usage.output_tokens) : '—';
+            const recBadge = r.recovery
+              ? `<span class="rec-badge" title="recovery fired">${{escapeHtml(r.recovery.replace(/_/g, ' '))}}</span>`
+              : '';
             const main = `<tr class="${{mainCls}}" data-key="${{key}}" data-target="${{targetId}}">` +
               `<td>${{fmtTime(r.ts)}}</td><td>${{escapeHtml(r.profile)}}</td>` +
-              `<td>${{escapeHtml(r.method)}}</td><td><code>${{escapeHtml(r.path)}}</code></td>` +
+              `<td>${{escapeHtml(r.method)}}</td><td><code>${{escapeHtml(r.path)}}</code>${{recBadge}}</td>` +
               `<td class="${{statusClass(r.status)}}">${{r.status}}</td>` +
               `<td class="num ${{latClass(r.duration_ms)}}">${{fmtMs(r.duration_ms)}}</td>` +
               `<td class="num">${{tokIn}}</td><td class="num">${{tokOut}}</td>` +
