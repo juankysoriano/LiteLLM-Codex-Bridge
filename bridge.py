@@ -159,6 +159,7 @@ ALL_FEATURES = {
     "silent_completion_recovery",   # completed + no message item → 2-tier recovery
     "truncated_content_recovery",   # length + content cut mid-thought → continue
     "empty_with_stop_retry",        # empty + stop → one cheap retry
+    "tool_call_args_retry",         # tool_call args missing required fields → retry with thinking off
 }
 
 
@@ -1163,6 +1164,7 @@ _recovery_counts: dict[str, int] = {
     "fake_invocation": 0,
     "truncated_content": 0,
     "empty_with_stop_retry": 0,
+    "tool_call_args_retry": 0,
 }
 _retry_counts: dict[str, int] = {"retried": 0, "gave_up": 0}
 
@@ -1872,6 +1874,138 @@ def _is_responses_silent_completion(
     return _looks_like_fake_invocation(emitted_text)
 
 
+def _required_fields_for_tool(tools_list: Any, tool_name: str | None) -> set[str]:
+    """Extract the `required` set from the schema for ``tool_name``.
+
+    Returns an empty set when the tool isn't found, the schema is
+    malformed, or the schema doesn't declare any required fields. The
+    caller treats "no required fields" as "any args dict is valid".
+    """
+    if not isinstance(tools_list, list) or not isinstance(tool_name, str):
+        return set()
+    for t in tools_list:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") or {}
+        if fn.get("name") != tool_name:
+            continue
+        params = fn.get("parameters") or {}
+        if not isinstance(params, dict):
+            return set()
+        req = params.get("required")
+        if isinstance(req, list):
+            return {str(f) for f in req}
+        return set()
+    return set()
+
+
+def _validate_tool_calls(tool_calls: Any, tools_list: Any) -> bool:
+    """Return True when every tool_call's args satisfy its schema's
+    required fields. Malformed JSON or unknown tool names also count as
+    invalid (we want to retry those too)."""
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return True  # nothing to validate
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            return False
+        fn = tc.get("function") or {}
+        name = fn.get("name")
+        args_raw = fn.get("arguments")
+        if not isinstance(args_raw, str):
+            return False
+        try:
+            parsed = json.loads(args_raw)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        required = _required_fields_for_tool(tools_list, name)
+        if required and not required.issubset(parsed.keys()):
+            return False
+    return True
+
+
+def _client_already_disabled_thinking(body: dict) -> bool:
+    """Return True if the body explicitly disables thinking, so retrying
+    with thinking-off would be a no-op."""
+    eb = body.get("extra_body") or {}
+    if not isinstance(eb, dict):
+        return False
+    ctk = eb.get("chat_template_kwargs") or {}
+    if isinstance(ctk, dict) and ctk.get("enable_thinking") is False:
+        return True
+    re_top = body.get("reasoning_effort")
+    if isinstance(re_top, str) and re_top.strip().lower() in _CLIENT_DISABLE_EFFORTS:
+        return True
+    re_obj = body.get("reasoning")
+    if isinstance(re_obj, dict):
+        eff = re_obj.get("effort")
+        if isinstance(eff, str) and eff.strip().lower() in _CLIENT_DISABLE_EFFORTS:
+            return True
+    return False
+
+
+def _build_thinking_off_retry_body(body: dict) -> dict:
+    """Clone the request body and force thinking off for the retry.
+
+    Drops `thinking_token_budget` (irrelevant when thinking is off)
+    and sets `chat_template_kwargs.enable_thinking=false`. The retry
+    is non-streaming (caller wraps it via `_post_chat_for_text`-style
+    helpers) so we also force `stream=False` defensively.
+    """
+    retry = copy.deepcopy(body)
+    retry["stream"] = False
+    retry.pop("stream_options", None)
+    eb = retry.get("extra_body")
+    if not isinstance(eb, dict):
+        eb = {}
+    eb.pop("thinking_token_budget", None)
+    ctk = eb.get("chat_template_kwargs")
+    if not isinstance(ctk, dict):
+        ctk = {}
+    ctk["enable_thinking"] = False
+    eb["chat_template_kwargs"] = ctk
+    retry["extra_body"] = eb
+    return retry
+
+
+async def _retry_chat_thinking_off(
+    body: dict, headers: dict[str, str], profile: ProfileConfig
+) -> tuple[int, dict]:
+    """Run a non-streaming chat/completions retry with thinking disabled.
+
+    Returns (status, payload) — caller validates the payload before
+    deciding whether to swap.
+    """
+    cfg = CONFIG.upstreams[profile.upstream]
+    url = f"{_upstream_url(profile)}/chat/completions"
+    retry_body = _build_thinking_off_retry_body(body)
+    last_status = 502
+    payload: dict = {"error": {"message": "unreachable"}}
+    try:
+        async for attempt in _retry_policy(cfg):
+            with attempt:
+                async with _gated(profile):
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+                        r = await client.post(url, json=retry_body, headers=headers)
+                last_status = r.status_code
+                if r.status_code in _RETRYABLE_STATUS:
+                    raise _UpstreamHTTPError(r.status_code, r.text)
+                payload = (
+                    r.json()
+                    if r.headers.get("content-type", "").startswith("application/json")
+                    else {}
+                )
+                break
+    except _QueueTimeout:
+        return 503, {"error": {"message": "queue timeout on retry"}}
+    except (RetryError, _UpstreamHTTPError):
+        return last_status, payload if isinstance(payload, dict) else {"error": {}}
+    except httpx.HTTPError as e:
+        return 502, {"error": {"message": f"retry upstream error: {e}"}}
+    return last_status, payload
+
+
 def _detect_truncated_message(message_text: str, finish_reason: str | None) -> bool:
     """Heuristic for "answer was cut mid-thought".
 
@@ -2537,9 +2671,21 @@ async def _stream_chat_completions(
     profile: ProfileConfig,
     state: dict | None = None,
 ) -> AsyncIterator[bytes]:
-    """Forward chat/completions SSE byte-for-byte, sniffing usage. `state`
-    is reserved for future stream-side recoveries (currently chat/completions
-    streaming applies none)."""
+    """Forward chat/completions SSE byte-for-byte by default, sniffing
+    usage along the way.
+
+    When the profile has `tool_call_args_retry` enabled, switches to a
+    BUFFERED mode: collects all upstream chunks first, parses to
+    extract the final assistant message, validates tool_call args
+    against the schemas in `body.tools`, and either:
+      - emits the buffered chunks unchanged (valid), or
+      - retries the same request with thinking disabled and synthesizes
+        a fresh SSE stream from the retry response (invalid).
+
+    Buffered mode pays for-correctness with latency: the client sees no
+    intermediate deltas, only the final result. Keepalive comments are
+    still emitted to the client so chunkTimeout doesn't fire.
+    """
     if state is None:
         state = {}
     model_hint = body.get("model")
@@ -2578,47 +2724,259 @@ async def _stream_chat_completions(
         yield _sse_chat_error(status, body_text)
         return
 
+    do_retry_recovery = profile.has("tool_call_args_retry") and not _client_already_disabled_thinking(body)
+
     try:
         if response.status_code >= 400:
             error_text = (await response.aread()).decode("utf-8", errors="ignore")
             yield _sse_chat_error(response.status_code, error_text)
             return
-        buffer = b""
+
+        if not do_retry_recovery:
+            # Existing path: byte-for-byte forward, sniff usage as it
+            # passes by.
+            buffer = b""
+            try:
+                async for chunk in _iter_bytes_with_keepalive(response):
+                    if not chunk:
+                        continue
+                    yield chunk
+                    if chunk == _SSE_KEEPALIVE:
+                        continue
+                    buffer += chunk
+                    while b"\n\n" in buffer:
+                        event, buffer = buffer.split(b"\n\n", 1)
+                        for line in event.splitlines():
+                            if not line.startswith(b"data: "):
+                                continue
+                            raw = line[6:].strip()
+                            if raw == b"[DONE]":
+                                continue
+                            try:
+                                payload = json.loads(raw)
+                            except (ValueError, UnicodeDecodeError):
+                                continue
+                            if not isinstance(payload, dict):
+                                continue
+                            if isinstance(payload.get("usage"), dict):
+                                record = _extract_usage(profile.name, model_hint, payload)
+                                if record:
+                                    _broadcast_usage(record)
+            except _StreamStalledError as exc:
+                yield _sse_chat_error(504, str(exc))
+            return
+
+        # Buffered path: collect everything from upstream first.
+        # Keepalives still flow to the client so it doesn't time out.
+        upstream_buffer = bytearray()
         try:
             async for chunk in _iter_bytes_with_keepalive(response):
                 if not chunk:
                     continue
-                yield chunk
-                # Keepalive comments aren't real data — don't feed them to
-                # the SSE-event buffer or the usage sniffer.
                 if chunk == _SSE_KEEPALIVE:
+                    yield chunk  # keep client alive
                     continue
-                buffer += chunk
-                while b"\n\n" in buffer:
-                    event, buffer = buffer.split(b"\n\n", 1)
-                    for line in event.splitlines():
-                        if not line.startswith(b"data: "):
-                            continue
-                        raw = line[6:].strip()
-                        if raw == b"[DONE]":
-                            continue
-                        try:
-                            payload = json.loads(raw)
-                        except (ValueError, UnicodeDecodeError):
-                            continue
-                        if not isinstance(payload, dict):
-                            continue
-                        if isinstance(payload.get("usage"), dict):
-                            record = _extract_usage(profile.name, model_hint, payload)
-                            if record:
-                                _broadcast_usage(record)
+                upstream_buffer.extend(chunk)
         except _StreamStalledError as exc:
             yield _sse_chat_error(504, str(exc))
+            return
+
+        # Parse the buffered SSE into a complete chat/completions object.
+        assembled = _assemble_chat_sse(bytes(upstream_buffer), model_hint)
+        upstream_payload = assembled["payload"]
+
+        # Decide: valid tool_calls → emit original buffer; invalid →
+        # retry with thinking off.
+        msg = ((upstream_payload.get("choices") or [{}])[0]).get("message") or {}
+        tool_calls = msg.get("tool_calls")
+        if not tool_calls or _validate_tool_calls(tool_calls, body.get("tools")):
+            # Valid (or no tool_calls at all) — passthrough the buffer.
+            yield bytes(upstream_buffer)
+            if isinstance(assembled.get("usage"), dict):
+                rec = _extract_usage(profile.name, model_hint, {"usage": assembled["usage"], "model": model_hint})
+                if rec:
+                    _broadcast_usage(rec)
+            return
+
+        # Invalid → retry with thinking off.
+        r_status, retry_payload = await _retry_chat_thinking_off(body, headers, profile)
+        if r_status >= 400 or not isinstance(retry_payload, dict):
+            yield bytes(upstream_buffer)  # retry failed, emit original
+            return
+        retry_choice = (retry_payload.get("choices") or [{}])[0]
+        retry_msg = retry_choice.get("message") or {}
+        retry_tcs = retry_msg.get("tool_calls")
+        if not retry_tcs or not _validate_tool_calls(retry_tcs, body.get("tools")):
+            yield bytes(upstream_buffer)  # retry didn't help, emit original
+            return
+
+        # Retry succeeded — synthesize SSE from the retry payload.
+        for synth_chunk in _synthesize_chat_sse(retry_payload, model_hint):
+            yield synth_chunk
+        state["recovery"] = "tool_call_args_retry"
+        _record_recovery("tool_call_args_retry")
+        usage = retry_payload.get("usage")
+        if isinstance(usage, dict):
+            rec = _extract_usage(profile.name, model_hint, retry_payload)
+            if rec:
+                _broadcast_usage(rec)
     finally:
         try:
             await response.aclose()
         finally:
             await client.aclose()
+
+
+def _assemble_chat_sse(buf: bytes, model_hint: str | None) -> dict:
+    """Walk buffered SSE bytes from a chat/completions stream and
+    reconstruct the equivalent non-streaming payload.
+
+    Returns ``{"payload": <chat completion-shaped dict>, "usage": <usage dict|None>}``.
+    Any malformed lines are skipped silently; we just rebuild what we
+    can. The reconstructed payload has the same shape as a non-stream
+    response so downstream validation can run against it.
+    """
+    msg: dict[str, Any] = {"role": "assistant", "content": ""}
+    tcs_by_index: dict[int, dict] = {}
+    finish: str | None = None
+    rid: str | None = None
+    created: int | None = None
+    model_id = model_hint
+    usage_obj: dict | None = None
+
+    for event in buf.split(b"\n\n"):
+        for line in event.splitlines():
+            if not line.startswith(b"data: "):
+                continue
+            raw = line[6:].strip()
+            if raw in (b"[DONE]", b""):
+                continue
+            try:
+                payload = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if rid is None and isinstance(payload.get("id"), str):
+                rid = payload["id"]
+            if created is None and isinstance(payload.get("created"), int):
+                created = payload["created"]
+            if isinstance(payload.get("model"), str):
+                model_id = payload["model"]
+            if isinstance(payload.get("usage"), dict):
+                usage_obj = payload["usage"]
+            for choice in payload.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                if isinstance(choice.get("finish_reason"), str):
+                    finish = choice["finish_reason"]
+                delta = choice.get("delta") or choice.get("message") or {}
+                if not isinstance(delta, dict):
+                    continue
+                if isinstance(delta.get("role"), str):
+                    msg["role"] = delta["role"]
+                if isinstance(delta.get("content"), str):
+                    msg["content"] = (msg.get("content") or "") + delta["content"]
+                for tc in delta.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    idx = tc.get("index", 0)
+                    slot = tcs_by_index.setdefault(int(idx), {
+                        "id": None, "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+                    if isinstance(tc.get("id"), str):
+                        slot["id"] = tc["id"]
+                    if isinstance(tc.get("type"), str):
+                        slot["type"] = tc["type"]
+                    fn = tc.get("function") or {}
+                    if isinstance(fn.get("name"), str) and fn["name"]:
+                        slot["function"]["name"] = fn["name"]
+                    if isinstance(fn.get("arguments"), str):
+                        slot["function"]["arguments"] = (
+                            slot["function"]["arguments"] + fn["arguments"]
+                        )
+    if tcs_by_index:
+        msg["tool_calls"] = [tcs_by_index[i] for i in sorted(tcs_by_index)]
+    return {
+        "payload": {
+            "id": rid or f"chatcmpl_assembled_{int(time.time()*1000)}",
+            "object": "chat.completion",
+            "created": created or int(time.time()),
+            "model": model_id,
+            "choices": [{"index": 0, "message": msg, "finish_reason": finish or "stop"}],
+            **({"usage": usage_obj} if usage_obj else {}),
+        },
+        "usage": usage_obj,
+    }
+
+
+def _synthesize_chat_sse(payload: dict, model_hint: str | None) -> list[bytes]:
+    """Convert a non-streaming chat/completions payload into a sequence
+    of SSE chunks compatible with streaming clients.
+
+    Single-delta synthesis: one chunk announces the role + tool_calls +
+    full content, a second chunk carries `finish_reason`, an optional
+    third carries usage, and a final `data: [DONE]\\n\\n` closes.
+    AI-SDK / OpenAI-compatible clients accept this shape because the
+    spec allows merging deltas across events.
+    """
+    rid = payload.get("id") or f"chatcmpl_synth_{int(time.time()*1000)}"
+    created = payload.get("created") or int(time.time())
+    model_id = payload.get("model") or model_hint or "unknown"
+    choice = (payload.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    finish = choice.get("finish_reason") or "stop"
+    chunks: list[bytes] = []
+
+    # Chunk 1: role announcement (some clients require this separately).
+    chunks.append(_sse({
+        "id": rid, "object": "chat.completion.chunk",
+        "created": created, "model": model_id,
+        "choices": [{"index": 0, "delta": {"role": msg.get("role") or "assistant"}, "finish_reason": None}],
+    }))
+    # Chunk 2: content (if any) and full tool_calls.
+    delta: dict[str, Any] = {}
+    if isinstance(msg.get("content"), str) and msg["content"]:
+        delta["content"] = msg["content"]
+    if isinstance(msg.get("tool_calls"), list):
+        delta["tool_calls"] = []
+        for i, tc in enumerate(msg["tool_calls"]):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            delta["tool_calls"].append({
+                "index": i,
+                "id": tc.get("id"),
+                "type": tc.get("type") or "function",
+                "function": {
+                    "name": fn.get("name"),
+                    "arguments": fn.get("arguments") or "",
+                },
+            })
+    if delta:
+        chunks.append(_sse({
+            "id": rid, "object": "chat.completion.chunk",
+            "created": created, "model": model_id,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        }))
+    # Chunk 3: finish_reason.
+    chunks.append(_sse({
+        "id": rid, "object": "chat.completion.chunk",
+        "created": created, "model": model_id,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+    }))
+    # Chunk 4 (optional): usage.
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        chunks.append(_sse({
+            "id": rid, "object": "chat.completion.chunk",
+            "created": created, "model": model_id,
+            "choices": [],
+            "usage": usage,
+        }))
+    chunks.append(b"data: [DONE]\n\n")
+    return chunks
 
 
 # =============================================================================
@@ -2686,7 +3044,15 @@ async def _stop_watchdog() -> None:
             pass
 
 
-def _redact_body(body: Any, max_bytes: int = 4096) -> dict:
+def _redact_body(body: Any, max_bytes: int = 65536) -> dict:
+    # Debug escape hatch: when BRIDGE_NO_REDACT is set, store the full
+    # unredacted body in the activity row. Useful for replaying client
+    # requests against the upstream directly without going through the
+    # bridge. WARNING: Hermes-class bodies can be 250-500KB each; with
+    # the 1000-row activity buffer, that's 250-500MB resident. Toggle
+    # off when not actively debugging.
+    if os.environ.get("BRIDGE_NO_REDACT"):
+        return copy.deepcopy(body) if isinstance(body, dict) else {"_": "<non-dict>"}
     """Return a copy of the request body with bulky / sensitive fields
     summarised so the dashboard can render it without leaking prompt
     content. Keeps every top-level field so you can see the full shape
@@ -3548,6 +3914,26 @@ async def _handle_chat_completions(
                 choice["finish_reason"] = "stop"
                 recovery_kind = "truncated_content"
                 _record_recovery(recovery_kind)
+        # tool_call_args_retry: model emitted tool_calls with args
+        # missing required fields (cargo-cult on poisoned history /
+        # Qwen3 #1817). Retry with thinking disabled — the no-thinking
+        # path doesn't have this bug per upstream reports + our own
+        # probing. Skip if the client already disabled thinking.
+        elif (
+            profile.has("tool_call_args_retry")
+            and message.get("tool_calls")
+            and not _validate_tool_calls(message.get("tool_calls"), body.get("tools"))
+            and not _client_already_disabled_thinking(body)
+        ):
+            r_status, retry_payload = await _retry_chat_thinking_off(body, headers, profile)
+            if r_status < 400 and isinstance(retry_payload, dict):
+                retry_choice = (retry_payload.get("choices") or [{}])[0]
+                retry_msg = retry_choice.get("message") or {}
+                retry_tcs = retry_msg.get("tool_calls")
+                if retry_tcs and _validate_tool_calls(retry_tcs, body.get("tools")):
+                    payload = retry_payload
+                    recovery_kind = "tool_call_args_retry"
+                    _record_recovery(recovery_kind)
         # Empty + stop retry: provider hiccup or stream parsing miss.
         # One cheap retry — if it returns the same empty result we keep
         # the original (don't loop). Tool-call responses are skipped
