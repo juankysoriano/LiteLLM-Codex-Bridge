@@ -2766,51 +2766,147 @@ async def _stream_chat_completions(
                 yield _sse_chat_error(504, str(exc))
             return
 
-        # Buffered path: collect everything from upstream first.
-        # Keepalives still flow to the client so it doesn't time out.
-        upstream_buffer = bytearray()
+        # Speculative passthrough path:
+        #   - Stream every chunk to the client as it arrives, EXCEPT we
+        #     hold the very first chunks in a tiny buffer until we know
+        #     what kind of turn this is.
+        #   - As soon as we see a `delta.tool_calls` event, switch to
+        #     full-buffer mode (validate at the end, retry if needed).
+        #   - As soon as we see a non-empty `delta.content` text event,
+        #     switch to passthrough mode (model committed to a
+        #     conversational reply; tool_call retry doesn't apply).
+        #   - If neither is seen by the time `finish_reason` arrives,
+        #     flush the held bytes and emit the rest passthrough.
+        #
+        # This preserves true-streaming for content-only turns and only
+        # incurs the buffer/retry cost on tool_call turns, where the
+        # client typically waits for `finish_reason: tool_calls` anyway.
+
+        DECISION_PENDING = 0
+        DECISION_PASSTHROUGH = 1
+        DECISION_BUFFER = 2
+        decision = DECISION_PENDING
+        held_bytes = bytearray()       # bytes received before decision was made
+        upstream_buffer = bytearray()  # full buffer when in DECISION_BUFFER mode
+        sse_buf = b""                  # incremental SSE event-line splitter (pre-decision)
+        usage_obj: dict | None = None  # sniffed usage for passthrough path
+
+        async def _flush_held():
+            # Helper: if there are held bytes, emit them now. The caller
+            # uses this once at the moment of switching to PASSTHROUGH.
+            nonlocal held_bytes
+            if held_bytes:
+                _b = bytes(held_bytes)
+                held_bytes = bytearray()
+                return _b
+            return b""
+
         try:
             async for chunk in _iter_bytes_with_keepalive(response):
                 if not chunk:
                     continue
                 if chunk == _SSE_KEEPALIVE:
-                    yield chunk  # keep client alive
+                    yield chunk
                     continue
-                upstream_buffer.extend(chunk)
+                if decision == DECISION_PASSTHROUGH:
+                    yield chunk
+                    # still sniff usage in passthrough
+                    sse_buf += chunk
+                    while b"\n\n" in sse_buf:
+                        ev, sse_buf = sse_buf.split(b"\n\n", 1)
+                        for line in ev.splitlines():
+                            if not line.startswith(b"data: "): continue
+                            raw = line[6:].strip()
+                            if raw in (b"[DONE]", b""): continue
+                            try: pl = json.loads(raw)
+                            except (ValueError, UnicodeDecodeError): continue
+                            if isinstance(pl, dict) and isinstance(pl.get("usage"), dict):
+                                usage_obj = pl["usage"]
+                    continue
+                if decision == DECISION_BUFFER:
+                    upstream_buffer.extend(chunk)
+                    continue
+                # DECISION_PENDING — hold bytes and inspect each event
+                held_bytes.extend(chunk)
+                sse_buf += chunk
+                while b"\n\n" in sse_buf:
+                    ev, sse_buf = sse_buf.split(b"\n\n", 1)
+                    for line in ev.splitlines():
+                        if not line.startswith(b"data: "): continue
+                        raw = line[6:].strip()
+                        if raw == b"[DONE]" or not raw: continue
+                        try: pl = json.loads(raw)
+                        except (ValueError, UnicodeDecodeError): continue
+                        if not isinstance(pl, dict): continue
+                        for choice in (pl.get("choices") or []):
+                            if not isinstance(choice, dict): continue
+                            delta = choice.get("delta") or {}
+                            if not isinstance(delta, dict): continue
+                            if delta.get("tool_calls"):
+                                decision = DECISION_BUFFER
+                                break
+                            content = delta.get("content")
+                            if isinstance(content, str) and content.strip():
+                                decision = DECISION_PASSTHROUGH
+                                break
+                        else:
+                            continue
+                        break
+                    if decision != DECISION_PENDING:
+                        break
+                if decision == DECISION_PASSTHROUGH:
+                    flushed = await _flush_held()
+                    if flushed:
+                        yield flushed
+                elif decision == DECISION_BUFFER:
+                    # Move held bytes into the full buffer; nothing emitted.
+                    upstream_buffer.extend(held_bytes)
+                    held_bytes = bytearray()
         except _StreamStalledError as exc:
             yield _sse_chat_error(504, str(exc))
             return
 
-        # Parse the buffered SSE into a complete chat/completions object.
+        # End of upstream stream.
+        if decision == DECISION_PASSTHROUGH:
+            # Already streamed everything (plus held flush).
+            if usage_obj:
+                rec = _extract_usage(profile.name, model_hint,
+                                     {"usage": usage_obj, "model": model_hint})
+                if rec: _broadcast_usage(rec)
+            return
+        if decision == DECISION_PENDING:
+            # No content, no tool_calls — empty turn or weird upstream.
+            # Flush whatever we held and exit; nothing to validate.
+            flushed = await _flush_held()
+            if flushed:
+                yield flushed
+            return
+
+        # DECISION_BUFFER: full buffer. Parse, validate, maybe retry.
         assembled = _assemble_chat_sse(bytes(upstream_buffer), model_hint)
         upstream_payload = assembled["payload"]
-
-        # Decide: valid tool_calls → emit original buffer; invalid →
-        # retry with thinking off.
         msg = ((upstream_payload.get("choices") or [{}])[0]).get("message") or {}
         tool_calls = msg.get("tool_calls")
         if not tool_calls or _validate_tool_calls(tool_calls, body.get("tools")):
-            # Valid (or no tool_calls at all) — passthrough the buffer.
             yield bytes(upstream_buffer)
             if isinstance(assembled.get("usage"), dict):
-                rec = _extract_usage(profile.name, model_hint, {"usage": assembled["usage"], "model": model_hint})
-                if rec:
-                    _broadcast_usage(rec)
+                rec = _extract_usage(profile.name, model_hint,
+                                     {"usage": assembled["usage"], "model": model_hint})
+                if rec: _broadcast_usage(rec)
             return
 
         # Invalid → retry with thinking off.
         r_status, retry_payload = await _retry_chat_thinking_off(body, headers, profile)
         if r_status >= 400 or not isinstance(retry_payload, dict):
-            yield bytes(upstream_buffer)  # retry failed, emit original
+            yield bytes(upstream_buffer)
             return
         retry_choice = (retry_payload.get("choices") or [{}])[0]
         retry_msg = retry_choice.get("message") or {}
         retry_tcs = retry_msg.get("tool_calls")
         if not retry_tcs or not _validate_tool_calls(retry_tcs, body.get("tools")):
-            yield bytes(upstream_buffer)  # retry didn't help, emit original
+            yield bytes(upstream_buffer)
             return
 
-        # Retry succeeded — synthesize SSE from the retry payload.
         for synth_chunk in _synthesize_chat_sse(retry_payload, model_hint):
             yield synth_chunk
         state["recovery"] = "tool_call_args_retry"
@@ -2818,8 +2914,7 @@ async def _stream_chat_completions(
         usage = retry_payload.get("usage")
         if isinstance(usage, dict):
             rec = _extract_usage(profile.name, model_hint, retry_payload)
-            if rec:
-                _broadcast_usage(rec)
+            if rec: _broadcast_usage(rec)
     finally:
         try:
             await response.aclose()
