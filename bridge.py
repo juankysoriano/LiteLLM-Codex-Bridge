@@ -125,13 +125,20 @@ class UpstreamConfig:
     # Model context window — used to cap the bumped `max_tokens` when
     # the bridge injects a thinking budget, so we don't push the
     # request past the model's limit (manifested as a 400
-    # ContextWindowExceeded from the upstream). 131072 = Qwen3
-    # default; tune per upstream if you point at other models.
-    context_window: int = 131072
-    # Safety margin between the estimated prompt size and the cap
-    # we set on `max_tokens`. Tokenization is approximate (chars /
-    # 3.5), so we leave headroom rather than be optimistic.
-    context_safety_margin: int = 1024
+    # ContextWindowExceeded from the upstream). 262144 = Qwen3 with
+    # YaRN/long-context enabled (NaN's current deployment); the stock
+    # Qwen3 native window is 131072. Tune per upstream if you point at
+    # other models.
+    context_window: int = 262144
+    # Safety margin between the estimated prompt size and the cap we
+    # set on `max_tokens`. The estimator (chars/3.0) is already biased
+    # pessimistic, but tool-result inflation is a moving target: an
+    # agent that pastes a 90k-token JSON blob into the next turn can
+    # blow past any tight ceiling. 8192 of slack covers the residual
+    # estimation error AND a generous chunk of mid-turn growth before
+    # the upstream rejects the request — which some clients (e.g.
+    # opencode) silently hang on instead of treating as overflow.
+    context_safety_margin: int = 8192
 
 
 # Feature flags. Each profile's `features` list selects which to apply.
@@ -257,6 +264,7 @@ def _builtin_defaults() -> BridgeConfig:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
+                default_thinking_budget=8192,
                 queue_priority=10,  # interactive — jumps ahead of background
             ),
             "hermes": ProfileConfig(
@@ -545,11 +553,14 @@ _SYSTEM_LIKE_ROLES = {"system", "developer"}
 _SYSTEM_NOTE_PREFIX = "[system note]\n"
 
 # Maps reasoning.effort → thinking_token_budget (vLLM extra_body).
-# Numbers track the Qwen3-30B-A3B-Thinking-2507 model card's anti-verbose
-# defaults. Currently a no-op against deployments missing
+# Sized for Qwen3-30B-A3B-Thinking-2507 on a 256k context: low/medium
+# cover casual reasoning, high (8k) is the model card's coding sweet
+# spot, xhigh (16k) reaches the model card's "highly challenging
+# reasoning" target. Even xhigh leaves 16k of the 32k max_output for
+# the actual answer. Currently a no-op against deployments missing
 # `--reasoning-parser qwen3` on vLLM (the param is silently dropped).
-_EFFORT_TO_THINKING_BUDGET = {"low": 512, "medium": 1024, "high": 2048, "xhigh": 4096}
-_DEFAULT_THINKING_BUDGET = 8192
+_EFFORT_TO_THINKING_BUDGET = {"low": 2048, "medium": 4096, "high": 8192, "xhigh": 16384}
+_DEFAULT_THINKING_BUDGET = 8192  # aligned to "high" in the effort map above
 
 # Qwen3 thinking-mode sampling. From generation_config.json shipped with
 # Qwen3-30B-A3B-Thinking-2507. presence_penalty is left at 0 (Qwen warns
@@ -971,6 +982,26 @@ _activity_history: deque[dict] = deque(maxlen=ACTIVITY_RING_SIZE)
 _activity_subscribers: set[asyncio.Queue[dict]] = set()
 _started_at = time.time()
 
+# ---------------------------------------------------------------------------
+# Compaction-event detection
+#
+# opencode's full-summarization compaction (overflow-driven) is invisible
+# from the ACP wire and produces no log line in opencode's own log file —
+# the only place we can spot it is HERE, where the bridge sees the chat
+# completion request. Its system prompt contains the SUMMARY_TEMPLATE
+# verbatim, so a substring match is enough.
+#
+# We map the inbound TCP source port → opencode pid so the panel can
+# filter to only the compactions for ITS happy session (otherwise a
+# multi-session user would see every panel light up on every other
+# session's compaction).
+# ---------------------------------------------------------------------------
+
+_COMPACTION_SIGNATURE = (
+    "Output exactly the Markdown structure shown inside <template>"
+)
+_compaction_history: deque[dict] = deque(maxlen=200)
+
 # Disk log data dir (same location as config)
 _CONFIG_DIR = Path(
     os.environ.get(
@@ -1129,6 +1160,147 @@ def _broadcast_activity(record: dict) -> None:
             queue.put_nowait(record)
         except asyncio.QueueFull:
             pass
+
+
+# ---------------------------------------------------------------------------
+# /proc/net/tcp parsing — map TCP source port → owning pid
+#
+# Used only when we detect a SUMMARY_TEMPLATE prompt and want to know
+# which opencode process sent it. Linux-only by design; on non-Linux
+# the lookup returns None and the panel filter degrades gracefully
+# (events with unknown pid are dropped, which is the right thing).
+# ---------------------------------------------------------------------------
+
+
+def _resolve_source_pid(host: str, port: int) -> int | None:
+    if not host or not isinstance(port, int) or port <= 0 or port > 65535:
+        return None
+    inode = _find_socket_inode(host, port)
+    if inode is None:
+        return None
+    return _find_pid_owning_inode(inode)
+
+
+def _find_socket_inode(host: str, port: int) -> str | None:
+    """Look up the local inode for an established TCP connection
+    whose remote (peer) end is `host:port`."""
+    candidates = ("/proc/net/tcp", "/proc/net/tcp6")
+    target_port_hex = f"{port:04X}"
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="ascii") as fh:
+                fh.readline()  # header
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    # parts[1] = local_address  (HOST:PORT in hex)
+                    # parts[2] = remote_address — for inbound conns this
+                    #           is the peer (= the client). FastAPI shows
+                    #           that peer to us as request.client.{host,port}.
+                    local = parts[1]
+                    inode = parts[9]
+                    # We're the SERVER receiving a connection. The peer's
+                    # ephemeral port is the LOCAL port from the peer's
+                    # perspective, but in our /proc/net/tcp it's the
+                    # LOCAL port of OUR socket only when scanning bridge
+                    # process — the peer's pid owns the OTHER side.
+                    # Easiest: scan all rows and match on parts[1] split
+                    # by ':' — port half — equal to target.
+                    if ":" not in local:
+                        continue
+                    _, port_hex = local.rsplit(":", 1)
+                    if port_hex.upper() == target_port_hex:
+                        return inode
+        except OSError:
+            continue
+    return None
+
+
+def _find_pid_owning_inode(inode: str) -> int | None:
+    """Walk /proc/*/fd looking for a symlink target like
+    `socket:[<inode>]`. Returns the first matching pid (there can only
+    be one for a given socket fd in practice)."""
+    needle = f"socket:[{inode}]"
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        fd_dir = f"/proc/{entry}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(f"{fd_dir}/{fd}")
+            except OSError:
+                continue
+            if target == needle:
+                return int(entry)
+    return None
+
+
+def _record_compaction(
+    *,
+    profile_name: str,
+    model: str | None,
+    source_host: str | None,
+    source_port: int | None,
+    body: dict,
+) -> None:
+    pid = (
+        _resolve_source_pid(source_host, source_port)
+        if source_host and source_port
+        else None
+    )
+    record = {
+        "ts": time.time(),
+        "profile": profile_name,
+        "model": model,
+        "source_pid": pid,
+        "source_host": source_host,
+        "source_port": source_port,
+        "input_chars": _estimate_input_chars(body),
+    }
+    _compaction_history.append(record)
+
+
+def _estimate_input_chars(body: dict) -> int:
+    total = 0
+    for msg in body.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        c = msg.get("content")
+        if isinstance(c, str):
+            total += len(c)
+    return total
+
+
+def _looks_like_summary_request(body: dict) -> bool:
+    """Match opencode's SUMMARY_TEMPLATE in the system prompt. The
+    string is lifted verbatim from sst/opencode's compaction.ts and is
+    distinctive enough that a substring match has effectively zero
+    false positives — no real user prompt asks for "the Markdown
+    structure shown inside <template>"."""
+    for msg in body.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") not in ("system", "user"):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and _COMPACTION_SIGNATURE in content:
+            return True
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str) and _COMPACTION_SIGNATURE in text:
+                        return True
+    return False
 
 
 def _extract_usage(profile_name: str, model_hint: str | None, payload: dict) -> dict | None:
@@ -1300,17 +1472,27 @@ _DEFAULT_ANSWER_TOKENS = 4096
 
 
 def _estimate_prompt_tokens(body: dict) -> int:
-    """Cheap char-based estimate of how many tokens the prompt will
-    consume on the upstream. We don't ship a tokenizer — the bridge
-    runs on a different process and can't import the model's BPE
-    files — so we use the standard 1 token ≈ 3.5 chars heuristic
-    (Qwen runs slightly higher than that, OpenAI tokenizers slightly
-    lower, but both round close enough for capping purposes).
+    """Char-based estimate of how many tokens the prompt will consume.
+    We don't ship a tokenizer — the bridge runs on a different process
+    and can't import the model's BPE files — so we estimate from char
+    count using a deliberately pessimistic 3.0 chars/token ratio.
+
+    Why 3.0 instead of the textbook 3.5: tool results in agent
+    workloads are dominated by JSON, code, log dumps, and other
+    structurally-dense content, which tokenizes at ~2.5–3.0 chars per
+    token (every `{`, `,`, `:` is its own token; short keys like `id`
+    burn a token apiece). The textbook 3.5 ratio assumes English
+    prose; under-counting on a JSON-heavy prompt drops us below the
+    real input size and the cap-clamp lets the request through into
+    a 400 ContextWindowExceeded — which some clients (e.g. opencode)
+    don't recognise as overflow and silently hang on.
+
+    Over-counting is cheap (slightly tighter `max_tokens` cap);
+    under-counting is expensive (silent stuck session). Bias to
+    over-count.
 
     Walks the obvious string-bearing fields: messages.content,
-    instructions, input items, tools schemas, system prompts. Doesn't
-    try to be exact — false-low estimate would let the upstream
-    enforce, false-high reduces our injected cap a bit.
+    instructions, input items, tools schemas, system prompts.
     """
     chars = 0
     if isinstance(body.get("instructions"), str):
@@ -1344,7 +1526,48 @@ def _estimate_prompt_tokens(body: dict) -> int:
             chars += len(json.dumps(tools, default=str))
         except (TypeError, ValueError):
             pass
-    return int(chars / 3.5)
+    return int(chars / 3.0)
+
+
+def _clamp_max_tokens_to_context(body: dict, profile: ProfileConfig) -> None:
+    """Cap the client's declared `max_tokens` / `max_output_tokens` so
+    `prompt + max_tokens ≤ context_window − safety_margin`. Runs
+    unconditionally on every request — separate from the thinking-budget
+    bump in `_ensure_room_for_injected_thinking`, which only fires when
+    we inject thinking on a client that didn't ask for it.
+
+    Why unconditional: clients that compute their own
+    `max_tokens = context_window − input_tokens` (e.g. opencode) hit a
+    classic off-by-one when the input grows between turns — request
+    arrives at exactly `context_window + N` and the upstream rejects
+    with ContextWindowExceeded. Some clients don't recognise the
+    litellm-shaped error as an overflow signal and silently hang
+    instead of triggering compaction. We clamp here so the request
+    always fits and the client's own retry/compaction logic doesn't
+    matter.
+
+    Idempotent: if the cap is already safe, does nothing.
+    """
+    if "messages" in body:
+        field = "max_tokens"
+    elif "input" in body:
+        field = "max_output_tokens"
+    else:
+        return
+    current = body.get(field)
+    if not isinstance(current, int) or current <= 0:
+        return
+    upstream_cfg = CONFIG.upstreams.get(profile.upstream)
+    if upstream_cfg is None:
+        return
+    prompt_est = _estimate_prompt_tokens(body)
+    max_allowed = upstream_cfg.context_window - prompt_est - upstream_cfg.context_safety_margin
+    # If the prompt is already over the limit, leave a tiny slot — the
+    # upstream will reject either way, but at least don't ship a
+    # negative cap.
+    max_allowed = max(max_allowed, 256)
+    if current > max_allowed:
+        body[field] = max_allowed
 
 
 def _ensure_room_for_injected_thinking(
@@ -1440,6 +1663,10 @@ def _apply_request_transforms(body: dict, profile: ProfileConfig, kind: str) -> 
         _force_serial_tool_calls(body)
     if profile.has("drop_oai_only_fields"):
         _drop_oai_only_fields(body)
+    # Always last: cap max_tokens so prompt+cap fits the context window.
+    # Runs after every other transform (which may have bumped or
+    # rewritten max_tokens) so the clamp sees the final value.
+    _clamp_max_tokens_to_context(body, profile)
     return body
 
 
@@ -2200,6 +2427,81 @@ async def _stream_responses(
 # =============================================================================
 
 
+# Heartbeat sent to the SSE client when the upstream is silent. Most clients
+# (opencode's @ai-sdk/openai-compatible) implement chunkTimeout as raw-bytes
+# inactivity, so any bytes — including SSE comments — reset their watchdog.
+# Comments are part of the SSE spec (line starting with `:`) and parsers are
+# required to ignore their content.
+_SSE_KEEPALIVE = b": keepalive\n\n"
+# How long we let the upstream go silent before we emit a keepalive. Has to
+# stay safely under client-side chunk timeouts (opencode default 30s, others
+# usually similar) so the client never sees inactivity.
+_STREAM_KEEPALIVE_INTERVAL_S = 15.0
+# How long the upstream may go silent in total before we give up. Distinct
+# from connect/idle limits in `httpx.Timeout`: we want to keep streams alive
+# through long thinking pauses (heavy reasoning models can sit silent for a
+# minute mid-tool-call) but a 5-minute black hole is a dead connection.
+_STREAM_SILENCE_LIMIT_S = 300.0
+
+
+class _StreamStalledError(RuntimeError):
+    """Upstream stopped emitting bytes for `_STREAM_SILENCE_LIMIT_S`. We
+    treat this like a hard upstream failure so the bridge can surface a
+    proper SSE error to the client instead of letting it hang forever."""
+
+
+async def _iter_bytes_with_keepalive(
+    response: httpx.Response,
+) -> AsyncIterator[bytes]:
+    """Wrap `response.aiter_bytes()` with a heartbeat so a slow/stalled
+    upstream doesn't trip the client's chunk-inactivity timeout.
+
+    Heartbeats are SSE comments — they pass through any spec-conforming
+    parser as a no-op, but keep raw bytes flowing so the client's
+    `chunkTimeout` watchdog stays happy.
+
+    Critical correctness rule: a keepalive byte **must only be emitted
+    on an SSE event boundary** (right after a `\\n\\n`). Injecting one
+    inside an in-flight `data: {...}` line splits the JSON across two
+    parsed events on the client and the tool-call args end up corrupted
+    (we observed opencode receiving `arguments="{"` and bailing with
+    "JSON Parse error: Expected '}'" because the keepalive landed
+    mid-event during a slow tool-call generation). When the upstream
+    pauses mid-event we just hold the keepalive until the next boundary
+    arrives — by then either the model resumed (no need for keepalive)
+    or `_STREAM_SILENCE_LIMIT_S` is hit and we abort.
+    """
+    iterator = response.aiter_bytes().__aiter__()
+    last_real_chunk = time.monotonic()
+    # Track whether the most recent yielded chunk ended on a `\n\n` event
+    # boundary. We start `True` so a slow first event still gets its
+    # heartbeat (the client hasn't started a partial parse yet either).
+    on_event_boundary = True
+    while True:
+        try:
+            chunk = await asyncio.wait_for(
+                iterator.__anext__(), timeout=_STREAM_KEEPALIVE_INTERVAL_S
+            )
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            silence = time.monotonic() - last_real_chunk
+            if silence >= _STREAM_SILENCE_LIMIT_S:
+                raise _StreamStalledError(
+                    f"upstream silent for {silence:.0f}s, aborting stream"
+                )
+            if on_event_boundary:
+                yield _SSE_KEEPALIVE
+            # Mid-event: skip this tick, wait for the upstream to either
+            # resume (pushing us past the boundary) or hit the silence
+            # limit. We do NOT inject — corrupting the event is worse
+            # than letting the client's chunk timeout fire.
+            continue
+        last_real_chunk = time.monotonic()
+        yield chunk
+        on_event_boundary = chunk.endswith(b"\n\n")
+
+
 async def _stream_chat_completions(
     body: dict,
     headers: dict[str, str],
@@ -2248,29 +2550,36 @@ async def _stream_chat_completions(
             yield _sse_chat_error(response.status_code, error_text)
             return
         buffer = b""
-        async for chunk in response.aiter_bytes():
-            if not chunk:
-                continue
-            yield chunk
-            buffer += chunk
-            while b"\n\n" in buffer:
-                event, buffer = buffer.split(b"\n\n", 1)
-                for line in event.splitlines():
-                    if not line.startswith(b"data: "):
-                        continue
-                    raw = line[6:].strip()
-                    if raw == b"[DONE]":
-                        continue
-                    try:
-                        payload = json.loads(raw)
-                    except (ValueError, UnicodeDecodeError):
-                        continue
-                    if not isinstance(payload, dict):
-                        continue
-                    if isinstance(payload.get("usage"), dict):
-                        record = _extract_usage(profile.name, model_hint, payload)
-                        if record:
-                            _broadcast_usage(record)
+        try:
+            async for chunk in _iter_bytes_with_keepalive(response):
+                if not chunk:
+                    continue
+                yield chunk
+                # Keepalive comments aren't real data — don't feed them to
+                # the SSE-event buffer or the usage sniffer.
+                if chunk == _SSE_KEEPALIVE:
+                    continue
+                buffer += chunk
+                while b"\n\n" in buffer:
+                    event, buffer = buffer.split(b"\n\n", 1)
+                    for line in event.splitlines():
+                        if not line.startswith(b"data: "):
+                            continue
+                        raw = line[6:].strip()
+                        if raw == b"[DONE]":
+                            continue
+                        try:
+                            payload = json.loads(raw)
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        if not isinstance(payload, dict):
+                            continue
+                        if isinstance(payload.get("usage"), dict):
+                            record = _extract_usage(profile.name, model_hint, payload)
+                            if record:
+                                _broadcast_usage(record)
+        except _StreamStalledError as exc:
+            yield _sse_chat_error(504, str(exc))
     finally:
         try:
             await response.aclose()
@@ -2523,6 +2832,58 @@ async def health() -> dict:
         "profiles": list(CONFIG.profiles.keys()),
         "upstreams": [g.snapshot() for g in _UPSTREAM_GATES.values()],
     }
+
+
+@app.post("/compactions/_inject")
+async def compactions_inject(payload: dict) -> dict:
+    """Debug-only: push a synthetic compaction record into the buffer.
+    Used to test the panel-side poll without waiting for an actual
+    overflow-driven summarization (which only fires past ~80k tokens).
+    Body: `{pid, profile?, model?, input_chars?}`. The pid value
+    becomes `source_pid` so the panel filter matches when this pid is
+    the user's opencode binary."""
+    pid = payload.get("pid")
+    if not isinstance(pid, int):
+        return {"error": "pid (int) required"}
+    record = {
+        "ts": time.time(),
+        "profile": payload.get("profile") or "opencode",
+        "model": payload.get("model") or "qwen3.6",
+        "source_pid": pid,
+        "source_host": "127.0.0.1",
+        "source_port": None,
+        "input_chars": int(payload.get("input_chars") or 0),
+        "injected": True,
+    }
+    _compaction_history.append(record)
+    return {"ok": True, "record": record}
+
+
+@app.get("/compactions/recent")
+async def compactions_recent(
+    pid: int | None = None,
+    since_ts: float | None = None,
+    limit: int = 50,
+) -> dict:
+    """Return recently-detected opencode summarization (compaction)
+    requests. The panel polls this with `?pid=<opencode_pid>&since_ts=
+    <last_seen_ts>` so it sees only its own session's events.
+
+    Without `pid`: returns ALL recent events (callers can filter
+    themselves or use this for diagnostics).
+    Events whose source pid lookup failed are returned with
+    `source_pid: null` and only included when no `pid` filter is set —
+    the panel ignores those.
+    """
+    rows = list(_compaction_history)
+    if since_ts is not None:
+        rows = [r for r in rows if r["ts"] > since_ts]
+    if pid is not None:
+        rows = [r for r in rows if r.get("source_pid") == pid]
+    rows.sort(key=lambda r: r["ts"])
+    if limit > 0:
+        rows = rows[-limit:]
+    return {"events": rows, "now": time.time()}
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -2997,6 +3358,18 @@ async def _handle_chat_completions(
     body = await request.json()
     client_params = _inspect_thinking_params(body, "chat_completions")
     redacted = _redact_body(body)
+    # Compaction detection runs BEFORE the body is mutated by transforms
+    # so the SUMMARY_TEMPLATE substring we match is the literal opencode
+    # sent us — transforms could in theory add system messages later.
+    if _looks_like_summary_request(body):
+        client = request.client
+        _record_compaction(
+            profile_name=profile.name,
+            model=body.get("model") if isinstance(body.get("model"), str) else None,
+            source_host=client.host if client else None,
+            source_port=client.port if client else None,
+            body=body,
+        )
     body = _apply_request_transforms(body, profile, kind="chat_completions")
     forwarded = _redact_body(body)  # post-transform — what we sent upstream
     inspected = _diff_thinking_params(client_params, _inspect_thinking_params(body, "chat_completions"))

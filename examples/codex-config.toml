@@ -7,10 +7,12 @@
 model = "qwen3.6"
 model_provider = "nan"
 
-# Qwen3-30B-A3B-Thinking-2507 has a 131072-token context. The bridge doesn't
-# enforce this — Codex does. 32000 max output is the community-recommended
-# sweet spot to avoid mid-answer truncation while keeping latency bounded.
-model_context_window = 131072
+# Qwen3-30B-A3B-Thinking-2507 has a 131072-token native context, extendable
+# to 262144 via YaRN (NaN currently runs the extended window). The bridge
+# doesn't enforce this — Codex does. 32000 max output is the
+# community-recommended sweet spot to avoid mid-answer truncation while
+# keeping latency bounded.
+model_context_window = 262144
 model_max_output_tokens = 32000
 
 # Codex 0.124+ requires this, not "off".
