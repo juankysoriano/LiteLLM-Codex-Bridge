@@ -19,9 +19,9 @@ enforced (likely vLLM running without `--reasoning-parser qwen3` or with
 MTP speculative decoding hitting issue #39573).
 
 Usage:
-  X_NAN_KEY=sk-... uv run bench_thinking_budget.py
-  X_NAN_KEY=sk-... uv run bench_thinking_budget.py --target https://api.nan.builders/v1
-  X_NAN_KEY=sk-... uv run bench_thinking_budget.py --budgets 128 1024 8192
+  X_NAN_KEY=<your-key> uv run bench_thinking_budget.py
+  X_NAN_KEY=<your-key> uv run bench_thinking_budget.py --target https://api.nan.builders/v1
+  X_NAN_KEY=<your-key> uv run bench_thinking_budget.py --budgets 128 1024 8192
 
 By default it hits NaN Builders directly (bypassing any local bridge) so
 you measure the upstream behavior cleanly.

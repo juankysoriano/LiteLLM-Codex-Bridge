@@ -11,8 +11,8 @@ Restart=on-failure
 RestartSec=3
 
 # Override defaults if you want; otherwise the bridge uses sensible
-# bundled defaults (NaN Builders upstream, profiles for codex /
-# opencode / hermes / default).
+# bundled defaults (NaN Builders upstream, default profile plus one
+# example project profile).
 # Environment=PORT=4242
 # Environment=HOST=127.0.0.1
 # Environment=LOG_LEVEL=info

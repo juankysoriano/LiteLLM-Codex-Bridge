@@ -9,17 +9,15 @@
 # ]
 # ///
 """
-resilient-llm-bridge — a local HTTP proxy that adds resilience between
-OpenAI-compatible clients (Codex, opencode, hermes, OpenAI Agents SDK,
-custom integrations) and OpenAI-compatible upstreams (LiteLLM proxy,
-vLLM, llama.cpp, Together, Fireworks, Groq, NaN Builders, etc.).
+NaN LLM Bridge — a local HTTP proxy that adds resilience between
+OpenAI-compatible clients (opencode, hermes, OpenAI Agents SDK, custom
+integrations) and OpenAI-compatible upstreams (NaN Builders, LiteLLM
+proxy, vLLM, llama.cpp, Together, Fireworks, Groq, etc.).
 
 What "resilience" means concretely:
 
-* Per-client **profiles** select which transformations apply. Codex needs
-  heavy request-body massaging for its OpenAI-native quirks; opencode and
-  hermes are well-behaved chat/completions clients that need almost
-  nothing. Same proxy, different paths, different behavior.
+* Per-client **profiles** select which transformations apply. Same proxy,
+  different paths, different behavior.
 
 * **Retry policy** for transient upstream failures (5xx, 429, network
   errors) with exponential backoff. Configurable per profile.
@@ -33,10 +31,6 @@ What "resilience" means concretely:
 * **Rate limiting** per upstream — token bucket for RPM and a semaphore
   for max concurrent requests. Queues, doesn't reject. Different upstreams
   can have different limits.
-
-* **vLLM bug workarounds** for clients that hit `/v1/responses` (Codex,
-  OpenAI Agents SDK): rewrites the malformed parallel-tool-call SSE that
-  vLLM bug #39426 produces, until vLLM PR #39600 ships.
 
 * **Operational fixes** that bite any proxy chain talking to
   Cloudflare-fronted upstreams (gzip mismatch → forced
@@ -59,7 +53,7 @@ Configuration:
   See `BRIDGE_CONFIG_PATH` env var (defaults to
   ~/.config/resilient-llm-bridge/config.yaml).
   If the file is absent, sensible defaults are used (NaN Builders as the
-  upstream, profiles for codex / opencode / hermes / default).
+  upstream, profiles for myproject / default).
 """
 
 from __future__ import annotations
@@ -80,7 +74,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 import httpx
 import yaml
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from tenacity import (
     AsyncRetrying,
@@ -145,21 +139,38 @@ class UpstreamConfig:
 # Order in the list does not matter; transforms run in a fixed pipeline.
 ALL_FEATURES = {
     # Request transforms (responses-API + chat/completions)
-    "qwen_sampling_defaults",       # inject Qwen3 sampling (temp/top_p/top_k/min_p/presence_penalty)
+    "model_sampling_defaults",      # inject model-aware sampling defaults for qwen/gemma
     "drop_oai_only_fields",         # drop OpenAI-only fields the upstream rejects
     "effort_to_thinking_budget",    # translate reasoning.effort → thinking_token_budget
     # Request transforms (responses-API only)
-    "normalize_responses_input",    # reshape input items for strict validators
-    "drop_namespace_tools",         # drop namespace/MCP/web_search/image_gen tools
-    "force_serial_tool_calls",      # parallel_tool_calls=false override
     # Stream rewriters (responses-API only)
-    "parallel_tool_sse_fix",        # vLLM #39426 workaround for parallel tool SSE
     # Recovery triggers (responses-API; chat/completions has its own)
     "thinking_overflow_recovery",   # incomplete + max_output_tokens → 2-tier recovery
     "silent_completion_recovery",   # completed + no message item → 2-tier recovery
     "truncated_content_recovery",   # length + content cut mid-thought → continue
     "empty_with_stop_retry",        # empty + stop → one cheap retry
     "tool_call_args_retry",         # tool_call args missing required fields → retry with thinking off
+    "xml_tool_residue_retry",       # Qwen XML tool-call template leaked into reasoning/text → retry with thinking off
+}
+
+FORCE_MODEL_OPTIONS = ("qwen3.6", "gemma4")
+
+# Maps reasoning.effort → thinking_token_budget (vLLM extra_body).
+# Defined before config loading because profile validation needs the
+# closed effort set.
+_EFFORT_TO_THINKING_BUDGET = {"low": 2048, "medium": 4096, "high": 8192, "xhigh": 16384}
+_THINKING_EFFORT_OPTIONS = tuple(_EFFORT_TO_THINKING_BUDGET.keys())
+
+FEATURE_DESCRIPTIONS = {
+    "model_sampling_defaults": "Inject model-aware sampling defaults after final model resolution. Qwen uses thinking/non-thinking presets; Gemma4 follows NaN's provider docs. Client-provided values always win.",
+    "drop_oai_only_fields": "Remove OpenAI-only fields the upstream rejects, such as store, metadata, and some response formats.",
+    "effort_to_thinking_budget": "Translate reasoning_effort/reasoning.effort into enable_thinking plus thinking_token_budget.",
+    "thinking_overflow_recovery": "Recover when reasoning hits max tokens before producing a final message.",
+    "silent_completion_recovery": "Recover when the upstream reports completed but emits no useful message text.",
+    "truncated_content_recovery": "Continue an answer that ended with finish_reason=length mid-sentence.",
+    "empty_with_stop_retry": "Retry once when the upstream returns an empty completion with finish_reason=stop.",
+    "tool_call_args_retry": "Retry with thinking disabled when streamed tool-call arguments miss required schema fields.",
+    "xml_tool_residue_retry": "Retry with thinking disabled when Qwen-style XML tool templates leak into text/reasoning.",
 }
 
 
@@ -170,28 +181,49 @@ class ProfileConfig:
     upstream: str
     features: set[str] = field(default_factory=set)
     model_aliases: dict[str, str] = field(default_factory=dict)
-    # Authoritative thinking budget:
-    #   None         → profile is silent; the bridge respects whatever
-    #                  the client sent and translates `effort` →
-    #                  budget if the client gave a hint without an
-    #                  explicit budget.
-    #   <positive>   → profile FORCES this budget; overrides any client
-    #                  effort/budget signal.
+    # Optional hard override. When set, the bridge ignores the client
+    # model and sends this model upstream. When None/empty, the client
+    # model is respected (after optional aliases).
+    force_model: str | None = None
+    # Profile default thinking effort used only when thinking_enabled is
+    # True and the client did not send an explicit effort/budget. None
+    # means force thinking on but let the model/upstream choose its own
+    # thinking budget. `default_thinking_budget` remains as a legacy
+    # compatibility fallback for old config files.
+    default_thinking_effort: str | None = None
     default_thinking_budget: int | None = None
-    # Tristate authoritative thinking switch:
+    # Default generated-token budget. For chat/completions this fills
+    # `max_tokens`; for responses it fills `max_output_tokens`. This is
+    # output only: reasoning/thinking tokens and final answer tokens are
+    # both counted inside it.
+    default_max_output_tokens: int | None = None
+    # Explicit request overrides. None means respect the client/default
+    # transform. These are stronger than defaults and sampling presets.
+    force_max_output_tokens: int | None = None
+    force_temperature: float | None = None
+    force_top_p: float | None = None
+    force_presence_penalty: float | None = None
+    # Tristate default thinking switch:
     #   None  → profile is silent on thinking; the bridge respects
     #           whatever the client sent (or didn't send).
-    #   True  → profile FORCES thinking on, regardless of what the
-    #           client sent.
-    #   False → profile FORCES thinking off, regardless of what the
-    #           client sent.
+    #   True  → profile turns thinking on when the client sent no
+    #           explicit thinking preference.
+    #   False → profile turns thinking off when the client sent no
+    #           explicit thinking preference.
     # The `default` profile is the only built-in that sets this.
     thinking_enabled: bool | None = None
     # Queue priority for the upstream gate — HIGHER = jumps ahead of
-    # lower-priority numbers. Interactive coding agents (codex,
-    # opencode) get 10; long-running daemons (hermes, default) get 0.
-    # Within the same priority bucket it's first-come-first-served.
+    # lower-priority numbers. Interactive agents get 10; long-running
+    # daemons (hermes, default) get 0. Within the same priority bucket
+    # it's first-come-first-served.
     queue_priority: int = 0
+    # Profile-level operational switches. Both default on because this
+    # bridge is mostly used behind Cloudflare-fronted model providers:
+    # streaming reduces idle timeouts, and retrying transient 5xx/524
+    # failures before first byte is safe because no client-visible
+    # output has been emitted yet.
+    auto_retries: bool = True
+    force_stream: bool = True
 
     def has(self, feature: str) -> bool:
         return feature in self.features
@@ -206,6 +238,8 @@ class ProfileConfig:
         in the bridge restores the reasoning hint while still routing
         to the right model upstream.
         """
+        if self.force_model:
+            return self.force_model
         if not isinstance(model, str):
             return model
         return self.model_aliases.get(model, model)
@@ -227,15 +261,13 @@ class BridgeConfig:
 def _builtin_defaults() -> BridgeConfig:
     """Sensible defaults when no config file is present.
 
-    Single upstream pointing at NaN Builders with their advertised limits
-    (100 RPM, 5 concurrent), and profiles for every client we ship support
-    for: codex (full transform stack), hermes / opencode (light), and
-    default (catch-all with mild defenses).
+    Single upstream pointing at NaN Builders with conservative defaults
+    and two non-private profiles: default plus one example profile.
     """
     nan = UpstreamConfig(
         name="nan",
         url="https://api.nan.builders/v1",
-        rate_limit_rpm=100,
+        rate_limit_rpm=1000,
         rate_limit_concurrent=5,
         retry_max_attempts=3,
     )
@@ -246,50 +278,27 @@ def _builtin_defaults() -> BridgeConfig:
                 name="default",
                 upstream="nan",
                 features={
-                    "qwen_sampling_defaults",
+                    "model_sampling_defaults",
                     "drop_oai_only_fields",
                     "effort_to_thinking_budget",
                     "thinking_overflow_recovery",
                     "silent_completion_recovery",
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
+                    "xml_tool_residue_retry",
                 },
-                # `default` is the only built-in profile that opts into
-                # forced thinking — anonymous clients can't tell us
-                # their preference so we apply a sensible default
-                # (medium). Named profiles below leave thinking_enabled
-                # at the dataclass default (False) and pass through.
-                thinking_enabled=True,
-                default_thinking_budget=4096,
+                # No thinking override by default: client effort is translated,
+                # otherwise the upstream/model default decides.
+                default_max_output_tokens=None,
+                auto_retries=True,
+                force_stream=True,
                 queue_priority=0,  # background / unknown
             ),
-            "codex": ProfileConfig(
-                name="codex",
+            "myproject": ProfileConfig(
+                name="myproject",
                 upstream="nan",
                 features={
-                    "qwen_sampling_defaults",
-                    "drop_oai_only_fields",
-                    "effort_to_thinking_budget",
-                    "normalize_responses_input",
-                    "drop_namespace_tools",
-                    "force_serial_tool_calls",
-                    "parallel_tool_sse_fix",
-                    "thinking_overflow_recovery",
-                    "silent_completion_recovery",
-                    "truncated_content_recovery",
-                    "empty_with_stop_retry",
-                },
-                # No thinking overrides — Codex always sends
-                # `reasoning.effort`; the bridge translates that to a
-                # budget via the effort map, which implicitly activates
-                # thinking on the upstream.
-                queue_priority=10,  # interactive — jumps ahead of background
-            ),
-            "hermes": ProfileConfig(
-                name="hermes",
-                upstream="nan",
-                features={
-                    "qwen_sampling_defaults",
+                    "model_sampling_defaults",
                     "drop_oai_only_fields",
                     "effort_to_thinking_budget",
                     "thinking_overflow_recovery",
@@ -297,30 +306,10 @@ def _builtin_defaults() -> BridgeConfig:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                 },
-                # No thinking overrides. Hermes can't send a reasoning
-                # hint to a non-whitelisted host (its supports_reasoning
-                # gate is host-based) so it sends nothing — and we
-                # honor that. No thinking unless Hermes ever starts
-                # forwarding hints.
-                queue_priority=1,  # background daemon, but ahead of `default`
-            ),
-            "opencode": ProfileConfig(
-                name="opencode",
-                upstream="nan",
-                features={
-                    "qwen_sampling_defaults",
-                    "drop_oai_only_fields",
-                    "effort_to_thinking_budget",
-                    "thinking_overflow_recovery",
-                    "silent_completion_recovery",
-                    "truncated_content_recovery",
-                    "empty_with_stop_retry",
-                },
-                # No thinking overrides — opencode now sends its own
-                # `reasoning_effort` (configured via
-                # `models.<id>.options.reasoningEffort` in
-                # opencode.json), which the bridge translates.
-                queue_priority=10,  # interactive — jumps ahead of background
+                default_max_output_tokens=None,
+                auto_retries=True,
+                force_stream=True,
+                queue_priority=5,
             ),
         },
         default_profile="default",
@@ -338,32 +327,36 @@ _SAMPLE_CONFIG_YAML = """\
 #                        retry_max_attempts, retry_initial_wait,
 #                        retry_max_wait }
 #   profiles:  <name>: { upstream, features:[...], queue_priority,
-#                        default_thinking_budget, model_aliases:{...} }
+#                        thinking_enabled, default_thinking_budget,
+#                        default_max_output_tokens, model_aliases:{...} }
 #   default_profile: <name>      # which profile catches /v1/... (no prefix)
 #
+# Thinking policy:
+#   Omit thinking_enabled to respect client/upstream defaults. Set true/false
+#   only when a profile should force thinking on/off. Omit
+#   default_thinking_budget to avoid injecting a budget; client
+#   reasoning_effort is still translated when present.
+#
 # Available `features` (toggle on/off per profile):
-#   qwen_sampling_defaults      inject Qwen3 sampling (top_k, min_p, …)
+#   model_sampling_defaults     inject model-aware sampling defaults
 #   drop_oai_only_fields        strip OpenAI-only fields the upstream rejects
-#   effort_to_thinking_budget   reasoning.effort → thinking_token_budget
-#   normalize_responses_input   reshape input items for strict validators
-#   drop_namespace_tools        drop namespace/MCP/web_search/image tools
-#   force_serial_tool_calls     parallel_tool_calls=false override
-#   parallel_tool_sse_fix       vLLM #39426 workaround
+#   effort_to_thinking_budget   reasoning.effort → enable_thinking + thinking_token_budget
 #   thinking_overflow_recovery  incomplete + max_output_tokens → recover
 #   silent_completion_recovery  completed + no message item → recover
 #   truncated_content_recovery  length + cut mid-thought → continue
 #   empty_with_stop_retry       empty + stop → one cheap retry
+#   xml_tool_residue_retry      XML tool-call template leaked as reasoning/text → retry
 #
 # `queue_priority`: HIGHER number = jumps ahead in the upstream queue
 # when slots are saturated. Same priority resolves FIFO. Suggested:
-#   10  interactive coding agents (codex, opencode)
-#    1  background agents (hermes)
+#   10  interactive agents
+#    5  project-specific workers
 #    0  default / unknown clients
 
 upstreams:
   nan:
     url: "https://api.nan.builders/v1"
-    rate_limit_rpm: 100
+    rate_limit_rpm: 1000
     rate_limit_concurrent: 5
     queue_timeout_s: 120.0    # 503 if a request waits longer than this
     stuck_warn_s: 300.0       # watchdog logs slots held longer than this
@@ -372,9 +365,9 @@ profiles:
   default:
     upstream: nan
     queue_priority: 0
-    default_thinking_budget: 4096   # medium — for unknown clients
+    # default_max_output_tokens: 32768
     features:
-      - qwen_sampling_defaults
+      - model_sampling_defaults
       - drop_oai_only_fields
       - effort_to_thinking_budget
       - thinking_overflow_recovery
@@ -382,46 +375,13 @@ profiles:
       - truncated_content_recovery
       - empty_with_stop_retry
 
-  codex:
+  myproject:
     upstream: nan
-    queue_priority: 10
-    default_thinking_budget: 8192
+    queue_priority: 5
+    # Example profile for one client/project. Rename it locally as needed.
+    # http://127.0.0.1:4242/myproject/v1/chat/completions
     features:
-      - qwen_sampling_defaults
-      - drop_oai_only_fields
-      - effort_to_thinking_budget
-      - normalize_responses_input
-      - drop_namespace_tools
-      - force_serial_tool_calls
-      - parallel_tool_sse_fix
-      - thinking_overflow_recovery
-      - silent_completion_recovery
-      - truncated_content_recovery
-      - empty_with_stop_retry
-
-  hermes:
-    upstream: nan
-    queue_priority: 1
-    default_thinking_budget: 4096
-    features:
-      - qwen_sampling_defaults
-      - drop_oai_only_fields
-      - effort_to_thinking_budget
-      - thinking_overflow_recovery
-      - silent_completion_recovery
-      - truncated_content_recovery
-      - empty_with_stop_retry
-
-  opencode:
-    upstream: nan
-    queue_priority: 10
-    default_thinking_budget: 8192
-    # Optional model id rewrites (client-id -> upstream-id), in case
-    # you want to dodge a client-side model heuristic. Example:
-    # model_aliases:
-    #   nan-thinking: qwen3.6
-    features:
-      - qwen_sampling_defaults
+      - model_sampling_defaults
       - drop_oai_only_fields
       - effort_to_thinking_budget
       - thinking_overflow_recovery
@@ -522,6 +482,9 @@ def _load_config() -> BridgeConfig:
             print(f"[config] profile {name!r} features must be a list; ignored", flush=True)
             feats_raw = []
         feats = set(str(f) for f in feats_raw)
+        if "qwen_sampling_defaults" in feats:
+            feats.remove("qwen_sampling_defaults")
+            feats.add("model_sampling_defaults")
         invalid = feats - ALL_FEATURES
         if invalid:
             print(
@@ -537,9 +500,28 @@ def _load_config() -> BridgeConfig:
             )
             aliases_raw = {}
         model_aliases = {str(k): str(v) for k, v in aliases_raw.items()}
-        # default_thinking_budget is now Optional[int]: missing/null
-        # leaves it as None (no budget injected). Numeric values still
-        # parse; non-numeric/non-null falls back to None.
+        force_model_raw = body.get("force_model")
+        force_model = str(force_model_raw).strip() if force_model_raw is not None else ""
+        if force_model and force_model not in FORCE_MODEL_OPTIONS:
+            print(
+                f"[config] profile {name!r} force_model must be one of "
+                f"{list(FORCE_MODEL_OPTIONS)}; ignored",
+                flush=True,
+            )
+            force_model = ""
+        raw_effort = body.get("default_thinking_effort")
+        default_effort = str(raw_effort).strip().lower() if raw_effort is not None else ""
+        if default_effort not in _THINKING_EFFORT_OPTIONS:
+            if default_effort:
+                print(
+                    f"[config] profile {name!r} default_thinking_effort must be one of "
+                    f"{list(_THINKING_EFFORT_OPTIONS)}; ignored",
+                    flush=True,
+                )
+            default_effort = ""
+        # Legacy compatibility: old configs may still carry a raw numeric
+        # default_thinking_budget. New configs should prefer
+        # default_thinking_effort so the UI can present a closed set.
         raw_budget = body.get("default_thinking_budget")
         if raw_budget is None:
             budget_val: int | None = None
@@ -548,6 +530,30 @@ def _load_config() -> BridgeConfig:
                 budget_val = int(raw_budget)
             except (TypeError, ValueError):
                 budget_val = None
+        raw_max_output = body.get("default_max_output_tokens")
+        if raw_max_output is None:
+            max_output_val: int | None = None
+        else:
+            try:
+                max_output_val = int(raw_max_output)
+            except (TypeError, ValueError):
+                max_output_val = None
+        def _opt_int(key: str) -> int | None:
+            raw = body.get(key)
+            if raw in (None, ""):
+                return None
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return None
+        def _opt_float(key: str) -> float | None:
+            raw = body.get(key)
+            if raw in (None, ""):
+                return None
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return None
         # thinking_enabled is tristate. Absent in YAML → None (profile
         # silent, bridge respects client). Boolean in YAML → profile
         # is authoritative and overrides client.
@@ -564,9 +570,18 @@ def _load_config() -> BridgeConfig:
             upstream=upstream_name,
             features=feats,
             model_aliases=model_aliases,
+            force_model=force_model or None,
+            default_thinking_effort=default_effort or None,
             default_thinking_budget=budget_val,
+            default_max_output_tokens=max_output_val,
+            force_max_output_tokens=_opt_int("force_max_output_tokens"),
+            force_temperature=_opt_float("force_temperature"),
+            force_top_p=_opt_float("force_top_p"),
+            force_presence_penalty=_opt_float("force_presence_penalty"),
             thinking_enabled=thinking_enabled_val,
             queue_priority=_coerce(body.get("queue_priority"), int, 0),
+            auto_retries=bool(body.get("auto_retries", True)),
+            force_stream=bool(body.get("force_stream", True)),
         )
     if not profiles:
         profiles = _builtin_defaults().profiles
@@ -590,21 +605,24 @@ CONFIG = _load_config()
 _SYSTEM_LIKE_ROLES = {"system", "developer"}
 _SYSTEM_NOTE_PREFIX = "[system note]\n"
 
-# Maps reasoning.effort → thinking_token_budget (vLLM extra_body).
-# Sized for Qwen3-30B-A3B-Thinking-2507 on a 256k context: low/medium
-# cover casual reasoning, high (8k) is the model card's coding sweet
-# spot, xhigh (16k) reaches the model card's "highly challenging
-# reasoning" target. Even xhigh leaves 16k of the 32k max_output for
-# the actual answer. Currently a no-op against deployments missing
-# `--reasoning-parser qwen3` on vLLM (the param is silently dropped).
-_EFFORT_TO_THINKING_BUDGET = {"low": 2048, "medium": 4096, "high": 8192, "xhigh": 16384}
-_DEFAULT_THINKING_BUDGET = 8192  # aligned to "high" in the effort map above
-
-# Qwen3 thinking-mode sampling. From generation_config.json shipped with
-# Qwen3-30B-A3B-Thinking-2507. presence_penalty is left at 0 (Qwen warns
-# that high values cause language mixing on coding tasks).
-_QWEN_TOP_LEVEL_DEFAULTS = {"temperature": 0.6, "top_p": 0.95, "presence_penalty": 0.0}
+# Effort sizes are tuned for Qwen3-30B-A3B-Thinking-2507 on a 256k
+# context: low/medium cover casual reasoning, high (8k) is the model
+# card's coding sweet spot, xhigh (16k) reaches the model card's
+# "highly challenging reasoning" target. Even xhigh leaves 16k of the
+# 32k default output budget for the actual answer. Currently a no-op
+# against deployments missing `--reasoning-parser qwen3` on vLLM (the
+# param is silently dropped).
+# Model-aware sampling defaults. These are deliberately conservative:
+# they only fill missing values, never override client-provided sampling.
+# Qwen3.6 publishes distinct presets for thinking vs non-thinking.
+# Gemma4 has broader Google/Hugging Face generation defaults, but NaN's
+# provider docs specify temp/top_p for its served gemma4 deployment and do
+# not mention top_k/presence_penalty/min_p.
+_QWEN_THINKING_TOP_LEVEL_DEFAULTS = {"temperature": 0.6, "top_p": 0.95, "presence_penalty": 0.0}
+_QWEN_NONTHINKING_TOP_LEVEL_DEFAULTS = {"temperature": 0.7, "top_p": 0.8, "presence_penalty": 1.5}
 _QWEN_EXTRA_BODY_DEFAULTS = {"top_k": 20, "min_p": 0}
+_GEMMA4_TOP_LEVEL_DEFAULTS = {"temperature": 0.6, "top_p": 0.95}
+_GEMMA4_EXTRA_BODY_DEFAULTS = {}
 
 # OpenAI-only fields that LiteLLM/vLLM upstreams typically reject with 400.
 _DROP_FIELDS = {
@@ -643,6 +661,65 @@ _FAKE_INVOCATION_LINE_RE = re.compile(
     r"^[a-zA-Z_][\w]*\s*\([^()]*(?:\([^()]*\)[^()]*)*\)\s*;?$"
 )
 _HAPPY_PSEUDO_TOOL_RE = re.compile(r"\bhappy__\w+\s*\(")
+_XML_TOOL_RESIDUE_RE = re.compile(
+    r"</?tool_call\b|</?function(?:=|>)|</?parameter(?:=|>)"
+)
+_XML_TOOL_CLOSING_TAIL_RE = re.compile(
+    r"(?:\n?\s*</parameter>\s*\n\s*</function>\s*\n\s*</tool_call>\s*)+$"
+)
+
+
+def _has_xml_tool_residue(text: Any) -> bool:
+    return isinstance(text, str) and bool(_XML_TOOL_RESIDUE_RE.search(text))
+
+
+def _message_has_xml_tool_residue(message: Any) -> bool:
+    """Qwen sometimes leaks its XML tool-call template as assistant
+    reasoning/text instead of emitting OpenAI-compatible tool_calls."""
+    if not isinstance(message, dict):
+        return False
+    for key in ("content", "reasoning_content", "reasoning"):
+        if _has_xml_tool_residue(message.get(key)):
+            return True
+    fields = message.get("provider_specific_fields")
+    if isinstance(fields, dict):
+        for key in ("reasoning_content", "reasoning"):
+            if _has_xml_tool_residue(fields.get(key)):
+                return True
+    return False
+
+
+def _delta_has_xml_tool_residue(delta: Any) -> bool:
+    if not isinstance(delta, dict):
+        return False
+    for key in ("content", "reasoning_content", "reasoning"):
+        if _has_xml_tool_residue(delta.get(key)):
+            return True
+    return False
+
+
+def _clean_visible_content(message: dict) -> str:
+    content = message.get("content")
+    if not isinstance(content, str):
+        return ""
+    return _XML_TOOL_CLOSING_TAIL_RE.sub("", content).strip()
+
+
+def _retry_payload_usable_after_xml_residue(
+    retry_payload: Any, tools_list: Any, require_tool_call: bool
+) -> bool:
+    if not isinstance(retry_payload, dict):
+        return False
+    retry_choice = (retry_payload.get("choices") or [{}])[0]
+    retry_msg = retry_choice.get("message") or {}
+    if not isinstance(retry_msg, dict) or _message_has_xml_tool_residue(retry_msg):
+        return False
+    retry_tcs = retry_msg.get("tool_calls")
+    if retry_tcs:
+        return _validate_tool_calls(retry_tcs, tools_list)
+    if require_tool_call:
+        return False
+    return bool(_clean_visible_content(retry_msg))
 
 
 def _is_fake_invocation_message_item(item: Any) -> bool:
@@ -763,7 +840,7 @@ class _UpstreamGate:
         `rate_limit_rpm/60` per second.
       * Concurrency cap: max `rate_limit_concurrent` slots in flight.
       * Priority heap: when slots are saturated, waiters queue in
-        priority order. Higher number wins (`codex` and `opencode`
+        priority order. Higher number wins (`opencode`
         use priority=10; `hermes` and `default` use priority=0).
 
     Per-slot state is a dict so the dashboard can show oldest-age and
@@ -856,12 +933,36 @@ class _UpstreamGate:
                 raise _QueueTimeout(self.cfg.name, waited) from None
             raise
 
+    async def update_slot(self, slot_id: int, **fields: Any) -> None:
+        """Attach live request metadata to an acquired slot."""
+        async with self._lock:
+            info = self._in_flight.get(slot_id)
+            if info is not None:
+                info.update({k: v for k, v in fields.items() if v is not None})
+
     async def release(self, slot_id: int) -> None:
         """Release a slot and wake the next waiter, if any."""
         async with self._lock:
             self._in_flight.pop(slot_id, None)
             self._stuck_logged.discard(slot_id)
             self._dispatch_next_locked()
+
+    async def active_requests(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        async with self._lock:
+            rows = []
+            for slot_id, info in self._in_flight.items():
+                row = dict(info)
+                row["slot_id"] = slot_id
+                row["upstream"] = self.cfg.name
+                row["age_s"] = round(now - float(info.get("started", now)), 1)
+                first_byte_at = info.get("first_byte_at")
+                row["ttfb_s"] = (
+                    round(float(first_byte_at) - float(info.get("started", first_byte_at)), 3)
+                    if first_byte_at is not None else None
+                )
+                rows.append(row)
+            return rows
 
     def _dispatch_next_locked(self) -> None:
         """Hand a slot to the highest-priority queued waiter. Caller
@@ -938,6 +1039,30 @@ async def _gated(profile: ProfileConfig, *, path: str = "?"):
         await gate.release(slot_id)
 
 
+async def _acquire_gate_slot(
+    profile: ProfileConfig, *, path: str = "?"
+) -> tuple[_UpstreamGate, int]:
+    """Manual gate acquire for streaming responses — caller MUST
+    eventually call `gate.release(slot_id)`.
+
+    `_gated()` releases on context exit, which is wrong for streaming:
+    the upstream connection lives well past the function that opened
+    it. Releasing too early makes `concurrent_in_flight` under-report
+    active streams and weakens the concurrency cap (it ends up
+    limiting only the connect+headers phase, not the real number of
+    concurrent SSE bodies). Streaming callers acquire via this
+    function and release in their `finally` after `aclose()`.
+    """
+    gate = _gate_for(profile)
+    slot_id = await gate.acquire(
+        profile_name=profile.name,
+        path=path,
+        priority=profile.queue_priority,
+        queue_timeout=gate.cfg.queue_timeout_s,
+    )
+    return gate, slot_id
+
+
 async def _gate_watchdog_loop(interval_s: float = 30.0) -> None:
     """Background task: periodically log slots that have been held
     longer than the per-upstream `stuck_warn_s` threshold. Doesn't
@@ -973,7 +1098,8 @@ async def _gate_watchdog_loop(interval_s: float = 30.0) -> None:
 # =============================================================================
 
 
-_RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+# 524 is Cloudflare timeout-before-first-byte; safe to retry before streaming starts.
+_RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504, 524}
 
 
 class _UpstreamHTTPError(Exception):
@@ -985,10 +1111,11 @@ class _UpstreamHTTPError(Exception):
         super().__init__(f"upstream HTTP {status}: {body[:200]}")
 
 
-def _retry_policy(cfg: UpstreamConfig) -> AsyncRetrying:
+def _retry_policy(cfg: UpstreamConfig, *, enabled: bool = True) -> AsyncRetrying:
     """Build a per-upstream tenacity retry policy."""
+    attempts = cfg.retry_max_attempts if enabled else 1
     return AsyncRetrying(
-        stop=stop_after_attempt(cfg.retry_max_attempts),
+        stop=stop_after_attempt(max(1, attempts)),
         wait=wait_exponential_jitter(
             initial=cfg.retry_initial_wait, max=cfg.retry_max_wait
         ),
@@ -1165,6 +1292,7 @@ _recovery_counts: dict[str, int] = {
     "truncated_content": 0,
     "empty_with_stop_retry": 0,
     "tool_call_args_retry": 0,
+    "xml_tool_residue": 0,
 }
 _retry_counts: dict[str, int] = {"retried": 0, "gave_up": 0}
 
@@ -1382,70 +1510,45 @@ def _content_to_string(content: Any) -> str:
     return str(content or "")
 
 
-def _normalize_responses_input(
-    input_value: Any, *, fold_leading_into_instructions: bool
-) -> tuple[list, str]:
-    """Reshape `/v1/responses` input array for strict upstream validators.
 
-    See the original module docstring's bug list for what each rule fixes.
-    Returns (new_input_list, folded_instructions_text).
-    """
-    if not isinstance(input_value, list) or not input_value:
-        return input_value, ""
-    result: list = []
-    folded_chunks: list[str] = []
-    seen_non_system = False
-    for item in input_value:
-        if not isinstance(item, dict):
-            result.append(item)
-            seen_non_system = True
-            continue
-        item_type = item.get("type", "message")
-        if item_type == "reasoning":
-            continue
-        if item_type in ("function_call", "function_call_output"):
-            seen_non_system = True
-            result.append(item)
-            continue
-        if item_type != "message":
-            seen_non_system = True
-            result.append(item)
-            continue
-        role = item.get("role")
-        is_system_like = role in _SYSTEM_LIKE_ROLES
-        if is_system_like and not seen_non_system:
-            text = _content_to_string(item.get("content"))
-            if fold_leading_into_instructions:
-                if text:
-                    folded_chunks.append(text)
-                continue
-            if text:
-                result.append({"role": "system", "content": text})
-            continue
-        if is_system_like:
-            text = _content_to_string(item.get("content"))
-            if text:
-                result.append({"role": "user", "content": _SYSTEM_NOTE_PREFIX + text})
-            continue
-        seen_non_system = True
-        text = _content_to_string(item.get("content"))
-        if role == "assistant" and not text:
-            continue
-        result.append({"role": role or "user", "content": text})
-    return result, "\n\n".join(folded_chunks)
+def _thinking_enabled_for_sampling(body: dict) -> bool | None:
+    extra = body.get("extra_body")
+    if not isinstance(extra, dict):
+        return None
+    chat_kwargs = extra.get("chat_template_kwargs")
+    if not isinstance(chat_kwargs, dict):
+        return None
+    value = chat_kwargs.get("enable_thinking")
+    return value if isinstance(value, bool) else None
 
 
-def _apply_qwen_sampling_defaults(body: dict) -> None:
+def _apply_model_sampling_defaults(body: dict) -> None:
+    model = str(body.get("model") or "").lower()
+    if "qwen" in model:
+        thinking_enabled = _thinking_enabled_for_sampling(body)
+        top_defaults = (
+            _QWEN_NONTHINKING_TOP_LEVEL_DEFAULTS
+            if thinking_enabled is False
+            else _QWEN_THINKING_TOP_LEVEL_DEFAULTS
+        )
+        extra_defaults = _QWEN_EXTRA_BODY_DEFAULTS
+    elif "gemma" in model:
+        top_defaults = _GEMMA4_TOP_LEVEL_DEFAULTS
+        extra_defaults = _GEMMA4_EXTRA_BODY_DEFAULTS
+    else:
+        return
+
     if body.get("temperature") in (None, 0, 0.0):
-        body["temperature"] = _QWEN_TOP_LEVEL_DEFAULTS["temperature"]
+        body["temperature"] = top_defaults["temperature"]
     if body.get("top_p") is None:
-        body["top_p"] = _QWEN_TOP_LEVEL_DEFAULTS["top_p"]
-    if body.get("presence_penalty") in (None, 0, 0.0):
-        body["presence_penalty"] = _QWEN_TOP_LEVEL_DEFAULTS["presence_penalty"]
+        body["top_p"] = top_defaults["top_p"]
+    if "presence_penalty" in top_defaults and body.get("presence_penalty") in (None, 0, 0.0):
+        body["presence_penalty"] = top_defaults["presence_penalty"]
+
     extra = body.get("extra_body")
     if not isinstance(extra, dict):
         extra = {}
-    for key, value in _QWEN_EXTRA_BODY_DEFAULTS.items():
+    for key, value in extra_defaults.items():
         extra.setdefault(key, value)
     body["extra_body"] = extra
 
@@ -1456,22 +1559,21 @@ _CLIENT_DISABLE_EFFORTS = {"none", "off", "disabled", "false", "no"}
 def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
     """Resolve the thinking-related fields based on profile policy.
 
-    Two-layer precedence: **profile wins when set, otherwise client wins**.
+    Two-layer precedence: **client explicit settings win, profile fills
+    missing settings only**.
 
     For each of `enable_thinking` and `thinking_token_budget`:
 
-      * If the profile config defines the field
-        (`thinking_enabled` is not None, or `default_thinking_budget`
-        is a positive int), the bridge OVERRIDES whatever the client
-        sent — the profile's value goes upstream regardless.
-      * If the profile config is silent on the field, the bridge
-        respects what the client sent. For budget specifically, when
-        the client gave an `effort` hint (e.g. Codex's
+      * If the client sent an explicit value, the bridge preserves it.
+      * If the client sent no explicit enable value, profile policy decides:
+        force on, force off, or stay silent so the upstream/client default wins.
+      * For budget specifically, when the client gave an `effort` hint
+        (e.g. Codex's
         `reasoning.effort=high`) without an explicit
         `extra_body.thinking_token_budget`, the bridge translates the
-        effort via `_EFFORT_TO_THINKING_BUDGET` — translation, not
-        override. Effort values in `_CLIENT_DISABLE_EFFORTS` are
-        translated to `enable_thinking=false`.
+        effort via `_EFFORT_TO_THINKING_BUDGET`. Otherwise it only adds
+        a budget if the profile explicitly defines one. Effort values in `_CLIENT_DISABLE_EFFORTS`
+        are translated to `enable_thinking=false`.
 
     Placement:
       - `thinking_token_budget` → top-level of `extra_body` (vLLM
@@ -1486,38 +1588,51 @@ def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
     if not isinstance(chat_kwargs, dict):
         chat_kwargs = {}
 
+    effort: str | None = None
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and isinstance(reasoning.get("effort"), str):
+        effort = reasoning["effort"].strip().lower()
+    if effort is None and isinstance(body.get("reasoning_effort"), str):
+        effort = body["reasoning_effort"].strip().lower()
+
+    client_set_enable = "enable_thinking" in chat_kwargs
+    client_set_budget = "thinking_token_budget" in extra
+    client_disabled_with_effort = effort in _CLIENT_DISABLE_EFFORTS
+    profile_forces_off = profile.thinking_enabled is False
+    profile_forces_on = profile.thinking_enabled is True
+
     # ----- enable_thinking decision -----
-    if profile.thinking_enabled is not None:
-        # Profile is authoritative — override.
-        chat_kwargs["enable_thinking"] = profile.thinking_enabled
-    # else: leave whatever the client sent (or didn't send) intact.
+    if profile_forces_off:
+        chat_kwargs["enable_thinking"] = False
+    elif profile_forces_on:
+        chat_kwargs["enable_thinking"] = True
+    elif client_disabled_with_effort and not client_set_enable:
+        chat_kwargs["enable_thinking"] = False
+    elif not client_set_enable and effort and effort in _EFFORT_TO_THINKING_BUDGET:
+        # Client asked for a reasoning effort; translate that explicit
+        # intent to the upstream's enable flag as well as the budget.
+        chat_kwargs["enable_thinking"] = True
+    # else: respect whatever the client/upstream decides.
+
+    client_disabled_thinking = (
+        chat_kwargs.get("enable_thinking") is False
+        or client_disabled_with_effort
+    )
 
     # ----- thinking_token_budget decision -----
-    if isinstance(profile.default_thinking_budget, int) and profile.default_thinking_budget > 0:
-        # Profile is authoritative — override any client effort/budget.
+    if client_disabled_thinking:
+        # A disabled-thinking request must not carry a budget. On some
+        # upstreams a budget can re-enable or alter thinking behavior.
+        extra.pop("thinking_token_budget", None)
+    elif client_set_budget:
+        pass
+    elif effort and effort in _EFFORT_TO_THINKING_BUDGET:
+        extra["thinking_token_budget"] = _EFFORT_TO_THINKING_BUDGET[effort]
+    elif profile_forces_on and profile.default_thinking_effort in _EFFORT_TO_THINKING_BUDGET:
+        extra["thinking_token_budget"] = _EFFORT_TO_THINKING_BUDGET[profile.default_thinking_effort]
+    elif profile_forces_on and isinstance(profile.default_thinking_budget, int) and profile.default_thinking_budget > 0:
         extra["thinking_token_budget"] = profile.default_thinking_budget
-    else:
-        # Profile silent — translate client signals. Skip if the client
-        # already put an explicit budget in extra_body (their value
-        # wins).
-        if "thinking_token_budget" not in extra:
-            effort: str | None = None
-            reasoning = body.get("reasoning")
-            if isinstance(reasoning, dict) and isinstance(reasoning.get("effort"), str):
-                effort = reasoning["effort"].strip().lower()
-            if effort is None and isinstance(body.get("reasoning_effort"), str):
-                effort = body["reasoning_effort"].strip().lower()
-            if effort and effort in _EFFORT_TO_THINKING_BUDGET:
-                extra["thinking_token_budget"] = _EFFORT_TO_THINKING_BUDGET[effort]
-            elif (
-                effort
-                and effort in _CLIENT_DISABLE_EFFORTS
-                and profile.thinking_enabled is None
-            ):
-                # Client said no thinking via `effort=none`; surface as
-                # explicit `enable_thinking=false`. Skip if the profile
-                # already overrode (profile-set wins).
-                chat_kwargs["enable_thinking"] = False
+    # else: stay silent — no default budget means client/upstream decides.
 
     if chat_kwargs:
         extra["chat_template_kwargs"] = chat_kwargs
@@ -1525,6 +1640,22 @@ def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
     # No more max_tokens inflation: `_ensure_room_for_injected_thinking`
     # is gone. The thinking budget enforces upstream now (verified
     # 2026-04-30), so there's no runaway reasoning to "make room" for.
+
+
+def _apply_default_output_tokens(body: dict, profile: ProfileConfig, kind: str) -> None:
+    default_tokens = profile.default_max_output_tokens
+    if not isinstance(default_tokens, int) or default_tokens <= 0:
+        return
+    if kind == "chat_completions":
+        if "max_tokens" not in body and "max_completion_tokens" not in body:
+            body["max_tokens"] = default_tokens
+    elif kind == "responses":
+        if "max_output_tokens" not in body:
+            body["max_output_tokens"] = default_tokens
+
+
+def _profile_max_completion_tokens(profile: ProfileConfig) -> int:
+    return profile.default_max_output_tokens or 32768
 
 
 def _estimate_prompt_tokens(body: dict) -> int:
@@ -1629,52 +1760,51 @@ def _drop_oai_only_fields(body: dict) -> None:
         body.pop(field_name, None)
 
 
-def _filter_tools_to_function_only(body: dict) -> None:
-    tools = body.get("tools")
-    if not isinstance(tools, list):
-        return
-    kept = [t for t in tools if isinstance(t, dict) and t.get("type") == "function"]
-    if kept:
-        body["tools"] = kept
-    else:
-        body.pop("tools", None)
-        body.pop("tool_choice", None)
+
+def _apply_force_overrides(body: dict, profile: ProfileConfig, kind: str) -> None:
+    if profile.force_max_output_tokens is not None:
+        field = "max_output_tokens" if kind == "responses" else "max_tokens"
+        body[field] = profile.force_max_output_tokens
+    if profile.force_temperature is not None:
+        body["temperature"] = profile.force_temperature
+    if profile.force_top_p is not None:
+        body["top_p"] = profile.force_top_p
+    if profile.force_presence_penalty is not None:
+        body["presence_penalty"] = profile.force_presence_penalty
 
 
-def _force_serial_tool_calls(body: dict) -> None:
-    body["parallel_tool_calls"] = False
+def _force_stream(body: dict, kind: str) -> None:
+    body["stream"] = True
+    if kind == "chat_completions":
+        opts = body.get("stream_options")
+        if not isinstance(opts, dict):
+            opts = {}
+        opts.setdefault("include_usage", True)
+        body["stream_options"] = opts
 
 
 def _apply_request_transforms(body: dict, profile: ProfileConfig, kind: str) -> dict:
     """Apply every feature in the profile that's relevant to this request kind.
 
-    `kind` is "responses" or "chat_completions" — some transforms are
-    responses-API-specific (input reshape, parallel_tool_calls override).
+    `kind` is "responses" or "chat_completions".
     """
-    # Always run model aliasing first so downstream transforms (and the
-    # upstream itself) see the resolved id.
-    if profile.model_aliases:
+    # Resolve model first so downstream transforms (and the upstream
+    # itself) see the final id. `force_model` is intentionally stronger
+    # than aliases; with no force configured, the client model passes
+    # through unchanged unless an alias matches.
+    if profile.force_model or profile.model_aliases:
         original = body.get("model")
         resolved = profile.resolve_model(original)
         if isinstance(resolved, str) and resolved != original:
             body["model"] = resolved
-    if profile.has("normalize_responses_input") and kind == "responses" and "input" in body:
-        instructions = body.get("instructions")
-        has_instructions = isinstance(instructions, str) and instructions.strip()
-        new_input, folded = _normalize_responses_input(
-            body["input"], fold_leading_into_instructions=bool(has_instructions)
-        )
-        body["input"] = new_input
-        if folded:
-            body["instructions"] = (instructions or "").rstrip() + "\n\n" + folded
-    if profile.has("drop_namespace_tools"):
-        _filter_tools_to_function_only(body)
-    if profile.has("qwen_sampling_defaults"):
-        _apply_qwen_sampling_defaults(body)
+    if profile.force_stream:
+        _force_stream(body, kind)
     if profile.has("effort_to_thinking_budget"):
         _apply_effort_budget(body, profile)
-    if profile.has("force_serial_tool_calls") and kind == "responses":
-        _force_serial_tool_calls(body)
+    if profile.has("model_sampling_defaults"):
+        _apply_model_sampling_defaults(body)
+    _apply_default_output_tokens(body, profile, kind)
+    _apply_force_overrides(body, profile, kind)
     if profile.has("drop_oai_only_fields"):
         _drop_oai_only_fields(body)
     # Always last: cap max_tokens so prompt+cap fits the context window.
@@ -1708,32 +1838,100 @@ def _input_to_chat_messages(input_value: Any, instructions: Any) -> list[dict]:
     return messages
 
 
-async def _post_chat_for_text(
-    body: dict, headers: dict[str, str], profile: ProfileConfig
-) -> str | None:
-    """Run a non-streaming chat/completions request and extract content."""
+async def _post_chat_payload(
+    body: dict,
+    headers: dict[str, str],
+    profile: ProfileConfig,
+    *,
+    timeout_s: float = 120.0,
+) -> tuple[int, dict]:
+    """Run chat/completions and return a non-stream-shaped payload.
+
+    When `profile.force_stream` is on, the upstream call still uses
+    `stream=true`; the bridge buffers and assembles the SSE response
+    internally. This keeps Cloudflare-fronted upstreams active while
+    preserving recovery code that needs to inspect a complete response.
+    """
     url = f"{_upstream_url(profile)}/chat/completions"
     cfg = CONFIG.upstreams[profile.upstream]
+    request_body = copy.deepcopy(body)
+    if profile.force_stream:
+        request_body["stream"] = True
+        opts = request_body.get("stream_options")
+        if not isinstance(opts, dict):
+            opts = {}
+        opts.setdefault("include_usage", True)
+        request_body["stream_options"] = opts
+    else:
+        request_body["stream"] = False
+        request_body.pop("stream_options", None)
+    last_status = 502
+    last_payload: dict = {"error": {"message": "unreachable"}}
     try:
-        async for attempt in _retry_policy(cfg):
+        async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
             with attempt:
                 async with _gated(profile):
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-                        r = await client.post(url, json=body, headers=headers)
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, read=None)) as client:
+                        if profile.force_stream:
+                            response = await client.send(
+                                client.build_request("POST", url, json=request_body, headers=headers),
+                                stream=True,
+                            )
+                            last_status = response.status_code
+                            if response.status_code in _RETRYABLE_STATUS:
+                                body_bytes = await response.aread()
+                                await response.aclose()
+                                raise _UpstreamHTTPError(
+                                    response.status_code,
+                                    body_bytes.decode("utf-8", errors="ignore"),
+                                )
+                            if response.status_code >= 400:
+                                body_bytes = await response.aread()
+                                await response.aclose()
+                                return response.status_code, _parse_upstream_error(
+                                    response.status_code,
+                                    body_bytes.decode("utf-8", errors="ignore"),
+                                )
+                            buf = bytearray()
+                            async for chunk in response.aiter_bytes():
+                                buf.extend(chunk)
+                            await response.aclose()
+                            assembled = _assemble_chat_sse(bytes(buf), request_body.get("model"))
+                            return response.status_code, assembled["payload"]
+                        r = await client.post(url, json=request_body, headers=headers)
+                last_status = r.status_code
                 if r.status_code in _RETRYABLE_STATUS:
                     raise _UpstreamHTTPError(r.status_code, r.text)
                 if r.status_code >= 400:
-                    return None
-                payload = r.json()
-                choices = payload.get("choices") if isinstance(payload, dict) else None
-                if not choices:
-                    return None
-                message = (choices[0] or {}).get("message") or {}
-                content = (message.get("content") or "").strip()
-                return content or None
-    except (RetryError, httpx.HTTPError, ValueError):
+                    return r.status_code, _parse_upstream_error(r.status_code, r.text)
+                payload = (
+                    r.json()
+                    if r.headers.get("content-type", "").startswith("application/json")
+                    else {}
+                )
+                return r.status_code, payload
+    except _QueueTimeout as exc:
+        return 503, {"error": {"message": str(exc), "retry_after_s": 10}}
+    except (RetryError, _UpstreamHTTPError):
+        return last_status, last_payload
+    except (httpx.HTTPError, ValueError) as e:
+        return 502, {"error": {"message": f"upstream error: {e}"}}
+    return last_status, last_payload
+
+
+async def _post_chat_for_text(
+    body: dict, headers: dict[str, str], profile: ProfileConfig
+) -> str | None:
+    """Run chat/completions and extract content."""
+    status, payload = await _post_chat_payload(body, headers, profile, timeout_s=120.0)
+    if status >= 400 or not isinstance(payload, dict):
         return None
-    return None
+    choices = payload.get("choices")
+    if not choices:
+        return None
+    message = (choices[0] or {}).get("message") or {}
+    content = (message.get("content") or "").strip()
+    return content or None
 
 
 async def _recover_thinking_overflow(
@@ -1771,8 +1969,8 @@ async def _recover_thinking_overflow(
             "chat_template_kwargs": {"enable_thinking": False},
         },
     }
-    if profile.has("qwen_sampling_defaults"):
-        _apply_qwen_sampling_defaults(tier2_body)
+    if profile.has("model_sampling_defaults"):
+        _apply_model_sampling_defaults(tier2_body)
     text = await _post_chat_for_text(tier2_body, headers, profile)
     if text:
         return text
@@ -1784,8 +1982,8 @@ async def _recover_thinking_overflow(
         "max_tokens": _RECOVERY_MAX_TOKENS,
         "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
     }
-    if profile.has("qwen_sampling_defaults"):
-        _apply_qwen_sampling_defaults(tier3_body)
+    if profile.has("model_sampling_defaults"):
+        _apply_model_sampling_defaults(tier3_body)
     return await _post_chat_for_text(tier3_body, headers, profile)
 
 
@@ -1826,8 +2024,8 @@ async def _recover_truncated_content(
             "chat_template_kwargs": {"enable_thinking": False},
         },
     }
-    if profile.has("qwen_sampling_defaults"):
-        _apply_qwen_sampling_defaults(cont_body)
+    if profile.has("model_sampling_defaults"):
+        _apply_model_sampling_defaults(cont_body)
     extra = await _post_chat_for_text(cont_body, headers, profile)
     if not extra:
         return None
@@ -1949,9 +2147,9 @@ def _build_thinking_off_retry_body(body: dict) -> dict:
     """Clone the request body and force thinking off for the retry.
 
     Drops `thinking_token_budget` (irrelevant when thinking is off)
-    and sets `chat_template_kwargs.enable_thinking=false`. The retry
-    is non-streaming (caller wraps it via `_post_chat_for_text`-style
-    helpers) so we also force `stream=False` defensively.
+    and sets `chat_template_kwargs.enable_thinking=false`. The helper
+    may still send this retry upstream as `stream=true` when the profile
+    has `force_stream` enabled; it buffers the SSE internally.
     """
     retry = copy.deepcopy(body)
     retry["stream"] = False
@@ -1977,33 +2175,11 @@ async def _retry_chat_thinking_off(
     Returns (status, payload) — caller validates the payload before
     deciding whether to swap.
     """
-    cfg = CONFIG.upstreams[profile.upstream]
-    url = f"{_upstream_url(profile)}/chat/completions"
     retry_body = _build_thinking_off_retry_body(body)
-    last_status = 502
-    payload: dict = {"error": {"message": "unreachable"}}
-    try:
-        async for attempt in _retry_policy(cfg):
-            with attempt:
-                async with _gated(profile):
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-                        r = await client.post(url, json=retry_body, headers=headers)
-                last_status = r.status_code
-                if r.status_code in _RETRYABLE_STATUS:
-                    raise _UpstreamHTTPError(r.status_code, r.text)
-                payload = (
-                    r.json()
-                    if r.headers.get("content-type", "").startswith("application/json")
-                    else {}
-                )
-                break
-    except _QueueTimeout:
-        return 503, {"error": {"message": "queue timeout on retry"}}
-    except (RetryError, _UpstreamHTTPError):
-        return last_status, payload if isinstance(payload, dict) else {"error": {}}
-    except httpx.HTTPError as e:
-        return 502, {"error": {"message": f"retry upstream error: {e}"}}
-    return last_status, payload
+    status, payload = await _post_chat_payload(
+        retry_body, headers, profile, timeout_s=120.0
+    )
+    return status, payload
 
 
 def _detect_truncated_message(message_text: str, finish_reason: str | None) -> bool:
@@ -2037,11 +2213,10 @@ def _coerce_error_payload(status: int, body_text: str) -> dict:
     it's already in that shape.
 
     The bridge previously wrapped errors in `{type:"error", status,
-    body}`, which neither opencode (`@ai-sdk/openai-compatible`) nor
-    codex CLI knows how to parse — both expect either `choices` or a
-    nested `error` object. The Zod failure manifests in happy as a
-    cryptic "expected array, received undefined" instead of the real
-    upstream message.
+    body}`, which opencode (`@ai-sdk/openai-compatible`) does not parse
+    correctly — it expects either `choices` or a nested `error` object.
+    The Zod failure manifests in happy as a cryptic "expected array,
+    received undefined" instead of the real upstream message.
     """
     try:
         parsed = json.loads(body_text)
@@ -2125,8 +2300,7 @@ async def _stream_responses(
     cfg = CONFIG.upstreams[profile.upstream]
     upstream_url = f"{_upstream_url(profile)}/responses"
 
-    # State for vLLM #39426 SSE rewrite (fc_state) and overflow recovery.
-    fc_state: dict[int, dict] = {}
+    # State for overflow/silent-response recovery.
     reasoning_accum = ""
     message_text_accum = ""
     message_emitted = False
@@ -2141,14 +2315,30 @@ async def _stream_responses(
     # "session spawned but no response ever shows".
     open_messages: dict[int, dict] = {}
     last_seq = 0
-    do_parallel_fix = profile.has("parallel_tool_sse_fix")
 
     async def _open_stream():
         # tenacity on the entire stream open is fine — we don't replay
         # mid-stream, we only retry the connect/headers phase.
-        async for attempt in _retry_policy(cfg):
+        # Slot is acquired manually so it can be held for the whole
+        # SSE body (see `_acquire_gate_slot`). Released on retryable
+        # errors here; ownership transfers to the caller on success.
+        async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
             with attempt:
-                async with _gated(profile):
+                gate, slot_id = await _acquire_gate_slot(
+                    profile, path="/v1/responses"
+                )
+                await gate.update_slot(
+                    slot_id,
+                    model=str(model_hint) if model_hint else None,
+                    method="POST",
+                    stream=True,
+                    phase="connecting",
+                    params=_inspect_thinking_params(body, "responses"),
+                    chunks=0,
+                    bytes=0,
+                )
+                slot_transferred = False
+                try:
                     client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=None))
                     response = await client.send(
                         client.build_request(
@@ -2163,11 +2353,25 @@ async def _stream_responses(
                         raise _UpstreamHTTPError(
                             response.status_code, body_bytes.decode("utf-8", errors="ignore")
                         )
-                    return client, response
+                    slot_transferred = True
+                    return client, response, gate, slot_id
+                finally:
+                    if not slot_transferred:
+                        await gate.release(slot_id)
         raise RuntimeError("unreachable")  # pragma: no cover
 
     try:
-        client, response = await _open_stream()
+        client, response, gate, slot_id = await _open_stream()
+        await gate.update_slot(
+            slot_id,
+            model=str(model_hint) if model_hint else None,
+            method="POST",
+            stream=True,
+            phase="opened",
+            params=_inspect_thinking_params(body, "responses"),
+            chunks=0,
+            bytes=0,
+        )
     except _QueueTimeout as exc:
         yield _sse_responses_error(503, str(exc))
         return
@@ -2184,9 +2388,17 @@ async def _stream_responses(
             return
 
         buffer = b""
+        chunk_count = 0
+        byte_count = 0
+        first_byte_at: float | None = None
         async for chunk in response.aiter_bytes():
             if not chunk:
                 continue
+            chunk_count += 1
+            byte_count += len(chunk)
+            if first_byte_at is None:
+                first_byte_at = time.monotonic()
+            await gate.update_slot(slot_id, phase="streaming", chunks=chunk_count, bytes=byte_count, first_byte_at=first_byte_at)
             buffer += chunk
             while b"\n\n" in buffer:
                 event, buffer = buffer.split(b"\n\n", 1)
@@ -2266,59 +2478,6 @@ async def _stream_responses(
                         # synthesize for this index.
                         open_messages.pop(idx, None)
 
-                # vLLM #39426 SSE rewrite (only when feature enabled)
-                if do_parallel_fix:
-                    if etype == "response.output_item.added":
-                        item = payload.get("item") or {}
-                        if item.get("type") == "function_call":
-                            idx = payload.get("output_index")
-                            fc_state[idx] = {
-                                "id": item.get("id"),
-                                "call_id": item.get("call_id"),
-                                "name": item.get("name"),
-                                "args": "",
-                            }
-                        yield _sse(payload)
-                        continue
-                    if etype == "response.function_call_arguments.delta":
-                        idx = payload.get("output_index")
-                        st = fc_state.get(idx)
-                        if st is not None:
-                            st["args"] += payload.get("delta") or ""
-                        yield _sse(payload)
-                        continue
-                    if etype == "response.function_call_arguments.done":
-                        # Drop vLLM's bogus concatenated `done`.
-                        continue
-                    if etype == "response.output_item.done":
-                        idx = payload.get("output_index")
-                        st = fc_state.get(idx)
-                        if st is not None:
-                            seq = payload.get("sequence_number")
-                            yield _sse(
-                                {
-                                    "type": "response.function_call_arguments.done",
-                                    "item_id": st["id"],
-                                    "output_index": idx,
-                                    "name": st["name"],
-                                    "arguments": st["args"],
-                                    "sequence_number": seq,
-                                    "model": payload.get("model"),
-                                }
-                            )
-                            fixed = dict(payload)
-                            fixed["item"] = {
-                                "type": "function_call",
-                                "id": st["id"],
-                                "call_id": st["call_id"],
-                                "name": st["name"],
-                                "arguments": st["args"],
-                                "status": "completed",
-                            }
-                            yield _sse(fixed)
-                            fc_state.pop(idx, None)
-                            continue
-
                 if etype == "response.completed":
                     # Buffer for potential post-stream recovery.
                     completed_payload = payload
@@ -2329,17 +2488,19 @@ async def _stream_responses(
         try:
             await response.aclose()
         finally:
-            await client.aclose()
+            try:
+                await client.aclose()
+            finally:
+                await gate.release(slot_id)
 
     if completed_payload is None:
         return
 
     response_obj = completed_payload.get("response") or {}
 
-    # Diagnostic trace — useful for debugging silent/empty responses
-    # like "happy spawns codex but no answer ever shows". Logged for
-    # every responses-API completion. Cheap and easy to grep.
-    if profile.name in {"codex", "default"}:
+    # Diagnostic trace — useful for debugging silent/empty responses.
+    # Logged for default responses-API completions. Cheap and easy to grep.
+    if profile.name == "default":
         items = response_obj.get("output") or []
         item_summary = []
         for it in items:
@@ -2364,7 +2525,7 @@ async def _stream_responses(
             else:
                 item_summary.append(t)
         print(
-            f"[codex-trace] profile={profile.name} status={response_obj.get('status')!r}"
+            f"[responses-trace] profile={profile.name} status={response_obj.get('status')!r}"
             f" finish_reason={response_obj.get('incomplete_details') or 'OK'}"
             f" items={item_summary}"
             f" message_emitted={message_emitted}"
@@ -2623,29 +2784,33 @@ async def _iter_bytes_with_keepalive(
     parser as a no-op, but keep raw bytes flowing so the client's
     `chunkTimeout` watchdog stays happy.
 
-    Critical correctness rule: a keepalive byte **must only be emitted
-    on an SSE event boundary** (right after a `\\n\\n`). Injecting one
-    inside an in-flight `data: {...}` line splits the JSON across two
-    parsed events on the client and the tool-call args end up corrupted
-    (we observed opencode receiving `arguments="{"` and bailing with
-    "JSON Parse error: Expected '}'" because the keepalive landed
-    mid-event during a slow tool-call generation). When the upstream
-    pauses mid-event we just hold the keepalive until the next boundary
-    arrives — by then either the model resumed (no need for keepalive)
-    or `_STREAM_SILENCE_LIMIT_S` is hit and we abort.
+    Critical correctness rule: never forward a partial SSE event. If the
+    upstream pauses halfway through a `data: {...}` event and we already
+    forwarded that fragment, a keepalive would corrupt the event stream.
+    Buffering until the next `\n\n` boundary lets us emit keepalives while
+    the upstream is silent without putting the client parser mid-event.
     """
     iterator = response.aiter_bytes().__aiter__()
     last_real_chunk = time.monotonic()
-    # Track whether the most recent yielded chunk ended on a `\n\n` event
-    # boundary. We start `True` so a slow first event still gets its
-    # heartbeat (the client hasn't started a partial parse yet either).
-    on_event_boundary = True
+    buffer = bytearray()
+
+    def pop_complete_event() -> bytes | None:
+        marker = buffer.find(b"\n\n")
+        if marker < 0:
+            return None
+        end = marker + 2
+        event = bytes(buffer[:end])
+        del buffer[:end]
+        return event
+
     while True:
         try:
             chunk = await asyncio.wait_for(
                 iterator.__anext__(), timeout=_STREAM_KEEPALIVE_INTERVAL_S
             )
         except StopAsyncIteration:
+            if buffer:
+                yield bytes(buffer)
             return
         except asyncio.TimeoutError:
             silence = time.monotonic() - last_real_chunk
@@ -2653,16 +2818,15 @@ async def _iter_bytes_with_keepalive(
                 raise _StreamStalledError(
                     f"upstream silent for {silence:.0f}s, aborting stream"
                 )
-            if on_event_boundary:
-                yield _SSE_KEEPALIVE
-            # Mid-event: skip this tick, wait for the upstream to either
-            # resume (pushing us past the boundary) or hit the silence
-            # limit. We do NOT inject — corrupting the event is worse
-            # than letting the client's chunk timeout fire.
+            yield _SSE_KEEPALIVE
             continue
         last_real_chunk = time.monotonic()
-        yield chunk
-        on_event_boundary = chunk.endswith(b"\n\n")
+        buffer.extend(chunk)
+        while True:
+            event = pop_complete_event()
+            if event is None:
+                break
+            yield event
 
 
 async def _stream_chat_completions(
@@ -2693,9 +2857,25 @@ async def _stream_chat_completions(
     upstream_url = f"{_upstream_url(profile)}/chat/completions"
 
     async def _open_stream():
-        async for attempt in _retry_policy(cfg):
+        # See `_stream_responses._open_stream` — slot stays held for
+        # the whole SSE body via `_acquire_gate_slot`.
+        async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
             with attempt:
-                async with _gated(profile):
+                gate, slot_id = await _acquire_gate_slot(
+                    profile, path="/v1/chat/completions"
+                )
+                await gate.update_slot(
+                    slot_id,
+                    model=str(model_hint) if model_hint else None,
+                    method="POST",
+                    stream=True,
+                    phase="connecting",
+                    params=_inspect_thinking_params(body, "chat_completions"),
+                    chunks=0,
+                    bytes=0,
+                )
+                slot_transferred = False
+                try:
                     client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=None))
                     response = await client.send(
                         client.build_request(
@@ -2710,11 +2890,25 @@ async def _stream_chat_completions(
                         raise _UpstreamHTTPError(
                             response.status_code, body_bytes.decode("utf-8", errors="ignore")
                         )
-                    return client, response
+                    slot_transferred = True
+                    return client, response, gate, slot_id
+                finally:
+                    if not slot_transferred:
+                        await gate.release(slot_id)
         raise RuntimeError("unreachable")  # pragma: no cover
 
     try:
-        client, response = await _open_stream()
+        client, response, gate, slot_id = await _open_stream()
+        await gate.update_slot(
+            slot_id,
+            model=str(model_hint) if model_hint else None,
+            method="POST",
+            stream=True,
+            phase="opened",
+            params=_inspect_thinking_params(body, "chat_completions"),
+            chunks=0,
+            bytes=0,
+        )
     except _QueueTimeout as exc:
         yield _sse_chat_error(503, str(exc))
         return
@@ -2724,7 +2918,10 @@ async def _stream_chat_completions(
         yield _sse_chat_error(status, body_text)
         return
 
-    do_retry_recovery = profile.has("tool_call_args_retry") and not _client_already_disabled_thinking(body)
+    thinking_retry_allowed = not _client_already_disabled_thinking(body)
+    do_tool_call_retry = profile.has("tool_call_args_retry") and thinking_retry_allowed
+    do_xml_residue_retry = profile.has("xml_tool_residue_retry") and thinking_retry_allowed
+    do_retry_recovery = do_tool_call_retry or do_xml_residue_retry
 
     try:
         if response.status_code >= 400:
@@ -2736,10 +2933,18 @@ async def _stream_chat_completions(
             # Existing path: byte-for-byte forward, sniff usage as it
             # passes by.
             buffer = b""
+            chunk_count = 0
+            byte_count = 0
+            first_byte_at: float | None = None
             try:
                 async for chunk in _iter_bytes_with_keepalive(response):
                     if not chunk:
                         continue
+                    chunk_count += 1
+                    byte_count += len(chunk)
+                    if first_byte_at is None:
+                        first_byte_at = time.monotonic()
+                    await gate.update_slot(slot_id, phase="streaming", chunks=chunk_count, bytes=byte_count, first_byte_at=first_byte_at)
                     yield chunk
                     if chunk == _SSE_KEEPALIVE:
                         continue
@@ -2790,6 +2995,9 @@ async def _stream_chat_completions(
         upstream_buffer = bytearray()  # full buffer when in DECISION_BUFFER mode
         sse_buf = b""                  # incremental SSE event-line splitter (pre-decision)
         usage_obj: dict | None = None  # sniffed usage for passthrough path
+        chunk_count = 0
+        byte_count = 0
+        first_byte_at: float | None = None
 
         async def _flush_held():
             # Helper: if there are held bytes, emit them now. The caller
@@ -2805,6 +3013,11 @@ async def _stream_chat_completions(
             async for chunk in _iter_bytes_with_keepalive(response):
                 if not chunk:
                     continue
+                chunk_count += 1
+                byte_count += len(chunk)
+                if first_byte_at is None:
+                    first_byte_at = time.monotonic()
+                await gate.update_slot(slot_id, phase="streaming", chunks=chunk_count, bytes=byte_count, first_byte_at=first_byte_at)
                 if chunk == _SSE_KEEPALIVE:
                     yield chunk
                     continue
@@ -2842,7 +3055,10 @@ async def _stream_chat_completions(
                             if not isinstance(choice, dict): continue
                             delta = choice.get("delta") or {}
                             if not isinstance(delta, dict): continue
-                            if delta.get("tool_calls"):
+                            if do_xml_residue_retry and _delta_has_xml_tool_residue(delta):
+                                decision = DECISION_BUFFER
+                                break
+                            if do_tool_call_retry and delta.get("tool_calls"):
                                 decision = DECISION_BUFFER
                                 break
                             content = delta.get("content")
@@ -2886,8 +3102,31 @@ async def _stream_chat_completions(
         assembled = _assemble_chat_sse(bytes(upstream_buffer), model_hint)
         upstream_payload = assembled["payload"]
         msg = ((upstream_payload.get("choices") or [{}])[0]).get("message") or {}
+        if do_xml_residue_retry and _message_has_xml_tool_residue(msg):
+            require_tool_call = bool(body.get("tools")) and not _clean_visible_content(msg)
+            r_status, retry_payload = await _retry_chat_thinking_off(body, headers, profile)
+            if (
+                r_status < 400
+                and _retry_payload_usable_after_xml_residue(
+                    retry_payload, body.get("tools"), require_tool_call
+                )
+            ):
+                for synth_chunk in _synthesize_chat_sse(retry_payload, model_hint):
+                    yield synth_chunk
+                state["recovery"] = "xml_tool_residue"
+                _record_recovery("xml_tool_residue")
+                usage = retry_payload.get("usage")
+                if isinstance(usage, dict):
+                    rec = _extract_usage(profile.name, model_hint, retry_payload)
+                    if rec: _broadcast_usage(rec)
+                return
+
         tool_calls = msg.get("tool_calls")
-        if not tool_calls or _validate_tool_calls(tool_calls, body.get("tools")):
+        if (
+            not do_tool_call_retry
+            or not tool_calls
+            or _validate_tool_calls(tool_calls, body.get("tools"))
+        ):
             yield bytes(upstream_buffer)
             if isinstance(assembled.get("usage"), dict):
                 rec = _extract_usage(profile.name, model_hint,
@@ -2919,7 +3158,10 @@ async def _stream_chat_completions(
         try:
             await response.aclose()
         finally:
-            await client.aclose()
+            try:
+                await client.aclose()
+            finally:
+                await gate.release(slot_id)
 
 
 def _assemble_chat_sse(buf: bytes, model_hint: str | None) -> dict:
@@ -2972,6 +3214,14 @@ def _assemble_chat_sse(buf: bytes, model_hint: str | None) -> dict:
                     msg["role"] = delta["role"]
                 if isinstance(delta.get("content"), str):
                     msg["content"] = (msg.get("content") or "") + delta["content"]
+                if isinstance(delta.get("reasoning_content"), str):
+                    msg["reasoning_content"] = (
+                        msg.get("reasoning_content") or ""
+                    ) + delta["reasoning_content"]
+                if isinstance(delta.get("reasoning"), str):
+                    msg["reasoning"] = (
+                        msg.get("reasoning") or ""
+                    ) + delta["reasoning"]
                 for tc in delta.get("tool_calls") or []:
                     if not isinstance(tc, dict):
                         continue
@@ -3087,7 +3337,7 @@ async def _post_responses_nonstream(
     last_status = 502
     last_body = ""
     try:
-        async for attempt in _retry_policy(cfg):
+        async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
             with attempt:
                 async with _gated(profile):
                     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
@@ -3116,7 +3366,7 @@ async def _post_responses_nonstream(
 # =============================================================================
 
 
-app = FastAPI(title="resilient-llm-bridge")
+app = FastAPI(title="NaN LLM Bridge")
 
 _watchdog_task: asyncio.Task | None = None
 
@@ -3406,6 +3656,106 @@ def _percentile(values: list[float], pct: float) -> float:
     return s[lo] + (s[hi] - s[lo]) * (k - lo)
 
 
+def _matches_stats_filter(row: dict, *, profile: str | None, model: str | None) -> bool:
+    if profile and row.get("profile") != profile:
+        return False
+    if model and row.get("model") != model:
+        return False
+    return True
+
+
+def _filter_stats_rows(
+    activity_rows: list[dict],
+    usage_rows: list[dict],
+    *,
+    profile: str | None,
+    model: str | None,
+) -> tuple[list[dict], list[dict]]:
+    if not profile and not model:
+        return activity_rows, usage_rows
+    return (
+        [r for r in activity_rows if _matches_stats_filter(r, profile=profile, model=model)],
+        [r for r in usage_rows if _matches_stats_filter(r, profile=profile, model=model)],
+    )
+
+
+def _read_disk_history(limit: int = 1000, *, strip_bodies: bool = True) -> tuple[list[dict], list[dict]]:
+    """Read recent persisted dashboard history from JSONL logs.
+
+    `/stats` uses this after restarts so model/upstream dashboards do
+    not appear empty just because the process memory ring was reset.
+    """
+    activity: list[dict] = []
+    usage: list[dict] = []
+    for fname in ("activity.jsonl", "usage.jsonl"):
+        path = LOG_DIR / fname
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+        except OSError:
+            continue
+        for line in lines[-limit:]:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if fname == "activity.jsonl":
+                if strip_bodies:
+                    obj.pop("body", None)
+                    obj.pop("forwarded", None)
+                activity.append(obj)
+            else:
+                usage.append(obj)
+    return activity, usage
+
+
+def _capture_activity_bodies() -> bool:
+    return bool(os.environ.get("BRIDGE_NO_REDACT"))
+
+
+def _strip_activity_bodies_except_recent(rows: list[dict], keep_recent: int = 10) -> list[dict]:
+    if keep_recent <= 0:
+        keep_from = len(rows)
+    else:
+        keep_from = max(0, len(rows) - keep_recent)
+    out: list[dict] = []
+    for idx, row in enumerate(rows):
+        copied = dict(row)
+        if idx < keep_from:
+            copied.pop("body", None)
+            copied.pop("forwarded", None)
+        out.append(copied)
+    return out
+
+
+def _dedupe_rows(rows: list[dict], fields: tuple[str, ...]) -> list[dict]:
+    by_key: dict[tuple, dict] = {}
+    for row in rows:
+        key = tuple(row.get(f) for f in fields)
+        if key in by_key:
+            by_key[key].update(row)
+        else:
+            by_key[key] = dict(row)
+    out = list(by_key.values())
+    out.sort(key=lambda r: r.get("ts", 0))
+    return out
+
+
+def _stats_source_rows() -> tuple[list[dict], list[dict]]:
+    disk_activity, disk_usage = _read_disk_history(limit=1000, strip_bodies=True)
+    activity = _dedupe_rows(
+        [*disk_activity, *list(_activity_history)],
+        ("ts", "profile", "path", "method", "status", "model"),
+    )
+    usage = _dedupe_rows(
+        [*disk_usage, *list(_usage_history)],
+        ("ts", "profile", "model", "input_tokens", "output_tokens", "total_output_tokens"),
+    )
+    return activity, usage
+
+
 def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict:
     """Aggregate a slice of activity + usage records into a stats blob."""
     durations = [r["duration_ms"] for r in activity_rows if "duration_ms" in r]
@@ -3417,6 +3767,7 @@ def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict
         if key not in d:
             d[key] = {
                 "requests": 0,
+                "completions": 0,
                 "errors": 0,
                 "tokens_in": 0,
                 "tokens_out": 0,
@@ -3425,15 +3776,16 @@ def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict
             }
         return d[key]
 
-    # Activity rows now carry both `profile` and `model` (post-transform
-    # upstream id), so each request increments BOTH a profile bucket and
-    # a model bucket — fixes the previous "Per-model" panel showing 0
-    # requests / 0ms p50 because only by_profile was incremented from
-    # activity and by_model only got tokens from usage rows.
+    # Profile buckets include all bridge traffic. Model buckets only
+    # include rows with a real model id, so GET /models or /props calls
+    # do not create a confusing "?" model row. Usage rows provide the
+    # authoritative completion/token count.
     for row in activity_rows:
-        b_p = _bucket(by_profile, row.get("profile") or "?")
-        b_m = _bucket(by_model, row.get("model") or "?")
-        for b in (b_p, b_m):
+        buckets = [_bucket(by_profile, row.get("profile") or "?")]
+        model = row.get("model")
+        if model:
+            buckets.append(_bucket(by_model, model))
+        for b in buckets:
             b["requests"] += 1
             if (row.get("status") or 0) >= 400:
                 b["errors"] += 1
@@ -3441,9 +3793,12 @@ def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict
                 b["duration_ms"].append(row["duration_ms"])
                 b["total_duration_ms"] += row["duration_ms"]
     for row in usage_rows:
-        b_p = _bucket(by_profile, row.get("profile") or "?")
-        b_m = _bucket(by_model, row.get("model") or "?")
-        for b in (b_p, b_m):
+        buckets = [_bucket(by_profile, row.get("profile") or "?")]
+        model = row.get("model")
+        if model:
+            buckets.append(_bucket(by_model, model))
+        for b in buckets:
+            b["completions"] += 1
             b["tokens_in"] += int(row.get("input_tokens") or 0)
             b["tokens_out"] += int(row.get("total_output_tokens") or row.get("output_tokens") or 0)
 
@@ -3457,10 +3812,15 @@ def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict
         if isinstance(kind, str) and kind in recoveries:
             recoveries[kind] += 1
 
-    # Finalize percentiles per bucket.
-    def _finalize(d: dict) -> dict:
+    # Finalize percentiles per bucket. If disk retention gives us more
+    # usage rows than activity rows for a model, keep request count at
+    # least equal to completion count so the table does not imply that
+    # one request produced several independent completions.
+    def _finalize(d: dict, *, normalize_requests: bool = False) -> dict:
         for key, b in d.items():
             ds = b.pop("duration_ms")
+            if normalize_requests and b.get("completions", 0) > b.get("requests", 0):
+                b["requests"] = b["completions"]
             b["p50_ms"] = round(_percentile(ds, 0.50), 1)
             b["p95_ms"] = round(_percentile(ds, 0.95), 1)
         return d
@@ -3477,25 +3837,46 @@ def _aggregate_window(activity_rows: list[dict], usage_rows: list[dict]) -> dict
         "p95_ms": round(_percentile(durations, 0.95), 1),
         "p99_ms": round(_percentile(durations, 0.99), 1),
         "by_profile": _finalize(by_profile),
-        "by_model": _finalize(by_model),
+        "by_model": _finalize(by_model, normalize_requests=True),
         "recoveries": recoveries,
     }
 
 
 @app.get("/stats")
-async def stats() -> dict:
+async def stats(
+    profile: str | None = Query(default=None),
+    model: str | None = Query(default=None),
+) -> dict:
     now = time.time()
     windows = {"1m": 60.0, "5m": 300.0, "15m": 900.0, "1h": 3600.0}
-    activity = list(_activity_history)
-    usage = list(_usage_history)
+    all_activity, all_usage = _stats_source_rows()
+    activity, usage = _filter_stats_rows(
+        all_activity, all_usage, profile=profile, model=model
+    )
     # Lifetime is just an unbounded aggregation — same shape as windows
     # so the dashboard can treat it uniformly (proper p50/p95, error
     # split, by_profile, by_model).
     lifetime = _aggregate_window(activity, usage)
-    lifetime["recoveries"] = dict(_recovery_counts)
+    if profile or model:
+        # In filtered views, lifetime recoveries should reflect the
+        # filtered activity rows, not the process-global counter.
+        lifetime["recoveries"] = lifetime.get("recoveries", {})
+    else:
+        lifetime["recoveries"] = dict(_recovery_counts)
     out: dict = {
         "now": now,
         "uptime_s": round(now - _started_at, 1),
+        "filters": {"profile": profile, "model": model},
+        "available_filters": {
+            "profiles": sorted({
+                *(r.get("profile") for r in all_activity if r.get("profile")),
+                *(r.get("profile") for r in all_usage if r.get("profile")),
+            }),
+            "models": sorted({
+                *(r.get("model") for r in all_activity if r.get("model")),
+                *(r.get("model") for r in all_usage if r.get("model")),
+            }),
+        },
         "lifetime": lifetime,
         "windows": {},
         "upstreams": [g.snapshot() for g in _UPSTREAM_GATES.values()],
@@ -3517,34 +3898,33 @@ async def stats() -> dict:
 
 
 @app.get("/history")
-async def history() -> dict:
-    """Return last entries from disk logs for dashboard initial load."""
-    activity: list[dict] = []
-    usage: list[dict] = []
-    for fname in ("activity.jsonl", "usage.jsonl"):
-        path = LOG_DIR / fname
-        if not path.exists():
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-        except OSError:
-            continue
-        # Strip body/forwarded from activity entries — too large for
-        # dashboard initial load. Decode failures are tolerated (log
-        # files can have a partially-flushed last line).
-        for line in lines[-200:]:
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if fname == "activity.jsonl":
-                obj.pop("body", None)
-                obj.pop("forwarded", None)
-                activity.append(obj)
-            else:
-                usage.append(obj)
-    return {"activity": activity, "usage": usage}
+async def history(
+    profile: str | None = Query(default=None),
+    model: str | None = Query(default=None),
+) -> dict:
+    """Return recent persisted + in-memory entries for dashboard initial load."""
+    disk_activity, disk_usage = _read_disk_history(limit=1000, strip_bodies=not _capture_activity_bodies())
+    activity = _dedupe_rows(
+        [*disk_activity, *list(_activity_history)],
+        ("ts", "profile", "path", "method", "status", "model"),
+    )
+    usage = _dedupe_rows(
+        [*disk_usage, *list(_usage_history)],
+        ("ts", "profile", "model", "input_tokens", "output_tokens", "total_output_tokens"),
+    )
+    activity, usage = _filter_stats_rows(activity, usage, profile=profile, model=model)
+    if _capture_activity_bodies():
+        activity = _strip_activity_bodies_except_recent(activity)
+    return {"activity": activity[-200:], "usage": usage[-200:]}
+
+
+@app.get("/inflight")
+async def inflight() -> dict:
+    rows: list[dict[str, Any]] = []
+    for gate in _UPSTREAM_GATES.values():
+        rows.extend(await gate.active_requests())
+    rows.sort(key=lambda r: r.get("age_s", 0), reverse=True)
+    return {"requests": rows}
 
 
 @app.get("/usage/stream")
@@ -3628,11 +4008,25 @@ def _dump_config_yaml(cfg: BridgeConfig) -> str:
         # omit the key so the YAML stays minimal.
         if p.thinking_enabled is not None:
             entry["thinking_enabled"] = p.thinking_enabled
-        # Only persist `default_thinking_budget` when the profile has
-        # one set — None is the canonical "no opinion, let upstream
-        # decide" default and we don't want to round-trip nulls.
+        if p.default_thinking_effort is not None:
+            entry["default_thinking_effort"] = p.default_thinking_effort
+        # Legacy custom numeric budget: keep round-tripping it if present.
         if p.default_thinking_budget is not None:
             entry["default_thinking_budget"] = p.default_thinking_budget
+        if p.default_max_output_tokens is not None:
+            entry["default_max_output_tokens"] = p.default_max_output_tokens
+        if p.force_max_output_tokens is not None:
+            entry["force_max_output_tokens"] = p.force_max_output_tokens
+        if p.force_temperature is not None:
+            entry["force_temperature"] = p.force_temperature
+        if p.force_top_p is not None:
+            entry["force_top_p"] = p.force_top_p
+        if p.force_presence_penalty is not None:
+            entry["force_presence_penalty"] = p.force_presence_penalty
+        entry["auto_retries"] = p.auto_retries
+        entry["force_stream"] = p.force_stream
+        if p.force_model:
+            entry["force_model"] = p.force_model
         if p.model_aliases:
             entry["model_aliases"] = dict(p.model_aliases)
         out["profiles"][name] = entry
@@ -3660,6 +4054,9 @@ def _validate_profile_payload(name: str, body: dict) -> tuple[ProfileConfig | No
     if not isinstance(feats_raw, list):
         return None, "features must be a list of strings"
     feats = set(str(f) for f in feats_raw)
+    if "qwen_sampling_defaults" in feats:
+        feats.remove("qwen_sampling_defaults")
+        feats.add("model_sampling_defaults")
     invalid = feats - ALL_FEATURES
     if invalid:
         return None, f"unknown features: {sorted(invalid)}"
@@ -3667,13 +4064,20 @@ def _validate_profile_payload(name: str, body: dict) -> tuple[ProfileConfig | No
     if not isinstance(aliases_raw, dict):
         return None, "model_aliases must be a string→string mapping"
     aliases = {str(k): str(v) for k, v in aliases_raw.items()}
+    force_model_raw = body.get("force_model")
+    force_model = str(force_model_raw).strip() if force_model_raw is not None else ""
+    if force_model and force_model not in FORCE_MODEL_OPTIONS:
+        return None, f"force_model must be one of: {', '.join(FORCE_MODEL_OPTIONS)}"
     try:
         priority = int(body.get("queue_priority", 0))
     except (TypeError, ValueError):
         return None, "queue_priority must be an integer"
-    # default_thinking_budget is now Optional[int]: missing/null means
-    # "no budget injected — let upstream decide". Numeric value clamps
-    # the reasoning depth.
+    raw_effort = body.get("default_thinking_effort", None)
+    default_effort = str(raw_effort).strip().lower() if raw_effort is not None else ""
+    if default_effort and default_effort not in _THINKING_EFFORT_OPTIONS:
+        return None, f"default_thinking_effort must be one of: {', '.join(_THINKING_EFFORT_OPTIONS)}"
+    # Legacy API compatibility: accept raw budgets but the dashboard now
+    # edits the closed effort set instead.
     raw_budget = body.get("default_thinking_budget", None)
     if raw_budget is None or raw_budget == "":
         budget: int | None = None
@@ -3685,21 +4089,79 @@ def _validate_profile_payload(name: str, body: dict) -> tuple[ProfileConfig | No
         if budget < 0 or budget > 64000:
             return None, "default_thinking_budget must be between 0 and 64000"
         if budget == 0:
-            budget = None  # treat 0 as "no budget"
+            budget = None
+    raw_max_output = body.get("default_max_output_tokens", None)
+    if raw_max_output is None or raw_max_output == "":
+        max_output_tokens: int | None = None
+    else:
+        try:
+            max_output_tokens = int(raw_max_output)
+        except (TypeError, ValueError):
+            return None, "default_max_output_tokens must be an integer or null"
+        if max_output_tokens < 0 or max_output_tokens > 131072:
+            return None, "default_max_output_tokens must be between 0 and 131072"
+        if max_output_tokens == 0:
+            max_output_tokens = None
+    def _validate_optional_float(key: str, *, min_value: float | None = None, max_value: float | None = None) -> tuple[float | None, str | None]:
+        raw = body.get(key, None)
+        if raw is None or raw == "":
+            return None, None
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return None, f"{key} must be a number or null"
+        if min_value is not None and val < min_value:
+            return None, f"{key} must be >= {min_value}"
+        if max_value is not None and val > max_value:
+            return None, f"{key} must be <= {max_value}"
+        return val, None
+
+    raw_force_max = body.get("force_max_output_tokens", None)
+    if raw_force_max is None or raw_force_max == "":
+        force_max_output_tokens: int | None = None
+    else:
+        try:
+            force_max_output_tokens = int(raw_force_max)
+        except (TypeError, ValueError):
+            return None, "force_max_output_tokens must be an integer or null"
+        if force_max_output_tokens < 1 or force_max_output_tokens > 131072:
+            return None, "force_max_output_tokens must be between 1 and 131072"
+    force_temperature, err = _validate_optional_float("force_temperature", min_value=0)
+    if err:
+        return None, err
+    force_top_p, err = _validate_optional_float("force_top_p", min_value=0, max_value=1)
+    if err:
+        return None, err
+    force_presence_penalty, err = _validate_optional_float("force_presence_penalty")
+    if err:
+        return None, err
+
     if "thinking_enabled" not in body:
         thinking_enabled: bool | None = None
     else:
         raw_enabled = body.get("thinking_enabled")
         thinking_enabled = None if raw_enabled is None else bool(raw_enabled)
+    if thinking_enabled is not True:
+        default_effort = ""
+        budget = None
     return (
         ProfileConfig(
             name=name,
             upstream=upstream,
             features=feats,
             model_aliases=aliases,
+            force_model=force_model or None,
+            default_thinking_effort=default_effort or None,
             default_thinking_budget=budget,
+            default_max_output_tokens=max_output_tokens,
+            force_max_output_tokens=force_max_output_tokens,
+            force_temperature=force_temperature,
+            force_top_p=force_top_p,
+            force_presence_penalty=force_presence_penalty,
             thinking_enabled=thinking_enabled,
             queue_priority=priority,
+            auto_retries=bool(body.get("auto_retries", True)),
+            force_stream=bool(body.get("force_stream", True)),
         ),
         None,
     )
@@ -3727,14 +4189,26 @@ async def config_get() -> dict:
                 "upstream": p.upstream,
                 "features": sorted(p.features),
                 "queue_priority": p.queue_priority,
+                "default_thinking_effort": p.default_thinking_effort,
                 "default_thinking_budget": p.default_thinking_budget,
+                "default_max_output_tokens": p.default_max_output_tokens,
+                "force_max_output_tokens": p.force_max_output_tokens,
+                "force_temperature": p.force_temperature,
+                "force_top_p": p.force_top_p,
+                "force_presence_penalty": p.force_presence_penalty,
                 "thinking_enabled": p.thinking_enabled,
+                "auto_retries": p.auto_retries,
+                "force_stream": p.force_stream,
+                "force_model": p.force_model,
                 "model_aliases": dict(p.model_aliases),
             }
             for p in CONFIG.profiles.values()
         ],
         "default_profile": CONFIG.default_profile,
         "available_features": sorted(ALL_FEATURES),
+        "feature_descriptions": FEATURE_DESCRIPTIONS,
+        "force_model_options": list(FORCE_MODEL_OPTIONS),
+        "thinking_effort_options": list(_THINKING_EFFORT_OPTIONS),
         "config_path": str(DEFAULT_CONFIG_PATH),
     }
 
@@ -3781,7 +4255,11 @@ async def config_profile_delete(name: str) -> JSONResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard() -> HTMLResponse:
-    return HTMLResponse(content=_dashboard_html(), status_code=200)
+    return HTMLResponse(
+        content=_dashboard_html(),
+        status_code=200,
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 # Profile-routed endpoints. Order matters in FastAPI route resolution: the
@@ -3969,7 +4447,7 @@ async def _handle_chat_completions(
     last_body = ""
     payload: dict = {"error": {"message": "unreachable"}}
     try:
-        async for attempt in _retry_policy(cfg):
+        async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
             with attempt:
                 async with _gated(profile):
                     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
@@ -3998,10 +4476,34 @@ async def _handle_chat_completions(
         finish = choice.get("finish_reason")
         message = choice.get("message") or {}
         content = message.get("content") or ""
+        if (
+            profile.has("xml_tool_residue_retry")
+            and _message_has_xml_tool_residue(message)
+            and not _client_already_disabled_thinking(body)
+        ):
+            require_tool_call = bool(body.get("tools")) and not _clean_visible_content(message)
+            r_status, retry_payload = await _retry_chat_thinking_off(body, headers, profile)
+            if (
+                r_status < 400
+                and _retry_payload_usable_after_xml_residue(
+                    retry_payload, body.get("tools"), require_tool_call
+                )
+            ):
+                payload = retry_payload
+                recovery_kind = "xml_tool_residue"
+                _record_recovery(recovery_kind)
+                choice = (payload.get("choices") or [{}])[0]
+                finish = choice.get("finish_reason")
+                message = choice.get("message") or {}
+                content = message.get("content") or ""
         # Truncated content recovery for chat/completions: model produced
         # *some* answer but was cut mid-thought. Resume via continue_final_message.
-        if profile.has("truncated_content_recovery") and _detect_truncated_message(
-            content, finish
+        if (
+            recovery_kind is None
+            and profile.has("truncated_content_recovery")
+            and _detect_truncated_message(
+                content, finish
+            )
         ):
             extra = await _recover_truncated_content(body, content, headers, profile)
             if extra:
@@ -4015,7 +4517,8 @@ async def _handle_chat_completions(
         # path doesn't have this bug per upstream reports + our own
         # probing. Skip if the client already disabled thinking.
         elif (
-            profile.has("tool_call_args_retry")
+            recovery_kind is None
+            and profile.has("tool_call_args_retry")
             and message.get("tool_calls")
             and not _validate_tool_calls(message.get("tool_calls"), body.get("tools"))
             and not _client_already_disabled_thinking(body)
@@ -4034,7 +4537,8 @@ async def _handle_chat_completions(
         # the original (don't loop). Tool-call responses are skipped
         # because empty content there is intentional.
         elif (
-            profile.has("empty_with_stop_retry")
+            recovery_kind is None
+            and profile.has("empty_with_stop_retry")
             and finish == "stop"
             and not content.strip()
             and not message.get("tool_calls")
@@ -4086,7 +4590,7 @@ async def _handle_passthrough(request: Request, profile: ProfileConfig, path: st
     response_headers: dict[str, str] = {}
     response_media_type: str | None = None
     try:
-        async for attempt in _retry_policy(cfg):
+        async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
             with attempt:
                 async with _gated(profile):
                     async with httpx.AsyncClient(
@@ -4168,7 +4672,7 @@ def _synthesize_model_metadata(profile: ProfileConfig, model_id: str) -> dict:
         "owned_by": cfg.name,
         "context_length": cfg.context_window,
         "max_context_length": cfg.context_window,
-        "max_completion_tokens": 32000,
+        "max_completion_tokens": _profile_max_completion_tokens(profile),
         "capabilities": {
             "reasoning": True,
             "tool_call": True,
@@ -4197,7 +4701,7 @@ def _enrich_models_list(payload: dict, profile: ProfileConfig) -> dict:
         m = dict(m)
         m.setdefault("context_length", cfg.context_window)
         m.setdefault("max_context_length", cfg.context_window)
-        m.setdefault("max_completion_tokens", 32000)
+        m.setdefault("max_completion_tokens", _profile_max_completion_tokens(profile))
         enriched.append(m)
     payload = dict(payload)
     payload["data"] = enriched
@@ -4227,7 +4731,7 @@ async def profile_models_list(profile_name: str, request: Request):
     }
     cfg = CONFIG.upstreams[profile.upstream]
     try:
-        async for attempt in _retry_policy(cfg):
+        async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
             with attempt:
                 async with _gated(profile):
                     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
@@ -4303,38 +4807,98 @@ def _dashboard_html() -> str:
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>resilient-llm-bridge :: {DEFAULT_PORT}</title>
+  <title>NaN LLM Bridge :: {DEFAULT_PORT}</title>
+  <script>
+    document.documentElement.dataset.theme = localStorage.getItem('nan-bridge-theme') || 'dark';
+  </script>
   <style>
     :root {{
-      --bg: #0a0a0a; --panel: #111; --panel2: #161616;
-      --fg: #d4d4d4; --dim: #6e7681; --line: #1f1f1f;
-      --accent: #79c0ff; --accent2: #d2a8ff;
-      --good: #56d364; --warn: #f0883e; --bad: #ff7b72;
+      --bg: #101215; --bg2: #15181d; --panel: #181c22; --panel2: #20252d;
+      --panel3: #252b34; --fg: #ece7df; --dim: #a49b8d; --muted: #736b61;
+      --line: #333943; --line2: #454c58; --accent: #f05a28; --accent2: #79c7bc;
+      --good: #8fbc8f; --warn: #e3b35f; --bad: #e06c75; --orange: #f05a28;
+      --shadow: rgba(0, 0, 0, 0.34); --glow: rgba(240, 90, 40, 0.14);
+    }}
+    :root[data-theme="light"] {{
+      --bg: #faf9f6; --bg2: #ffffff; --panel: #ffffff; --panel2: #f3f1ec;
+      --panel3: #ebe7df; --fg: #171717; --dim: #6f6a61; --muted: #9a9388;
+      --line: #ded8cd; --line2: #cfc6b8; --accent: #f05a28; --accent2: #2f6f73;
+      --good: #2f7d45; --warn: #a16207; --bad: #c2413d; --orange: #f05a28;
+      --shadow: rgba(44, 35, 24, 0.10); --glow: rgba(240, 90, 40, 0.10);
     }}
     * {{ box-sizing: border-box; }}
-    body {{ background: var(--bg); color: var(--fg);
-      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-      padding: 1.2rem; max-width: 1500px; margin: 0 auto;
+    html {{ min-height: 100%; }}
+    body {{ background:
+      radial-gradient(circle at 18% -14%, var(--glow), transparent 31rem),
+      linear-gradient(180deg, var(--bg2), var(--bg) 26rem);
+      color: var(--fg); font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      padding: 1.2rem; max-width: 1540px; margin: 0 auto;
       font-size: 13px; line-height: 1.45; }}
-    h1 {{ font-size: 1.5rem; margin: 0; color: var(--accent); letter-spacing: -0.5px; }}
-    h2 {{ font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.12em;
-      color: var(--dim); margin: 1.6rem 0 0.5rem 0;
-      border-bottom: 1px solid var(--line); padding-bottom: 0.4rem; font-weight: 500; }}
-    .header {{ display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; }}
-    .port {{ color: var(--good); font-size: 1.1rem; font-weight: 500; }}
-    .uptime {{ color: var(--dim); font-size: 0.9rem; }}
+    a {{ color: var(--accent); text-decoration: none; }}
+    a:hover {{ color: var(--fg); }}
+    h1 {{ margin: 0; color: var(--fg); letter-spacing: 0; line-height: 0.95; font-weight: 700; }}
+    h2 {{ font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.16em;
+      color: var(--dim); margin: 1.7rem 0 0.55rem 0;
+      border-bottom: 1px solid var(--line); padding-bottom: 0.45rem; font-weight: 500; }}
+    .section-note {{ color: var(--muted); font-size: 0.66rem; letter-spacing: 0.12em; margin-left: 0.45rem; }}
+    .status-pill {{ display: inline-block; border: 1px solid var(--line); padding: 0.08rem 0.38rem;
+      font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--dim); }}
+    .status-pill.ok {{ color: var(--good); border-color: rgba(163,190,140,.42); }}
+    .status-pill.busy {{ color: var(--warn); border-color: rgba(235,203,139,.42); }}
+    .status-pill.hot {{ color: var(--bad); border-color: rgba(212,115,124,.46); }}
+    .shell {{ position: relative; overflow: hidden; border: 1px solid var(--line);
+      background: var(--panel); box-shadow: 0 18px 46px var(--shadow);
+      padding: 1.15rem; margin-bottom: 1.35rem; }}
+    .shell::after {{ content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px;
+      background: var(--accent); opacity: .95; }}
+    .header {{ position: relative; display: grid; grid-template-columns: 1fr auto;
+      gap: 1.2rem; align-items: start; }}
+    .brand {{ display: grid; grid-template-columns: 1fr; gap: 0.85rem; align-items: start; }}
+    .brand-kicker {{ color: var(--accent); font-size: 0.72rem; text-transform: uppercase;
+      letter-spacing: 0.2em; margin-bottom: 0.45rem; }}
+    .brand-title {{ display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.52rem;
+      font-size: clamp(2.0rem, 3.4vw, 3.35rem); }}
+    .word-nan, .word-llm, .word-bridge {{ display: inline-flex; align-items: baseline; gap: 0.02em; }}
+    .word-nan {{ filter: drop-shadow(0 0 18px rgba(136,192,208,0.18)); }}
+    .nan-n1 {{ color: var(--accent); }}
+    .nan-a {{ color: var(--good); }}
+    .nan-n2 {{ color: var(--accent2); }}
+    .word-llm {{ color: var(--warn); }}
+    .word-bridge {{ color: var(--fg); font-weight: 600; }}
+    .brand-subtitle {{ color: var(--dim); max-width: 58rem; margin-top: 0.62rem; font-size: 0.88rem; }}
+    .badges {{ display: flex; flex-wrap: wrap; gap: 0.42rem; margin-top: 0.9rem; grid-column: 2; }}
+    .badge {{ color: var(--fg); background: rgba(216,222,233,0.045); border: 1px solid var(--line);
+      padding: 0.22rem 0.48rem; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.12em; }}
+    .badge.accent {{ color: var(--accent); border-color: rgba(136,192,208,0.42); background: rgba(136,192,208,0.08); }}
+    .status-panel {{ min-width: 21rem; border: 1px solid var(--line); background: var(--panel2);
+      padding: 0.75rem; display: grid; gap: 0.7rem; }}
+    .theme-toggle {{ background: var(--panel); border: 1px solid var(--line); color: var(--fg);
+      padding: 0.18rem 0.5rem; cursor: pointer; font: inherit; font-size: 0.72rem; text-transform: uppercase;
+      letter-spacing: 0.1em; }}
+    .theme-toggle:hover {{ border-color: var(--accent); color: var(--accent); }}
+    .status-line {{ display: flex; align-items: center; justify-content: space-between; gap: 1rem; }}
+    .status-label {{ color: var(--muted); text-transform: uppercase; letter-spacing: 0.14em; font-size: 0.68rem; }}
+    .port {{ color: var(--good); font-size: 1.1rem; font-weight: 600; }}
+    .uptime {{ color: var(--fg); font-size: 0.82rem; }}
     .pulse {{ display: inline-block; width: 8px; height: 8px;
       background: var(--good); border-radius: 50%; margin-right: 0.4rem;
-      animation: pulse 1.6s ease-in-out infinite; }}
-    @keyframes pulse {{ 0%, 100% {{ opacity: 0.4; }} 50% {{ opacity: 1; }} }}
-    .uptime-bar {{ flex: 1; }}
+      box-shadow: 0 0 0 4px rgba(163,190,140,0.12); animation: pulse 1.6s ease-in-out infinite; }}
+    @keyframes pulse {{ 0%, 100% {{ opacity: 0.45; transform: scale(.92); }} 50% {{ opacity: 1; transform: scale(1); }} }}
+    .uptime-bar {{ height: 1px; background: linear-gradient(90deg, transparent, var(--line2), transparent); }}
+    @media (max-width: 860px) {{
+      body {{ padding: 0.85rem; }}
+      .header {{ grid-template-columns: 1fr; }}
+      .brand {{ grid-template-columns: 1fr; }}
+      .badges {{ grid-column: 1; }}
+      .status-panel {{ min-width: 0; width: 100%; }}
+    }}
 
     /* KPI grid */
     .kpis {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
       gap: 0.6rem; margin-top: 0.5rem; }}
     .kpi {{ background: var(--panel); border: 1px solid var(--line);
-      border-radius: 6px; padding: 0.75rem 0.9rem; display: flex;
-      flex-direction: column; gap: 0.15rem; }}
+      box-shadow: none; border-radius: 0; padding: 0.82rem 0.95rem; display: flex;
+      flex-direction: column; gap: 0.15rem; min-height: 8.8rem; }}
     .kpi-label {{ color: var(--dim); font-size: 0.7rem; text-transform: uppercase;
       letter-spacing: 0.08em; }}
     .kpi-value {{ font-size: 1.55rem; color: var(--accent); font-weight: 500;
@@ -4348,18 +4912,26 @@ def _dashboard_html() -> str:
       margin-top: 0.4rem; opacity: 0.85; }}
 
     /* Window selector */
-    .windows {{ display: inline-flex; gap: 0.3rem; margin-left: auto; }}
-    .windows button {{ background: transparent; border: 1px solid var(--line);
-      color: var(--dim); padding: 0.2rem 0.6rem; border-radius: 4px;
-      cursor: pointer; font: inherit; font-size: 0.75rem; }}
-    .windows button.active {{ color: var(--accent); border-color: var(--accent); }}
-    .windows button:hover {{ color: var(--fg); }}
+    .windows {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0.28rem; }}
+    .windows button {{ background: var(--panel); border: 1px solid var(--line);
+      color: var(--fg); padding: 0.28rem 0.52rem; border-radius: 0;
+      cursor: pointer; font: inherit; font-size: 0.72rem; min-width: 0;
+      box-shadow: inset 0 -1px 0 rgba(255,255,255,0.035); }}
+    .windows button.active {{ color: #ffffff; border-color: var(--accent); background: var(--accent);
+      box-shadow: 0 0 0 1px rgba(240,90,40,0.18); }}
+    .windows button:hover {{ color: var(--accent); border-color: var(--accent); }}
+    .windows button.active:hover {{ color: #ffffff; }}
+    :root[data-theme="light"] .windows button {{ background: #ffffff; color: #171717; border-color: #cfc6b8;
+      box-shadow: inset 0 -1px 0 rgba(44,35,24,0.06); }}
+    :root[data-theme="light"] .windows button.active {{ background: var(--accent); color: #ffffff; border-color: var(--accent); }}
+    :root[data-theme="light"] .windows button:hover {{ color: var(--accent); border-color: var(--accent); }}
+    :root[data-theme="light"] .windows button.active:hover {{ color: #ffffff; }}
 
     /* Two-column section */
     .grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; margin-top: 0.5rem; }}
     @media (max-width: 900px) {{ .grid2 {{ grid-template-columns: 1fr; }} }}
     .card {{ background: var(--panel); border: 1px solid var(--line);
-      border-radius: 6px; padding: 0.9rem 1rem; }}
+      border-radius: 0; padding: 0.95rem 1rem; box-shadow: none; }}
     .card h3 {{ margin: 0 0 0.5rem 0; font-size: 0.78rem;
       color: var(--dim); text-transform: uppercase; letter-spacing: 0.08em;
       font-weight: 500; }}
@@ -4370,8 +4942,8 @@ def _dashboard_html() -> str:
       1px solid var(--panel2); vertical-align: top; }}
     th {{ color: var(--dim); font-weight: normal; font-size: 0.78rem; }}
     .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-    code {{ background: var(--panel2); padding: 0.08rem 0.32rem; border-radius: 2px;
-      font-size: 0.86em; }}
+    code {{ background: var(--panel2); padding: 0.08rem 0.32rem; border-radius: 0;
+      font-size: 0.86em; border: 1px solid rgba(255,255,255,0.04); }}
 
     /* Status colors */
     .status-2xx {{ color: var(--good); }}
@@ -4396,8 +4968,8 @@ def _dashboard_html() -> str:
     .params .pp-changed {{ background: rgba(240, 136, 62, 0.15); color: var(--warn); }}
     .params .pp-stripped {{ background: rgba(255, 123, 114, 0.12); color: var(--bad); }}
     .activity-row {{ cursor: pointer; }}
-    .activity-row:hover {{ background: rgba(121, 192, 255, 0.04); }}
-    .activity-row.expanded {{ background: rgba(121, 192, 255, 0.06); }}
+    .activity-row:hover {{ background: rgba(240, 90, 40, 0.035); }}
+    .activity-row.expanded {{ background: rgba(240, 90, 40, 0.05); }}
     .body-row {{ display: none; }}
     .body-row.expanded {{ display: table-row; }}
     .body-pre {{ background: var(--panel2); border-radius: 4px;
@@ -4422,69 +4994,81 @@ def _dashboard_html() -> str:
       margin: 0.4rem 0 0.2rem 0; }}
     .body-label .dim {{ text-transform: none; letter-spacing: 0; opacity: 0.6; }}
 
-    /* Profile editor — compact */
-    .editor-hint {{ color: var(--dim); font-size: 0.72em;
-      margin: 0 0 0.35rem 0; line-height: 1.35; }}
-    .editor-actions {{ margin-top: 0.35rem; display: flex; align-items: center; gap: 0.5rem; }}
+    /* Profile editor */
+    .editor-hint {{ color: var(--dim); font-size: 0.78rem;
+      margin: 0 0 0.7rem 0; line-height: 1.45; }}
+    .editor-actions {{ margin-top: 0.8rem; display: flex; align-items: center; gap: 0.6rem; }}
     .editor-btn {{ background: var(--panel2); border: 1px solid var(--line);
-      color: var(--fg); padding: 0.12rem 0.4rem; border-radius: 2px;
-      cursor: pointer; font: inherit; font-size: 0.7rem; }}
+      color: var(--fg); padding: 0.24rem 0.55rem; border-radius: 2px;
+      cursor: pointer; font: inherit; font-size: 0.74rem; min-height: 1.7rem; }}
     .editor-btn:hover {{ border-color: var(--accent); color: var(--accent); }}
     .editor-btn.danger {{ color: var(--bad); }}
     .editor-btn.danger:hover {{ border-color: var(--bad); }}
-    .editor-btn.primary {{ background: rgba(121, 192, 255, 0.1); color: var(--accent); border-color: var(--accent); }}
+    .editor-btn.primary {{ background: rgba(240, 90, 40, 0.08); color: var(--accent); border-color: var(--accent); }}
     .editor-btn:disabled {{ opacity: 0.4; cursor: not-allowed; }}
-    .editor-status {{ font-size: 0.7rem; color: var(--dim); }}
+    .editor-status {{ font-size: 0.74rem; color: var(--dim); }}
     .editor-status.ok {{ color: var(--good); }}
     .editor-status.err {{ color: var(--bad); }}
 
-    .profile-row {{ background: var(--panel2); border-radius: 3px;
-      padding: 0.25rem 0.4rem; margin-bottom: 0.2rem;
-      border: 1px solid transparent; }}
-    .profile-row.dirty {{ border-color: var(--warn); }}
-    .pf-head {{ display: flex; align-items: center;
-      gap: 0.35rem; flex-wrap: wrap; }}
-    .pf-head .pf-name {{ font-weight: 500; color: var(--accent);
-      font-size: 0.78rem; min-width: 4rem; white-space: nowrap; }}
-    .pf-head .pf-name input {{ background: transparent; border: none;
-      color: var(--accent); font: inherit; font-size: 0.78rem;
-      font-weight: 500; padding: 0.02rem 0.15rem; border-radius: 1px;
-      border-bottom: 1px dashed var(--accent); width: 8rem; }}
-    .pf-head .pf-default {{ color: var(--dim); font-size: 0.6rem;
-      text-transform: uppercase; letter-spacing: 0.05em;
-      padding: 0.02rem 0.2rem; border: 1px solid var(--line); border-radius: 1px; }}
-    .pf-inline {{ display: inline-flex; align-items: center; gap: 0.15rem; }}
-    .pf-inline label {{ font-size: 0.62rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; }}
-    .pf-inline select, .pf-inline input {{ background: var(--panel);
-      border: 1px solid var(--line); color: var(--fg);
-      padding: 0.06rem 0.2rem; font: inherit; font-size: 0.7rem;
-      border-radius: 1px; }}
-    .pf-inline input[type="number"] {{ width: 4rem; }}
-    .pf-inline input:focus, .pf-inline select:focus {{ border-color: var(--accent); outline: none; }}
-    .pf-actions-inline {{ margin-left: auto; display: inline-flex; gap: 0.25rem; }}
+    .profile-row {{ background: var(--panel2); border: 1px solid var(--line);
+      border-radius: 4px; padding: 0; margin-bottom: 0.8rem; overflow: hidden; }}
+    .profile-row summary {{ list-style: none; cursor: pointer; }}
+    .profile-row summary::-webkit-details-marker {{ display: none; }}
+    .profile-row:not([open]) .pf-head {{ border-bottom: 0; }}
+    .profile-row.dirty {{ border-color: var(--warn); box-shadow: inset 3px 0 0 var(--warn); }}
+    .pf-head {{ display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap;
+      padding: 0.65rem 0.75rem; border-bottom: 1px solid var(--line); background: rgba(255,255,255,0.015); }}
+    .pf-head .pf-name {{ font-weight: 600; color: var(--accent);
+      font-size: 0.95rem; min-width: 7rem; white-space: nowrap; }}
+    .pf-head .pf-name input {{ background: var(--panel); border: 1px solid var(--line);
+      color: var(--accent); font: inherit; font-size: 0.88rem; font-weight: 500;
+      padding: 0.18rem 0.35rem; border-radius: 2px; width: 10rem; }}
+    .pf-default {{ color: var(--good); font-size: 0.64rem; text-transform: uppercase;
+      letter-spacing: 0.08em; padding: 0.05rem 0.28rem; border: 1px solid rgba(86,211,100,.35); }}
+    .pf-muted {{ color: var(--dim); font-size: 0.75rem; }}
+    .pf-actions-inline {{ margin-left: auto; display: inline-flex; gap: 0.35rem; }}
 
-    .pf-secondary {{ display: flex; align-items: flex-start;
-      gap: 0.4rem; margin-top: 0.2rem; }}
-    .pf-secondary .pf-features {{ flex: 1; display: flex; flex-wrap: wrap;
-      gap: 0.12rem 0.2rem; }}
-    .pf-secondary .pf-aliases {{ flex: 0 0 auto; min-width: 10rem; }}
-    .pf-feature {{ display: inline-flex; align-items: center; gap: 0.12rem;
-      cursor: pointer; user-select: none; font-size: 0.62rem;
-      padding: 0.03rem 0.2rem; border: 1px solid var(--line); border-radius: 1px;
-      background: var(--panel); color: var(--dim); }}
-    .pf-feature.on {{ color: var(--accent); border-color: var(--accent); }}
-    .pf-feature input {{ display: none; }}
+    .pf-body {{ padding: 0.75rem; display: grid; gap: 0.8rem; }}
+    .pf-section-title {{ color: var(--dim); font-size: 0.68rem; text-transform: uppercase;
+      letter-spacing: 0.12em; margin-bottom: 0.38rem; }}
+    .pf-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.5rem; }}
+    .pf-field {{ display: grid; gap: 0.22rem; }}
+    .pf-field label {{ font-size: 0.66rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.08em; }}
+    .pf-field input, .pf-field select {{ width: 100%; background: var(--panel);
+      border: 1px solid var(--line); color: var(--fg); padding: 0.3rem 0.4rem;
+      font: inherit; font-size: 0.78rem; border-radius: 2px; min-height: 1.9rem; }}
+    .pf-field input:focus, .pf-field select:focus {{ border-color: var(--accent); outline: none; }}
+    .pf-help {{ color: var(--dim); font-size: 0.7rem; line-height: 1.35; }}
 
-    .pf-aliases-label {{ font-size: 0.6rem; text-transform: uppercase;
-      letter-spacing: 0.04em; color: var(--dim); margin-bottom: 0.08rem; }}
-    .pf-alias-row {{ display: flex; gap: 0.12rem; margin-bottom: 0.08rem; align-items: center; }}
-    .pf-alias-row input {{ flex: 1; background: var(--panel);
-      border: 1px solid var(--line); color: var(--fg); padding: 0.05rem 0.2rem;
-      font: inherit; font-size: 0.66rem; border-radius: 1px; min-width: 0; }}
-    .pf-alias-arrow {{ color: var(--dim); font-size: 0.7em; }}
-    .pf-alias-del {{ background: transparent; border: 1px solid var(--line);
-      color: var(--bad); padding: 0 0.2rem; border-radius: 1px;
-      font: inherit; font-size: 0.66rem; cursor: pointer; }}
+    .pf-switch-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.5rem; }}
+    .pf-switch-card {{ display: grid; grid-template-columns: auto 1fr; gap: 0.4rem 0.55rem;
+      align-items: start; background: var(--panel); border: 1px solid var(--line); padding: 0.55rem; border-radius: 3px; }}
+    .pf-switch-card input {{ margin-top: 0.12rem; }}
+    .pf-switch-card strong {{ color: var(--fg); font-size: 0.78rem; font-weight: 500; }}
+    .pf-switch-card p {{ grid-column: 2; margin: 0; color: var(--dim); font-size: 0.72rem; line-height: 1.35; }}
+
+    .pf-feature-groups {{ display: grid; gap: 0.55rem; }}
+    .pf-feature-group {{ border: 1px solid var(--line); background: var(--panel); border-radius: 3px; }}
+    .pf-feature-group summary, .pf-feature-group-header {{ padding: 0.5rem 0.6rem; color: var(--fg);
+      font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; border-bottom: 1px solid var(--line); }}
+    .pf-feature-group summary {{ cursor: pointer; }}
+    .pf-feature-list {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0.45rem; padding: 0.55rem; }}
+    .pf-feature {{ display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 0.45rem;
+      border: 1px solid var(--line); background: var(--panel2); padding: 0.45rem; border-radius: 2px;
+      cursor: pointer; min-height: 4rem; }}
+    .pf-feature.on {{ border-color: rgba(240,90,40,.55); background: rgba(240,90,40,.06); }}
+    .pf-feature input {{ margin-top: 0.18rem; }}
+    .pf-feature-name {{ color: var(--fg); font-size: 0.74rem; word-break: break-word; }}
+    .pf-feature-desc {{ grid-column: 2; color: var(--dim); font-size: 0.7rem; line-height: 1.35; }}
+    .pf-feature-legacy .pf-feature-name::after {{ content: " legacy"; color: var(--warn); font-size: .62rem; margin-left: .3rem; }}
+
+    .pf-aliases {{ border: 1px solid var(--line); background: var(--panel); border-radius: 3px; padding: 0.55rem; }}
+    .pf-alias-row {{ display: grid; grid-template-columns: 1fr auto 1fr auto; gap: 0.25rem; margin-bottom: 0.25rem; align-items: center; }}
+    .pf-alias-row input {{ background: var(--panel2); border: 1px solid var(--line); color: var(--fg);
+      padding: 0.25rem 0.35rem; font: inherit; font-size: 0.74rem; border-radius: 2px; min-width: 0; }}
+    .pf-alias-arrow {{ color: var(--dim); font-size: 0.75rem; }}
+    .pf-alias-del {{ background: transparent; border: 1px solid var(--line); color: var(--bad);
+      padding: 0.1rem 0.35rem; border-radius: 2px; font: inherit; font-size: 0.72rem; cursor: pointer; }}
 
     /* Sparkline */
     .spark {{ display: block; width: 100%; height: 40px; }}
@@ -4550,25 +5134,60 @@ def _dashboard_html() -> str:
     @keyframes flash {{ 0% {{ background: rgba(86, 211, 100, 0.15); }} 100% {{ background: transparent; }} }}
 
     .footer {{ margin-top: 2rem; color: var(--dim); font-size: 0.8em;
-      border-top: 1px solid var(--line); padding-top: 0.8rem; }}
+      border-top: 1px solid var(--line); padding-top: 0.9rem; display: flex;
+      flex-wrap: wrap; gap: 0.45rem 0.65rem; align-items: center; }}
+    .footer::before {{ content: "NaN LLM Bridge"; color: var(--accent); text-transform: uppercase;
+      letter-spacing: 0.14em; font-size: 0.72rem; margin-right: 0.35rem; }}
     .footer code {{ font-size: 0.95em; }}
     .empty {{ color: var(--dim); padding: 1rem; text-align: center; }}
   </style>
 </head>
 <body>
-  <div class="header">
-    <h1>resilient-llm-bridge</h1>
-    <span class="port">:{DEFAULT_PORT}</span>
-    <span class="uptime"><span class="pulse"></span><span id="uptime">uptime —</span></span>
-    <div class="uptime-bar"></div>
-    <div class="windows">
-      <button data-win="1m">1m</button>
-      <button data-win="5m" class="active">5m</button>
-      <button data-win="15m">15m</button>
-      <button data-win="1h">1h</button>
-      <button data-win="lifetime">all</button>
+  <section class="shell">
+    <div class="header">
+      <div class="brand">
+        <div>
+          <div class="brand-kicker">// bridge</div>
+          <h1 class="brand-title" aria-label="NaN LLM Bridge">
+            <span class="word-nan"><span class="nan-n1">N</span><span class="nan-a">a</span><span class="nan-n2">N</span></span>
+            <span class="word-llm">LLM</span>
+            <span class="word-bridge">Bridge</span>
+          </h1>
+          <div class="brand-subtitle">
+            OpenAI-compatible routing, profile policies, live usage telemetry, and stream-first recovery for NaN-hosted models.
+          </div>
+        </div>
+        <div class="badges">
+          <span class="badge accent">OpenAI-compatible</span>
+          <span class="badge">stream-first</span>
+          <span class="badge">retry-aware</span>
+          <span class="badge">profile-routed</span>
+        </div>
+      </div>
+      <div class="status-panel">
+        <div class="status-line">
+          <span class="status-label">theme</span>
+          <button class="theme-toggle" id="theme-toggle" type="button">dark</button>
+        </div>
+        <div class="status-line">
+          <span class="status-label">listener</span>
+          <span class="port">:{DEFAULT_PORT}</span>
+        </div>
+        <div class="status-line">
+          <span class="status-label">health</span>
+          <span class="uptime"><span class="pulse"></span><span id="uptime">uptime —</span></span>
+        </div>
+        <div class="uptime-bar"></div>
+        <div class="windows">
+          <button data-win="1m">1m</button>
+          <button data-win="5m" class="active">5m</button>
+          <button data-win="15m">15m</button>
+          <button data-win="1h">1h</button>
+          <button data-win="lifetime">all</button>
+        </div>
+      </div>
     </div>
-  </div>
+  </section>
 
   <h2>Overview</h2>
   <div class="kpis">
@@ -4633,16 +5252,16 @@ def _dashboard_html() -> str:
     </div>
   </div>
 
-  <h2>Per-model</h2>
+  <h2>Per-model <span class="section-note" id="models-scope">active window</span></h2>
   <div class="card">
     <table>
       <thead><tr>
         <th>model</th>
-        <th class="num">req</th><th class="num">errors</th>
-        <th class="num">tok in</th><th class="num">tok out</th>
+        <th class="num">req</th><th class="num">comp</th><th class="num">errors</th>
+        <th class="num">tok in</th><th class="num">tok out</th><th class="num">out/comp</th>
         <th class="num">p50</th><th class="num">p95</th>
       </tr></thead>
-      <tbody id="models-body"><tr><td colspan="7" class="empty">no completions yet</td></tr></tbody>
+      <tbody id="models-body"><tr><td colspan="9" class="empty">no completions yet</td></tr></tbody>
     </table>
   </div>
 
@@ -4650,11 +5269,21 @@ def _dashboard_html() -> str:
   <div class="card">
     <table>
       <thead><tr>
-        <th>name</th><th>url</th>
-        <th>rpm cap</th><th>concurrent</th><th>in flight</th>
-        <th>waiting</th><th>oldest</th><th>utilization</th>
+        <th>upstream</th><th>endpoint</th><th>status</th>
+        <th class="num">slots</th><th class="num">queue</th><th class="num">rpm</th>
+        <th class="num">oldest</th><th>load</th>
       </tr></thead>
       <tbody id="upstreams-body"><tr><td colspan="8" class="empty">loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <h2>In-flight</h2>
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>age</th><th>profile</th><th>model</th><th>path</th><th>stream</th><th>phase</th><th>ttfb</th><th>chunks</th><th>bytes</th><th>params</th></tr>
+      </thead>
+      <tbody id="inflight-body"><tr><td colspan="10" class="empty">no active requests</td></tr></tbody>
     </table>
   </div>
 
@@ -4680,17 +5309,17 @@ def _dashboard_html() -> str:
     </div>
     <table>
       <thead><tr>
-        <th>time</th><th>profile</th><th>method</th>
+        <th>time</th><th>profile</th><th>model</th><th>method</th>
         <th>path</th><th>status</th><th class="num">ms</th>
         <th class="num">↑</th><th class="num">↓</th>
         <th>thinking params</th>
       </tr></thead>
-      <tbody id="activity"><tr><td colspan="9" class="empty">no activity yet</td></tr></tbody>
+      <tbody id="activity"><tr><td colspan="10" class="empty">no activity yet</td></tr></tbody>
     </table>
   </div>
 
   <div class="footer">
-    Endpoints: <code>/{{profile}}/v1/responses</code>,
+    Routes: <code>/{{profile}}/v1/responses</code>,
     <code>/{{profile}}/v1/chat/completions</code>,
     <code>/v1/...</code> (default profile).
     Config: <code>~/.config/resilient-llm-bridge/config.yaml</code>.
@@ -4701,6 +5330,13 @@ def _dashboard_html() -> str:
 
   <script>
     const $ = id => document.getElementById(id);
+    function setTheme(theme) {{
+      const next = theme === 'light' ? 'light' : 'dark';
+      document.documentElement.dataset.theme = next;
+      localStorage.setItem('nan-bridge-theme', next);
+      const btn = $('theme-toggle');
+      if (btn) btn.textContent = next;
+    }}
     const fmt = (n) => Number(n || 0).toLocaleString();
     const fmtMs = (ms) => ms < 1000 ? `${{Math.round(ms)}}ms` : `${{(ms/1000).toFixed(2)}}s`;
     const fmtTime = (ts) => new Date(ts * 1000).toLocaleTimeString();
@@ -4797,6 +5433,7 @@ def _dashboard_html() -> str:
     let lastStats = null;
     let activityRows = [];
     let usageRows = [];
+    let inflightRows = [];
     // Survives re-renders: keyed by activity row ts (stable per request).
     const expandedKeys = new Set();
     // Activity filter state. Mutated by the filter bar handlers; read
@@ -4809,6 +5446,11 @@ def _dashboard_html() -> str:
       model: '',
       pathQuery: '',
     }};
+
+    setTheme(document.documentElement.dataset.theme || 'dark');
+    $('theme-toggle').addEventListener('click', () => {{
+      setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+    }});
 
     document.querySelectorAll('.windows button').forEach(btn => {{
       btn.addEventListener('click', () => {{
@@ -4850,8 +5492,18 @@ def _dashboard_html() -> str:
         `</option>`
       ).join('');
     }}
+    function buildStatsUrl(path) {{
+      const params = new URLSearchParams();
+      if (filters.profile) params.set('profile', filters.profile);
+      if (filters.model) params.set('model', filters.model);
+      const qs = params.toString();
+      return qs ? `${{path}}?${{qs}}` : path;
+    }}
     function rerenderActivity() {{
       if (lastStats) renderStats(lastStats);
+    }}
+    function refreshFilteredStats() {{
+      refreshStats();
     }}
     $('flt-errors').addEventListener('click', () => {{
       filters.errorsOnly = !filters.errorsOnly;
@@ -4865,11 +5517,11 @@ def _dashboard_html() -> str:
     }});
     $('flt-profile').addEventListener('change', (e) => {{
       filters.profile = e.target.value;
-      rerenderActivity();
+      refreshFilteredStats();
     }});
     $('flt-model').addEventListener('change', (e) => {{
       filters.model = e.target.value;
-      rerenderActivity();
+      refreshFilteredStats();
     }});
     $('flt-path').addEventListener('input', (e) => {{
       filters.pathQuery = (e.target.value || '').toLowerCase();
@@ -4886,7 +5538,7 @@ def _dashboard_html() -> str:
       $('flt-profile').value = '';
       $('flt-model').value = '';
       $('flt-path').value = '';
-      rerenderActivity();
+      refreshFilteredStats();
     }});
 
     function pickWindow(stats) {{
@@ -4901,7 +5553,40 @@ def _dashboard_html() -> str:
       return {{ '1m': 60, '5m': 300, '15m': 900, '1h': 3600 }}[activeWindow] || 300;
     }}
 
+    function rowsInActiveWindow(rows, stats) {{
+      if (activeWindow === 'lifetime') return rows || [];
+      const now = Number(stats?.now || (Date.now() / 1000));
+      const cutoff = now - windowSeconds(stats);
+      return (rows || []).filter((r) => Number(r.ts || 0) >= cutoff);
+    }}
+
+    function renderInflight(rows) {{
+      const body = $('inflight-body');
+      if (!body) return;
+      const ordered = (rows || []).slice().sort((a, b) => (b.age_s || 0) - (a.age_s || 0));
+      body.innerHTML = ordered.length === 0
+        ? `<tr><td colspan="10" class="empty">no active requests</td></tr>`
+        : ordered.map((r) => {{
+            const firstByte = r.first_byte_at !== undefined && r.first_byte_at !== null;
+            const phase = firstByte ? 'streaming' : 'waiting';
+            const phaseCls = firstByte ? 'status-pill ok' : 'status-pill busy';
+            return `<tr>` +
+              `<td class="num ${{latClass((r.age_s || 0) * 1000)}}">${{fmtMs((r.age_s || 0) * 1000)}}</td>` +
+              `<td>${{escapeHtml(r.profile || '?')}}</td>` +
+              `<td>${{escapeHtml(r.model || '?')}}</td>` +
+              `<td><code>${{escapeHtml(r.path || '?')}}</code></td>` +
+              `<td>${{r.stream ? 'yes' : 'no'}}</td>` +
+              `<td><span class="${{phaseCls}}">${{phase}}</span></td>` +
+              `<td class="num">${{r.ttfb_s == null ? '—' : fmtMs(r.ttfb_s * 1000)}}</td>` +
+              `<td class="num">${{fmt(r.chunks || 0)}}</td>` +
+              `<td class="num">${{fmt(r.bytes || 0)}}</td>` +
+              `<td>${{renderParams(r.params)}}</td>` +
+            `</tr>`;
+          }}).join('');
+    }}
+
     function renderStats(stats) {{
+      renderInflight(inflightRows);
       const w = pickWindow(stats);
       const span = windowSeconds(stats);
       const empty = !w.requests;
@@ -4969,51 +5654,70 @@ def _dashboard_html() -> str:
           `</div></div>`;
       }}).join('');
 
-      // Per-model table.
-      const byModel = w.by_model || {{}};
+      // Per-model table. Prefer the active window, but fall back to
+      // lifetime so the panel does not look empty right after an idle
+      // few minutes. Model buckets exclude non-model requests.
+      const activeByModel = w.by_model || {{}};
+      const lifetimeByModel = (stats.lifetime && stats.lifetime.by_model) || {{}};
+      const useLifetimeModels = Object.keys(activeByModel).length === 0 && Object.keys(lifetimeByModel).length > 0;
+      const byModel = useLifetimeModels ? lifetimeByModel : activeByModel;
+      $('models-scope').textContent = useLifetimeModels ? 'lifetime (idle window)' : activeWindow;
       const modelRows = Object.entries(byModel)
+        .filter(([name, b]) => name && name !== '?' && ((b.requests || 0) > 0 || (b.completions || 0) > 0 || (b.tokens_out || 0) > 0))
         .sort((a, b) => (b[1].tokens_out || 0) - (a[1].tokens_out || 0))
-        .map(([name, b]) => `<tr><td>${{escapeHtml(name)}}</td>` +
-          `<td class="num">${{fmt(b.requests)}}</td>` +
-          `<td class="num ${{(b.errors||0)>0?'status-4xx':''}}">${{fmt(b.errors)}}</td>` +
-          `<td class="num">${{fmt(b.tokens_in)}}</td>` +
-          `<td class="num">${{fmt(b.tokens_out)}}</td>` +
-          `<td class="num ${{latClass(b.p50_ms)}}">${{fmtMs(b.p50_ms)}}</td>` +
-          `<td class="num ${{latClass(b.p95_ms)}}">${{fmtMs(b.p95_ms)}}</td></tr>`).join('');
+        .map(([name, b]) => {{
+          const comp = Number(b.completions || 0);
+          const avgOut = comp > 0 ? Math.round((b.tokens_out || 0) / comp) : 0;
+          return `<tr><td>${{escapeHtml(name)}}</td>` +
+            `<td class="num">${{fmt(b.requests)}}</td>` +
+            `<td class="num">${{fmt(comp)}}</td>` +
+            `<td class="num ${{(b.errors||0)>0?'status-4xx':''}}">${{fmt(b.errors)}}</td>` +
+            `<td class="num">${{fmt(b.tokens_in)}}</td>` +
+            `<td class="num">${{fmt(b.tokens_out)}}</td>` +
+            `<td class="num">${{avgOut ? fmt(avgOut) : '—'}}</td>` +
+            `<td class="num ${{latClass(b.p50_ms)}}">${{b.p50_ms ? fmtMs(b.p50_ms) : '—'}}</td>` +
+            `<td class="num ${{latClass(b.p95_ms)}}">${{b.p95_ms ? fmtMs(b.p95_ms) : '—'}}</td></tr>`;
+        }}).join('');
       $('models-body').innerHTML = modelRows ||
-        `<tr><td colspan="7" class="empty">no completions in window</td></tr>`;
+        `<tr><td colspan="9" class="empty">no model completions recorded</td></tr>`;
 
-      // Upstreams.
+      // Upstreams. Show operational state rather than raw counters.
       const upRows = (stats.upstreams || []).map(u => {{
         const inFlight = u.concurrent_in_flight || 0;
         const waiting = u.queue_waiting || 0;
         const cap = u.concurrent_limit || 1;
-        const pct = Math.min(100, (inFlight / cap) * 100);
-        const cls = pct >= 90 ? 'full' : pct >= 50 ? 'busy' : '';
+        const pct = Math.min(100, ((inFlight + waiting) / cap) * 100);
+        const cls = pct >= 90 ? 'full' : pct >= 50 || waiting > 0 ? 'busy' : '';
+        const state = waiting > 0 ? 'queued' : inFlight > 0 ? 'busy' : 'idle';
+        const stateCls = waiting > 0 ? 'hot' : inFlight > 0 ? 'busy' : 'ok';
         const oldest = u.oldest_in_flight_s || 0;
         const stuckWarn = u.stuck_warn_s || 300;
         const oldestCls = oldest > stuckWarn ? 'lat-slow' : oldest > stuckWarn * 0.5 ? 'lat-mid' : '';
         const oldestStr = oldest > 0 ? `${{oldest.toFixed(1)}}s` : '—';
-        const waitCls = waiting > 0 ? 'lat-mid' : '';
+        const rpmRemaining = Number(u.rpm_remaining || 0);
+        const rpmCap = Number(u.rpm_capacity || 0);
         return `<tr><td>${{escapeHtml(u.name)}}</td>` +
           `<td><code>${{escapeHtml(u.url)}}</code></td>` +
-          `<td class="num">${{u.rpm_remaining}}/${{u.rpm_capacity}}</td>` +
-          `<td class="num">${{cap}}</td>` +
-          `<td class="num">${{inFlight}}</td>` +
-          `<td class="num ${{waitCls}}">${{waiting}}</td>` +
+          `<td><span class="status-pill ${{stateCls}}">${{state}}</span></td>` +
+          `<td class="num">${{inFlight}}/${{cap}}</td>` +
+          `<td class="num ${{waiting > 0 ? 'lat-mid' : ''}}">${{waiting}}</td>` +
+          `<td class="num">${{fmtRate(rpmRemaining)}}/${{fmt(rpmCap)}}</td>` +
           `<td class="num ${{oldestCls}}">${{oldestStr}}</td>` +
-          `<td><div class="rate-bar"><div class="rate-bar-fill ${{cls}}" style="width:${{pct.toFixed(1)}}%"></div></div></td></tr>`;
+          `<td><div class="rate-bar" title="in flight + queued / concurrency cap"><div class="rate-bar-fill ${{cls}}" style="width:${{pct.toFixed(1)}}%"></div></div></td></tr>`;
       }}).join('');
       $('upstreams-body').innerHTML = upRows ||
-        `<tr><td colspan="8" class="empty">no upstreams</td></tr>`;
+        `<tr><td colspan="8" class="empty">no upstreams configured</td></tr>`;
 
       // Activity table from rolling buffer. Each main row has a hidden
       // sibling row with the full redacted JSON body — expanded on
       // click. Expanded state is keyed by the row's ts (stable across
       // renders) so periodic re-renders don't collapse open rows.
+      const windowActivityRows = rowsInActiveWindow(activityRows, stats);
+      const windowUsageRows = rowsInActiveWindow(usageRows, stats);
+
       // Build a lookup: profile -> usage records sorted by ts.
       const usageByProfile = {{}};
-      for (const u of usageRows) {{
+      for (const u of windowUsageRows) {{
         const p = u.profile || '?';
         if (!usageByProfile[p]) usageByProfile[p] = [];
         usageByProfile[p].push(u);
@@ -5038,22 +5742,37 @@ def _dashboard_html() -> str:
 
       // Refresh the profile/model dropdowns from whatever's been seen.
       // Keep the user's current selection; just append any new options.
-      const seenProfiles = new Set(activityRows.map((r) => r.profile).filter(Boolean));
-      const seenModels = new Set(activityRows.map((r) => r.model).filter(Boolean));
+      const available = stats.available_filters || {{}};
+      const profileValues = Array.isArray(available.profiles)
+        ? available.profiles
+        : activityRows.map((r) => r.profile);
+      const modelValues = Array.isArray(available.models)
+        ? available.models
+        : activityRows.map((r) => r.model);
+      const seenProfiles = new Set(profileValues.filter(Boolean));
+      const seenModels = new Set(modelValues.filter(Boolean));
       syncDropdown('flt-profile', seenProfiles, filters.profile);
       syncDropdown('flt-model', seenModels, filters.model);
 
       // Apply filters to the full activity buffer, then take the last 30
       // matching rows. Order matters: filtering first means we see 30
       // matches even if the latest 30 unfiltered rows have none of them.
-      const filtered = activityRows.filter(matchesFilters);
+      // Save scroll positions before innerHTML destroys the body-pre elements.
+      const pageScrollY = window.scrollY;
+      const bodyScrolls = new Map();
+      document.querySelectorAll('#activity .body-row.expanded .body-pre').forEach(pre => {{
+        const row = pre.closest('.body-row');
+        if (row && row.id) bodyScrolls.set(row.id, pre.scrollTop);
+      }});
+      const filtered = windowActivityRows.filter(matchesFilters);
       const recent = filtered.slice(-30).reverse();
-      $('flt-count').textContent = filtered.length === activityRows.length
-        ? `${{activityRows.length}} requests`
-        : `${{filtered.length}} of ${{activityRows.length}} match`;
+      const winText = activeWindow === 'lifetime' ? 'all' : activeWindow;
+      $('flt-count').textContent = filtered.length === windowActivityRows.length
+        ? `${{windowActivityRows.length}} requests · ${{winText}}`
+        : `${{filtered.length}} of ${{windowActivityRows.length}} match · ${{winText}}`;
       $('activity').innerHTML = recent.length === 0
-        ? `<tr><td colspan="9" class="empty">${{
-            activityRows.length === 0 ? 'no activity yet' : 'no rows match the current filters'
+        ? `<tr><td colspan="10" class="empty">${{
+            windowActivityRows.length === 0 ? `no activity in ${{winText}}` : 'no rows match the current filters'
           }}</td></tr>`
         : recent.map((r) => {{
             const key = String(r.ts);
@@ -5069,6 +5788,7 @@ def _dashboard_html() -> str:
               : '';
             const main = `<tr class="${{mainCls}}" data-key="${{key}}" data-target="${{targetId}}">` +
               `<td>${{fmtTime(r.ts)}}</td><td>${{escapeHtml(r.profile)}}</td>` +
+              `<td>${{escapeHtml(r.model || '?')}}</td>` +
               `<td>${{escapeHtml(r.method)}}</td><td><code>${{escapeHtml(r.path)}}</code>${{recBadge}}</td>` +
               `<td class="${{statusClass(r.status)}}">${{r.status}}</td>` +
               `<td class="num ${{latClass(r.duration_ms)}}">${{fmtMs(r.duration_ms)}}</td>` +
@@ -5083,7 +5803,7 @@ def _dashboard_html() -> str:
                   ? jsonHighlight(r.body)
                   : '<span class="jnull">no body captured</span>');
             const expand = `<tr class="${{bodyCls}}" id="${{targetId}}">` +
-              `<td colspan="9"><div class="body-pre">${{bodyJson}}</div></td></tr>`;
+              `<td colspan="10"><div class="body-pre">${{bodyJson}}</div></td></tr>`;
             return main + expand;
           }}).join('');
       // Wire click handlers for expandable rows. Toggle both the
@@ -5104,6 +5824,15 @@ def _dashboard_html() -> str:
             target.classList.add('expanded');
           }}
         }});
+      }});
+
+      // Restore scroll positions of expanded body rows across re-renders.
+      // The innerHTML replacement above destroys the .body-pre containers,
+      // so we saved scrollTop before the replacement and restore it now.
+      window.scrollTo(0, pageScrollY);
+      document.querySelectorAll('#activity .body-row.expanded').forEach(row => {{
+        const pre = row.querySelector('.body-pre');
+        if (pre) pre.scrollTop = bodyScrolls.get(row.id) || 0;
       }});
     }}
 
@@ -5215,9 +5944,37 @@ def _dashboard_html() -> str:
         .replace(/: null([,\\n}}\\]])/g, ': <span class="jnull">null</span>$1');
     }}
 
+    async function refreshInflight() {{
+      try {{
+        const r = await fetch('/inflight');
+        if (!r.ok) return;
+        const d = await r.json();
+        inflightRows = Array.isArray(d.requests) ? d.requests : [];
+        renderInflight(inflightRows);
+      }} catch (_) {{
+      }}
+    }}
+
+    function rowKey(row, fields) {{
+      return fields.map((f) => row?.[f] ?? '').join('|');
+    }}
+
+    function mergeRows(existing, incoming, fields, limit = 1000) {{
+      const byKey = new Map();
+      for (const row of existing || []) byKey.set(rowKey(row, fields), {{...row}});
+      for (const row of incoming || []) {{
+        const key = rowKey(row, fields);
+        const prev = byKey.get(key) || {{}};
+        byKey.set(key, {{...prev, ...row}});
+      }}
+      return [...byKey.values()]
+        .sort((a, b) => (a.ts || 0) - (b.ts || 0))
+        .slice(-limit);
+    }}
+
     async function refreshStats() {{
       try {{
-        const r = await fetch('/stats');
+        const r = await fetch(buildStatsUrl('/stats'));
         const d = await r.json();
         if (d.uptime_s !== undefined) {{
           const s = Math.round(d.uptime_s);
@@ -5225,54 +5982,90 @@ def _dashboard_html() -> str:
           const m = Math.floor((s % 3600) / 60);
           $('uptime').textContent = h > 0 ? `uptime ${{h}}h${{m}}m` : `uptime ${{m}}m ${{s % 60}}s`;
         }}
-        // Adopt server-side history once on each refresh.
-        if (Array.isArray(d.history?.activity)) activityRows = d.history.activity;
-        if (Array.isArray(d.history?.usage)) usageRows = d.history.usage;
+        // Stats polling intentionally ships small history rows. Merge
+        // them so it cannot wipe request bodies captured by /history/SSE.
+        if (Array.isArray(d.history?.activity)) {{
+          activityRows = mergeRows(
+            activityRows,
+            d.history.activity,
+            ['ts', 'profile', 'path', 'method', 'status', 'model']
+          );
+        }}
+        if (Array.isArray(d.history?.usage)) {{
+          usageRows = mergeRows(
+            usageRows,
+            d.history.usage,
+            ['ts', 'profile', 'model', 'input_tokens', 'output_tokens', 'total_output_tokens']
+          );
+        }}
         lastStats = d;
         renderStats(d);
       }} catch (e) {{ console.error(e); }}
     }}
 
-    // SSE feeds keep things live in between /stats refreshes.
-    const usage = new EventSource('/usage/stream');
-    usage.onmessage = (e) => {{
-      try {{
-        const d = JSON.parse(e.data);
-        usageRows.push(d);
-        if (usageRows.length > 1000) usageRows.shift();
-        const tot = d.total_tokens || ((d.input_tokens||0)+(d.output_tokens||0));
-        const live = $('live-tokens');
-        live.textContent = fmt(tot);
-        live.classList.remove('flash'); void live.offsetWidth; live.classList.add('flash');
-        $('live-meta').textContent = `${{d.profile}} · ${{d.model || '?'}} · in ${{fmt(d.input_tokens)}} / out ${{fmt(d.output_tokens)}}`;
-        $('live-rate').textContent = `${{new Date(d.ts*1000).toLocaleTimeString()}}`;
-        if (lastStats) renderStats(lastStats);
-      }} catch {{}}
-    }};
-    const activity = new EventSource('/activity/stream');
-    activity.onmessage = (e) => {{
-      try {{
-        const d = JSON.parse(e.data);
-        activityRows.push(d);
-        if (activityRows.length > 1000) activityRows.shift();
-        if (lastStats) renderStats(lastStats);
-      }} catch {{}}
-    }};
+    // SSE feeds keep things live in between /stats refreshes. Open them
+    // after window load so the browser does not keep the initial page
+    // navigation spinner active on remote/LAN access. The 1s /stats
+    // polling below is enough for first paint.
+    function startLiveStreams() {{
+      const usage = new EventSource('/usage/stream');
+      usage.onmessage = (e) => {{
+        try {{
+          const d = JSON.parse(e.data);
+          usageRows = mergeRows(
+            usageRows,
+            [d],
+            ['ts', 'profile', 'model', 'input_tokens', 'output_tokens', 'total_output_tokens']
+          );
+          const tot = d.total_tokens || ((d.input_tokens||0)+(d.output_tokens||0));
+          const live = $('live-tokens');
+          live.textContent = fmt(tot);
+          live.classList.remove('flash'); void live.offsetWidth; live.classList.add('flash');
+          $('live-meta').textContent = `${{d.profile}} · ${{d.model || '?'}} · in ${{fmt(d.input_tokens)}} / out ${{fmt(d.output_tokens)}}`;
+          $('live-rate').textContent = `${{new Date(d.ts*1000).toLocaleTimeString()}}`;
+          if (lastStats) renderStats(lastStats);
+        }} catch {{}}
+      }};
+      usage.onerror = () => {{ usage.close(); }};
+
+      const activity = new EventSource('/activity/stream');
+      activity.onmessage = (e) => {{
+        try {{
+          const d = JSON.parse(e.data);
+          activityRows = mergeRows(
+            activityRows,
+            [d],
+            ['ts', 'profile', 'path', 'method', 'status', 'model']
+          );
+          if (lastStats) renderStats(lastStats);
+        }} catch {{}}
+      }};
+      activity.onerror = () => {{ activity.close(); }};
+    }}
 
     refreshStats();
+    refreshInflight();
     setInterval(refreshStats, 1000);
+    setInterval(refreshInflight, 2_000);
+    window.addEventListener('load', () => window.setTimeout(startLiveStreams, 250));
 
     // Load disk history on initial page load.
-    fetch('/history')
+    fetch(buildStatsUrl('/history'))
       .then(r => r.json())
       .then(d => {{
         if (Array.isArray(d.activity)) {{
-          activityRows = d.activity;
-          if (activityRows.length > 1000) activityRows = activityRows.slice(-1000);
+          activityRows = mergeRows(
+            activityRows,
+            d.activity,
+            ['ts', 'profile', 'path', 'method', 'status', 'model']
+          );
         }}
         if (Array.isArray(d.usage)) {{
-          usageRows = d.usage;
-          if (usageRows.length > 1000) usageRows = usageRows.slice(-1000);
+          usageRows = mergeRows(
+            usageRows,
+            d.usage,
+            ['ts', 'profile', 'model', 'input_tokens', 'output_tokens', 'total_output_tokens']
+          );
         }}
       }})
       .catch(() => {{}});
@@ -5308,12 +6101,39 @@ def _dashboard_html() -> str:
       return out;
     }}
 
+    const FEATURE_GROUPS = [
+      {{
+        id: 'core',
+        title: 'core request shaping',
+        features: ['model_sampling_defaults', 'drop_oai_only_fields', 'effort_to_thinking_budget'],
+      }},
+      {{
+        id: 'recovery',
+        title: 'recovery and resilience',
+        features: ['thinking_overflow_recovery', 'silent_completion_recovery', 'truncated_content_recovery', 'empty_with_stop_retry', 'tool_call_args_retry', 'xml_tool_residue_retry'],
+      }},
+    ];
+
+    function featureGroupFor(feature) {{
+      return FEATURE_GROUPS.find((g) => g.features.includes(feature));
+    }}
+
     function profileToEditable(p) {{
       return {{
         name: p.name,
         upstream: p.upstream,
         queue_priority: p.queue_priority,
+        thinking_enabled: p.thinking_enabled,
+        default_thinking_effort: p.default_thinking_effort || '',
         default_thinking_budget: p.default_thinking_budget,
+        default_max_output_tokens: p.default_max_output_tokens,
+        force_max_output_tokens: p.force_max_output_tokens,
+        force_temperature: p.force_temperature,
+        force_top_p: p.force_top_p,
+        force_presence_penalty: p.force_presence_penalty,
+        auto_retries: p.auto_retries !== false,
+        force_stream: p.force_stream !== false,
+        force_model: p.force_model || '',
         features: new Set(p.features || []),
         aliases: aliasesToList(p.model_aliases),
         isNew: false,
@@ -5331,6 +6151,9 @@ def _dashboard_html() -> str:
           originals: new Map((d.profiles || []).map((p) => [p.name, JSON.stringify(p)])),
           upstreams: (d.upstreams || []).map((u) => u.name),
           available_features: d.available_features || [],
+          feature_descriptions: d.feature_descriptions || {{}},
+          force_model_options: d.force_model_options || ['qwen3.6', 'gemma4'],
+          thinking_effort_options: d.thinking_effort_options || ['low', 'medium', 'high', 'xhigh'],
           default_profile: d.default_profile,
         }};
         renderEditor();
@@ -5348,67 +6171,141 @@ def _dashboard_html() -> str:
         upstream: prof.upstream,
         features: [...prof.features].sort(),
         queue_priority: prof.queue_priority,
-        default_thinking_budget: prof.default_thinking_budget,
+        thinking_enabled: prof.thinking_enabled,
+        default_thinking_effort: prof.thinking_enabled === true ? (prof.default_thinking_effort || null) : null,
+        default_thinking_budget: null,
+        default_max_output_tokens: prof.default_max_output_tokens,
+        force_max_output_tokens: prof.force_max_output_tokens,
+        force_temperature: prof.force_temperature,
+        force_top_p: prof.force_top_p,
+        force_presence_penalty: prof.force_presence_penalty,
+        auto_retries: prof.auto_retries,
+        force_stream: prof.force_stream,
+        force_model: prof.force_model || null,
         model_aliases: aliasesToMap(prof.aliases),
       }});
       return current !== original;
     }}
 
+    function renderFeatureCard(f, prof, idx) {{
+      const on = prof.features.has(f);
+      const desc = editorState.feature_descriptions[f] || '';
+      const group = featureGroupFor(f);
+      const legacy = group && group.legacy;
+      return `<label class="pf-feature ${{on ? 'on' : ''}} ${{legacy ? 'pf-feature-legacy' : ''}}" data-idx="${{idx}}" data-feature="${{escapeHtml(f)}}">` +
+        `<input type="checkbox" ${{on ? 'checked' : ''}}>` +
+        `<span class="pf-feature-name">${{escapeHtml(f)}}</span>` +
+        `<span class="pf-feature-desc">${{escapeHtml(desc)}}</span>` +
+      `</label>`;
+    }}
+
+    function renderFeatureGroups(prof, idx) {{
+      const known = new Set(FEATURE_GROUPS.flatMap((g) => g.features));
+      const extra = (editorState.available_features || []).filter((f) => !known.has(f));
+      const groups = extra.length
+        ? [...FEATURE_GROUPS, {{ id: 'other', title: 'other', features: extra }}]
+        : FEATURE_GROUPS;
+      return `<div class="pf-feature-groups">` + groups.map((group) => {{
+        const items = group.features.filter((f) => (editorState.available_features || []).includes(f));
+        if (!items.length) return '';
+        const body = `<div class="pf-feature-list">${{items.map((f) => renderFeatureCard(f, prof, idx)).join('')}}</div>`;
+        if (group.collapsed) {{
+          return `<details class="pf-feature-group"><summary>${{escapeHtml(group.title)}}</summary>${{body}}</details>`;
+        }}
+        return `<div class="pf-feature-group"><div class="pf-feature-group-header">${{escapeHtml(group.title)}}</div>${{body}}</div>`;
+      }}).join('') + `</div>`;
+    }}
+
     function renderEditor() {{
       if (!editorState) return;
       const root = $('profile-editor');
-      const upstreamOpts = editorState.upstreams
-        .map((u) => `<option value="${{escapeHtml(u)}}">${{escapeHtml(u)}}</option>`).join('');
       const html = editorState.profiles.map((prof, idx) => {{
         const dirty = isDirty(prof);
-        const featuresHtml = editorState.available_features.map((f) => {{
-          const on = prof.features.has(f);
-          return `<label class="pf-feature ${{on ? 'on' : ''}}" data-idx="${{idx}}" data-feature="${{escapeHtml(f)}}">` +
-            `<input type="checkbox" ${{on ? 'checked' : ''}}>` +
-            `${{escapeHtml(f)}}</label>`;
-        }}).join('');
-        const aliasesHtml = (prof.aliases || []).map((al, ai) =>
-          `<div class="pf-alias-row">` +
-            `<input data-idx="${{idx}}" data-alias-idx="${{ai}}" data-alias-key="from" placeholder="from" value="${{escapeHtml(al.from)}}">` +
-            `<span class="pf-alias-arrow">→</span>` +
-            `<input data-idx="${{idx}}" data-alias-idx="${{ai}}" data-alias-key="to" placeholder="to" value="${{escapeHtml(al.to)}}">` +
-            `<button class="pf-alias-del" data-idx="${{idx}}" data-alias-del="${{ai}}" type="button">×</button>` +
-          `</div>`
-        ).join('');
         const selected = (val) => prof.upstream === val ? 'selected' : '';
         const upstreamSel = editorState.upstreams.map((u) =>
           `<option value="${{escapeHtml(u)}}" ${{selected(u)}}>${{escapeHtml(u)}}</option>`
         ).join('');
-        const featuresTag = `<div class="pf-features">${{featuresHtml}}</div>`;
-        const aliasesTag = `<div class="pf-aliases">` +
-          `<div class="pf-aliases-label">aliases</div>` +
-          `${{aliasesHtml}}` +
-          `<button class="editor-btn" data-idx="${{idx}}" data-action="alias-add" type="button">+ alias</button>` +
-        `</div>`;
-        return `<div class="profile-row ${{dirty ? 'dirty' : ''}}" data-idx="${{idx}}">` +
-          `<div class="pf-head">` +
+        const forceModelOptions = [''].concat(editorState.force_model_options || []);
+        const forceModelSel = forceModelOptions.map((m) =>
+          `<option value="${{escapeHtml(m)}}" ${{(prof.force_model || '') === m ? 'selected' : ''}}>${{m ? escapeHtml(m) : 'respect client model'}}</option>`
+        ).join('');
+        const thinkingEffortOptions = [''].concat(editorState.thinking_effort_options || []);
+        const thinkingEffortSel = thinkingEffortOptions.map((eff) =>
+          `<option value="${{escapeHtml(eff)}}" ${{(prof.default_thinking_effort || '') === eff ? 'selected' : ''}}>${{eff ? escapeHtml(eff) : 'model default'}}</option>`
+        ).join('');
+        const aliasesHtml = (prof.aliases || []).map((al, ai) =>
+          `<div class="pf-alias-row">` +
+            `<input data-idx="${{idx}}" data-alias-idx="${{ai}}" data-alias-key="from" placeholder="client model" value="${{escapeHtml(al.from)}}">` +
+            `<span class="pf-alias-arrow">→</span>` +
+            `<input data-idx="${{idx}}" data-alias-idx="${{ai}}" data-alias-key="to" placeholder="upstream model" value="${{escapeHtml(al.to)}}">` +
+            `<button class="pf-alias-del" data-idx="${{idx}}" data-alias-del="${{ai}}" type="button">×</button>` +
+          `</div>`
+        ).join('');
+        return `<details class="profile-row ${{dirty ? 'dirty' : ''}}" data-idx="${{idx}}" ${{prof.isNew || prof.name === editorState.default_profile ? 'open' : ''}}>` +
+          `<summary class="pf-head">` +
             (prof.isNew
-              ? `<span class="pf-name"><input data-idx="${{idx}}" data-key="name" value="${{escapeHtml(prof.name)}}" placeholder="name"></span>`
+              ? `<span class="pf-name"><input data-idx="${{idx}}" data-key="name" value="${{escapeHtml(prof.name)}}" placeholder="profile name"></span>`
               : `<span class="pf-name">${{escapeHtml(prof.name)}}</span>`) +
-            (prof.name === editorState.default_profile
-              ? `<span class="pf-default">default</span>`
-              : '') +
-            `<span class="pf-inline"><label>upstream</label>` +
-              `<select data-idx="${{idx}}" data-key="upstream">${{upstreamSel}}</select></span>` +
-            `<span class="pf-inline" title="higher = jumps ahead"><label>pri</label>` +
-              `<input type="number" data-idx="${{idx}}" data-key="queue_priority" value="${{prof.queue_priority}}" style="width:2.5rem"></span>` +
-            `<span class="pf-inline"><label>budget</label>` +
-              `<input type="number" min="0" max="64000" data-idx="${{idx}}" data-key="default_thinking_budget" value="${{prof.default_thinking_budget}}" style="width:4rem"></span>` +
+            (prof.name === editorState.default_profile ? `<span class="pf-default">default</span>` : '') +
+            `<span class="pf-muted">${{escapeHtml(prof.upstream || 'no upstream')}}</span>` +
             `<span class="pf-actions-inline">` +
               `<button class="editor-btn danger" data-idx="${{idx}}" data-action="delete" type="button">delete</button>` +
               `<button class="editor-btn primary" data-idx="${{idx}}" data-action="save" type="button" ${{dirty ? '' : 'disabled'}}>${{prof.isNew ? 'create' : 'save'}}</button>` +
             `</span>` +
+          `</summary>` +
+          `<div class="pf-body">` +
+            `<div>` +
+              `<div class="pf-section-title">profile settings</div>` +
+              `<div class="pf-grid">` +
+                `<div class="pf-field"><label>upstream</label><select data-idx="${{idx}}" data-key="upstream">${{upstreamSel}}</select><div class="pf-help">Provider route used by this profile.</div></div>` +
+                `<div class="pf-field"><label>priority</label><input type="number" data-idx="${{idx}}" data-key="queue_priority" value="${{prof.queue_priority}}"><div class="pf-help">Higher values jump ahead in the upstream queue.</div></div>` +
+                `<div class="pf-field"><label>thinking policy</label><select data-idx="${{idx}}" data-key="thinking_enabled">` +
+                  `<option value="" ${{prof.thinking_enabled === null || prof.thinking_enabled === undefined ? 'selected' : ''}}>respect client/upstream</option>` +
+                  `<option value="true" ${{prof.thinking_enabled === true ? 'selected' : ''}}>force thinking on</option>` +
+                  `<option value="false" ${{prof.thinking_enabled === false ? 'selected' : ''}}>force thinking off</option>` +
+                `</select><div class="pf-help">Respect is pass-through. Client reasoning_effort still maps to a concrete upstream budget.</div></div>` +
+                `<div class="pf-field"><label>default thinking effort</label><select data-idx="${{idx}}" data-key="default_thinking_effort" ${{prof.thinking_enabled === true ? '' : 'disabled'}}>${{thinkingEffortSel}}</select><div class="pf-help">Only applies with force thinking on. Model default sends no budget.</div></div>` +
+                `<div class="pf-field"><label>default output tokens</label><input type="number" min="0" max="131072" data-idx="${{idx}}" data-key="default_max_output_tokens" value="${{prof.default_max_output_tokens ?? ''}}"><div class="pf-help">Only fills when the client is silent.</div></div>` +
+                `<div class="pf-field"><label>force max output</label><input type="number" min="1" max="131072" data-idx="${{idx}}" data-key="force_max_output_tokens" value="${{prof.force_max_output_tokens ?? ''}}"><div class="pf-help">Blank respects client/default.</div></div>` +
+                `<div class="pf-field"><label>force temperature</label><input type="number" step="0.01" min="0" data-idx="${{idx}}" data-key="force_temperature" value="${{prof.force_temperature ?? ''}}"><div class="pf-help">Blank respects client/model preset.</div></div>` +
+                `<div class="pf-field"><label>force top p</label><input type="number" step="0.01" min="0" max="1" data-idx="${{idx}}" data-key="force_top_p" value="${{prof.force_top_p ?? ''}}"><div class="pf-help">Blank respects client/model preset.</div></div>` +
+                `<div class="pf-field"><label>force presence penalty</label><input type="number" step="0.01" data-idx="${{idx}}" data-key="force_presence_penalty" value="${{prof.force_presence_penalty ?? ''}}"><div class="pf-help">Blank respects client/model preset.</div></div>` +
+                `<div class="pf-field"><label>force model</label><select data-idx="${{idx}}" data-key="force_model">${{forceModelSel}}</select><div class="pf-help">Hard override. Off means the client chooses the model.</div></div>` +
+              `</div>` +
+            `</div>` +
+            `<div>` +
+              `<div class="pf-section-title">operational behavior</div>` +
+              `<div class="pf-switch-grid">` +
+                `<label class="pf-switch-card"><input type="checkbox" data-idx="${{idx}}" data-key="auto_retries" ${{prof.auto_retries ? 'checked' : ''}}><strong>auto retries</strong><p>Retry transient upstream failures such as 524 before bytes reach the client.</p></label>` +
+                `<label class="pf-switch-card"><input type="checkbox" data-idx="${{idx}}" data-key="force_stream" ${{prof.force_stream ? 'checked' : ''}}><strong>force stream</strong><p>Send stream=true upstream, including buffered bridge recovery retries.</p></label>` +
+              `</div>` +
+            `</div>` +
+            `<div>` +
+              `<div class="pf-section-title">features</div>` +
+              `${{renderFeatureGroups(prof, idx)}}` +
+            `</div>` +
+            `<details class="pf-aliases" ${{prof.aliases && prof.aliases.length ? 'open' : ''}}>` +
+              `<summary class="pf-section-title">model aliases</summary>` +
+              `<div class="pf-help">Rewrite client model ids before they reach the upstream.</div>` +
+              `${{aliasesHtml}}` +
+              `<button class="editor-btn" data-idx="${{idx}}" data-action="alias-add" type="button">+ alias</button>` +
+            `</details>` +
           `</div>` +
-          `<div class="pf-secondary">${{featuresTag}}${{aliasesTag}}</div>` +
-        `</div>`;
+        `</details>`;
       }}).join('');
       root.innerHTML = html;
       wireEditorHandlers();
+    }}
+
+    function markProfileDirty(idx) {{
+      const root = $('profile-editor');
+      const prof = editorState.profiles[idx];
+      if (!prof) return;
+      const dirty = isDirty(prof);
+      const row = root.querySelector(`.profile-row[data-idx="${{idx}}"]`);
+      if (row) row.classList.toggle('dirty', dirty);
+      const saveBtn = root.querySelector(`button[data-idx="${{idx}}"][data-action="save"]`);
+      if (saveBtn) saveBtn.disabled = !dirty;
     }}
 
     function wireEditorHandlers() {{
@@ -5420,12 +6317,24 @@ def _dashboard_html() -> str:
           const key = t.dataset.key;
           const prof = editorState.profiles[idx];
           if (!prof) return;
-          if (key === 'queue_priority' || key === 'default_thinking_budget') {{
-            prof[key] = Number(t.value);
+          if (key === 'queue_priority' || key === 'default_max_output_tokens' || key === 'force_max_output_tokens' || key === 'force_temperature' || key === 'force_top_p' || key === 'force_presence_penalty') {{
+            prof[key] = t.value === '' ? null : Number(t.value);
+          }} else if (key === 'thinking_enabled') {{
+            prof[key] = t.value === '' ? null : t.value === 'true';
+            if (prof[key] !== true) prof.default_thinking_effort = '';
+            const effortSelect = root.querySelector(`select[data-idx="${{idx}}"][data-key="default_thinking_effort"]`);
+            if (effortSelect) {{
+              effortSelect.disabled = prof[key] !== true;
+              if (prof[key] !== true) effortSelect.value = '';
+            }}
+          }} else if (key === 'default_thinking_effort') {{
+            prof[key] = t.value || '';
+          }} else if (key === 'auto_retries' || key === 'force_stream') {{
+            prof[key] = !!t.checked;
           }} else {{
             prof[key] = t.value;
           }}
-          renderEditor();
+          markProfileDirty(idx);
         }});
       }});
       root.querySelectorAll('.pf-feature').forEach((el) => {{
@@ -5451,10 +6360,7 @@ def _dashboard_html() -> str:
           if (!prof || !prof.aliases[ai]) return;
           prof.aliases[ai][which] = t.value;
           // No re-render on every keystroke (cursor jumps); only refresh dirty flag.
-          const row = root.querySelector(`.profile-row[data-idx="${{idx}}"]`);
-          if (row) row.classList.toggle('dirty', isDirty(prof));
-          const saveBtn = root.querySelector(`button[data-idx="${{idx}}"][data-action="save"]`);
-          if (saveBtn) saveBtn.disabled = !isDirty(prof);
+          markProfileDirty(idx);
         }});
       }});
       root.querySelectorAll('button[data-action]').forEach((el) => {{
@@ -5498,8 +6404,18 @@ def _dashboard_html() -> str:
         upstream: prof.upstream,
         features: [...prof.features],
         queue_priority: prof.queue_priority,
-        default_thinking_budget: prof.default_thinking_budget,
+        thinking_enabled: prof.thinking_enabled,
+        default_thinking_effort: prof.thinking_enabled === true ? (prof.default_thinking_effort || null) : null,
+        default_thinking_budget: null,
+        default_max_output_tokens: prof.default_max_output_tokens,
+        force_max_output_tokens: prof.force_max_output_tokens,
+        force_temperature: prof.force_temperature,
+        force_top_p: prof.force_top_p,
+        force_presence_penalty: prof.force_presence_penalty,
+        force_model: prof.force_model || null,
         model_aliases: aliasesToMap(prof.aliases),
+        auto_retries: prof.auto_retries,
+        force_stream: prof.force_stream,
       }};
       try {{
         const r = await fetch('/config/profiles/' + encodeURIComponent(trimmedName), {{
@@ -5546,8 +6462,18 @@ def _dashboard_html() -> str:
         name: '',
         upstream,
         queue_priority: 0,
-        default_thinking_budget: 4096,
-        features: new Set(['qwen_sampling_defaults', 'effort_to_thinking_budget',
+        thinking_enabled: null,
+        default_thinking_effort: '',
+        default_thinking_budget: null,
+        default_max_output_tokens: null,
+        force_max_output_tokens: null,
+        force_temperature: null,
+        force_top_p: null,
+        force_presence_penalty: null,
+        auto_retries: true,
+        force_stream: true,
+        force_model: '',
+        features: new Set(['model_sampling_defaults', 'effort_to_thinking_budget',
           'thinking_overflow_recovery', 'silent_completion_recovery',
           'truncated_content_recovery', 'empty_with_stop_retry',
           'drop_oai_only_fields']),

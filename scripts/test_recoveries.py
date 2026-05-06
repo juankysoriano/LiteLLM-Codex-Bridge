@@ -48,6 +48,7 @@ import httpx
 import uvicorn
 import yaml
 from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 
 
 def _free_port() -> int:
@@ -88,7 +89,14 @@ async def _serve_canned(path: str, request: Request):
     q = queues.get(path)
     if not q:
         return {"error": {"message": f"no canned response queued for {path}"}}
-    return q.popleft()
+    response = q.popleft()
+    if isinstance(response, dict) and "stream_events" in response:
+        async def event_stream():
+            for event in response["stream_events"]:
+                yield f"data: {json.dumps(event)}\n\n".encode("utf-8")
+            yield b"data: [DONE]\n\n"
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return response
 
 
 @mock_app.post("/v1/responses")
@@ -172,6 +180,7 @@ def _write_test_config(path: Path, mock_url: str) -> None:
             "test": {
                 "upstream": "mock",
                 "queue_priority": 0,
+                "force_stream": False,
                 "default_thinking_budget": 4096,
                 "features": [
                     "thinking_overflow_recovery",
@@ -179,6 +188,7 @@ def _write_test_config(path: Path, mock_url: str) -> None:
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
                     "tool_call_args_retry",
+                    "xml_tool_residue_retry",
                 ],
             },
         },
@@ -204,6 +214,7 @@ class TestState:
             "truncated_content": 0,
             "empty_with_stop_retry": 0,
             "tool_call_args_retry": 0,
+            "xml_tool_residue": 0,
         }
 
     def reset_mock(self) -> None:
@@ -530,6 +541,175 @@ _WRITE_FILE_TOOL = {
     },
 }
 
+_READ_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read",
+        "description": "Read part of a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filePath": {"type": "string"},
+                "limit": {"type": "integer"},
+                "offset": {"type": "integer"},
+            },
+            "required": ["filePath"],
+        },
+    },
+}
+
+
+def case_xml_tool_residue_retry_nonstream(t: TestState) -> None:
+    """Qwen leaks its XML tool template into reasoning_content instead
+    of returning a structured tool_call. Bridge retries with thinking
+    off and swaps in the structured tool_call."""
+    label = "xml_tool_residue"
+    t.reset_mock()
+    leaked_xml = """<tool_call>
+<function=read>
+<parameter=filePath>
+/tmp/example.tsx
+</parameter>
+<parameter=limit>
+30
+</parameter>
+<parameter=offset>
+160
+</parameter>
+</function>
+</tool_call>"""
+    t.queue("/v1/chat/completions", {
+        "id": "chatcmpl_xml_leak",
+        "object": "chat.completion",
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": leaked_xml,
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 30, "total_tokens": 80},
+    })
+    t.queue("/v1/chat/completions", {
+        "id": "chatcmpl_xml_retry_ok",
+        "object": "chat.completion",
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "I'll read that segment.\n",
+                "tool_calls": [{
+                    "id": "call_read_fixed",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": '{"filePath": "/tmp/example.tsx", "limit": 30, "offset": 160}',
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70},
+    })
+    body = {
+        "model": "test-model",
+        "stream": False,
+        "messages": [{"role": "user", "content": "read /tmp/example.tsx limit 30 offset 160"}],
+        "tools": [_READ_TOOL],
+    }
+    r = httpx.post(f"{t.bridge}/test/v1/chat/completions", json=body, timeout=15)
+    r.raise_for_status()
+    payload = r.json()
+    message = payload["choices"][0]["message"]
+    assert "<tool_call>" not in json.dumps(message), payload
+    tcs = message.get("tool_calls") or []
+    assert tcs, payload
+    args = json.loads(tcs[0]["function"]["arguments"])
+    assert args == {"filePath": "/tmp/example.tsx", "limit": 30, "offset": 160}, args
+    t.assert_recovery(label, label + " (non-stream)")
+
+
+def case_xml_tool_residue_retry_stream(t: TestState) -> None:
+    """Streaming chat/completions: XML appears in reasoning_content SSE.
+    Bridge buffers, retries with thinking off, and synthesizes clean SSE."""
+    label = "xml_tool_residue"
+    t.reset_mock()
+    leaked_xml = """<tool_call>
+<function=read>
+<parameter=filePath>
+/tmp/example.tsx
+</parameter>
+<parameter=limit>
+30
+</parameter>
+<parameter=offset>
+160
+</parameter>
+</function>
+</tool_call>"""
+    t.queue("/v1/chat/completions", {
+        "stream_events": [
+            {
+                "id": "chatcmpl_xml_stream",
+                "object": "chat.completion.chunk",
+                "model": "test-model",
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl_xml_stream",
+                "object": "chat.completion.chunk",
+                "model": "test-model",
+                "choices": [{"index": 0, "delta": {"reasoning_content": leaked_xml}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl_xml_stream",
+                "object": "chat.completion.chunk",
+                "model": "test-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 30, "total_tokens": 80},
+            },
+        ],
+    })
+    t.queue("/v1/chat/completions", {
+        "id": "chatcmpl_xml_stream_retry_ok",
+        "object": "chat.completion",
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "I'll read that segment.\n",
+                "tool_calls": [{
+                    "id": "call_read_fixed_stream",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": '{"filePath": "/tmp/example.tsx", "limit": 30, "offset": 160}',
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70},
+    })
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "messages": [{"role": "user", "content": "read /tmp/example.tsx limit 30 offset 160"}],
+        "tools": [_READ_TOOL],
+    }
+    with httpx.stream("POST", f"{t.bridge}/test/v1/chat/completions", json=body, timeout=15) as r:
+        r.raise_for_status()
+        text = "".join(r.iter_text())
+    assert "<tool_call>" not in text, text
+    assert "tool_calls" in text, text
+    assert "/tmp/example.tsx" in text, text
+    t.assert_recovery(label, label + " (stream)")
+
 
 def case_tool_call_args_retry_nonstream(t: TestState) -> None:
     """Non-streaming chat/completions: model returns write_file with
@@ -801,6 +981,8 @@ def main() -> int:
             case_fake_invocation(t)
             case_truncated_content(t)
             case_empty_with_stop_retry(t)
+            case_xml_tool_residue_retry_nonstream(t)
+            case_xml_tool_residue_retry_stream(t)
             case_tool_call_args_retry_nonstream(t)
             case_tool_call_args_retry_skips_when_client_disabled(t)
             case_tool_call_args_retry_failed_retry_passthrough(t)

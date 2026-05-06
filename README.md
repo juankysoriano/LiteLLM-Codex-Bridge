@@ -1,75 +1,87 @@
-# resilient-llm-bridge
+# NaN LLM Bridge
 
-A local HTTP proxy that adds **resilience** between OpenAI-compatible clients (Codex CLI, opencode, hermes, OpenAI Agents SDK, Cline-style harnesses, custom integrations) and OpenAI-compatible upstreams (LiteLLM proxy, [vLLM](https://github.com/vllm-project/vllm), llama.cpp, Together, Fireworks, [Groq](https://groq.com), [NaN Builders](https://nan.builders), …).
+NaN LLM Bridge is a local OpenAI-compatible proxy for routing multiple clients through the NaN Builders upstream with per-profile policy, retries, streaming safeguards, queueing, and live observability.
 
-You point each client at a profile-specific path on the bridge (`http://127.0.0.1:4242/codex/v1`, `http://127.0.0.1:4242/opencode/v1`, …); the bridge runs a configurable transform/recovery/retry pipeline per profile against the upstream and stitches everything together transparently.
+It is meant to be a practical compatibility layer: point clients at `localhost:4242`, give each client or workload a profile, and let the bridge handle the small but important differences between what clients send and what the upstream expects.
 
-Originally extracted from a Codex+vLLM+Qwen3 setup that needed ~12 wire-level workarounds to function. The same fixes turn out to be useful far beyond Codex.
-
----
-
-## What "resilience" means concretely
-
-| Concern | What the bridge does |
-| --- | --- |
-| **Different clients need different fixes** | Per-client profiles select which transformations apply. Codex needs heavy massaging for its OpenAI-native quirks; opencode/hermes are well-behaved chat/completions clients that need almost nothing. Same proxy, different paths. |
-| **Transient upstream failures (5xx, 429, network errors)** | [Tenacity](https://tenacity.readthedocs.io)-based retry with exponential backoff and jitter. Configurable per-upstream `retry_max_attempts`, `retry_initial_wait`, `retry_max_wait`. |
-| **Empty responses from thinking-mode models that overflow `max_tokens` during `<think>`** | Detects the pattern (`status: incomplete` + `incomplete_details.reason: max_output_tokens` + no message item, or `finish_reason: length` + content cut mid-thought, or empty + stop), runs a two-tier recovery via vLLM's `continue_final_message` (Qwen-official force-close pattern). Stitches the recovered answer back into the original response shape. |
-| **Provider rate limits** | Per-upstream token bucket for RPM and `asyncio.Semaphore` for max concurrent. Queues requests when the bucket is empty, doesn't reject. |
-| **vLLM bugs the upstream hasn't shipped a fix for** | Rewrites the malformed parallel-tool-call SSE that [vllm-project/vllm#39426](https://github.com/vllm-project/vllm/issues/39426) produces, until [PR #39600](https://github.com/vllm-project/vllm/pull/39600) ships. |
-| **Strict-validator quirks in providers' Responses-API implementations** | Reshapes Codex' verbose request shapes (drops `reasoning` items, easy-form for assistants, folds `developer`/`system` into `instructions`, mid-chat developer→user, drops empty assistants), strips OpenAI-only fields the upstream rejects (`include`, `prompt_cache_key`, `store`, `text.verbosity`, `client_metadata`, `metadata`, `service_tier`, `user`). |
-| **Greedy-decoding loops on Qwen3** | Codex defaults to `temperature: 0` (which Qwen3's docs explicitly warn against). The bridge injects Qwen-recommended sampling (`temperature=0.6`, `top_p=0.95`, `top_k=20`, `min_p=0`) when missing. |
-| **gzip mismatches in proxy chains (Cloudflare-fronted upstreams)** | Forces `Accept-Encoding: identity` upstream so SSE bytes pass through verbatim — no `stream closed before response.completed` failures. |
-| **Live observability** | `/usage/stream` SSE feed for live token counter; `/activity/stream` for recent-request metadata; HTML dashboard at `/` showing it all. |
-
----
-
-## Architecture
-
-```
-            ┌─────────────────────┐
-client(s) ──>│ /codex/v1/...       │── path-based ─┐
-            │ /opencode/v1/...    │   profile     │
-            │ /hermes/v1/...      │   selection   │
-            │ /v1/... (default)   │               │
-            └─────────────────────┘               │
-                                                   v
-                            ┌────────────────────────────────┐
-                            │ resilient-llm-bridge :4242     │
-                            │ ─────────────────────────────  │
-                            │ - request transforms (per      │
-                            │   profile features list)       │
-                            │ - rate limit (per-upstream     │
-                            │   token bucket + semaphore)    │
-                            │ - retry policy (tenacity)      │
-                            │ - SSE rewrite + recovery       │
-                            │ - dashboard at /               │
-                            │ - /usage/stream + /activity    │
-                            └────────────────┬───────────────┘
-                                             │
-                          ┌──────────────────┼──────────────────┐
-                          v                  v                  v
-                       upstream A         upstream B         upstream C
-                  (e.g. NaN Builders) (e.g. Together)   (e.g. local llama.cpp)
+```text
+http://localhost:4242/v1                  # default profile
+http://localhost:4242/myproject/v1        # example profile
+http://localhost:4242/hermes/v1           # local profile you can add
+http://localhost:4242/opencode/v1         # local profile you can add
 ```
 
-Each upstream has its own rate-limit/retry config. Each profile picks one upstream and a set of features. Backward compat: `/v1/...` (no profile prefix) routes through the `default` profile.
+Only `default` and `myproject` are shipped as public example profiles. Real local profiles are meant to live in your own `~/.config/resilient-llm-bridge/config.yaml`, outside the repo.
 
----
+## Features
 
-## Quick start
+- OpenAI-compatible endpoints for `/v1/chat/completions`, `/v1/responses`, and pass-through routes such as `/v1/models`.
+- Profile routing via `/{profile}/v1/...`, so different clients can have different behavior.
+- NaN Builders upstream by default, with configurable upstreams if you want to point elsewhere.
+- Per-profile policies for thinking, reasoning effort translation, output-token defaults, model overrides, sampling overrides, forced streaming, and retries.
+- Internal queue with profile priorities for upstream limits such as `1000 rpm` and `5` concurrent requests.
+- Stream-first behavior to reduce Cloudflare or proxy idle timeouts when a client forgets `stream=true`.
+- Recovery and retry mechanisms for common failure cases.
+- Dashboard at `/` with recent activity, active requests, profiles, models, token usage, latency, recoveries, and upstream load.
 
-### 1. Run
+## Why Profiles Help
 
-Single-file script with [`uv`](https://github.com/astral-sh/uv) inline metadata. If you have `uv`:
+Profiles let one bridge behave differently for different clients or workloads.
+
+Examples:
+
+- `default`: conservative catch-all for unknown clients.
+- `myproject`: a project-specific profile with higher queue priority than background work.
+- `hermes`: a local profile you might configure for fast interactive chat.
+- `opencode`: a local profile that respects the selected model but translates `reasoning_effort` into the upstream thinking fields.
+- `batch-heavy`: a local profile for offline jobs that need more thinking budget and lower priority.
+- `fast-no-thinking`: a local profile for cheap, low-latency calls where thinking should stay off.
+
+Clients call the profile directly:
+
+```text
+http://localhost:4242/myproject/v1/chat/completions
+```
+
+The bridge strips the profile prefix, applies that profile's policy, and forwards the request to the configured upstream.
+
+## Retry And Recovery
+
+The bridge can retry or recover several common cases:
+
+- transient upstream errors before bytes reach the client
+- 524-style timeout failures
+- empty responses
+- completions cut by `max_tokens`
+- streamed requests that need buffered recovery
+- malformed or incomplete tool-call arguments
+- Qwen-style XML tool-call residue leaking into text or reasoning
+- payload fields that need compatibility cleanup before reaching the upstream
+
+Retries are profile-controlled via `auto_retries`. Streaming can also be forced per profile via `force_stream`, including for bridge-internal recovery calls.
+
+## Queueing And Priorities
+
+Each upstream has a rate/concurrency gate:
+
+- `rate_limit_rpm`
+- `rate_limit_concurrent`
+- `queue_timeout_s`
+- `stuck_warn_s`
+
+When the upstream is saturated, requests wait in an internal priority queue instead of failing immediately. Higher `queue_priority` profiles go first.
+
+This is useful when the upstream has limits such as `1000 rpm` and `5` parallel requests. You can let interactive clients jump ahead of batch jobs while still keeping background work queued.
+
+## Quick Start
+
+Run directly with `uv`:
 
 ```bash
 uv run bridge.py
 ```
 
-`uv` reads the `# /// script` block at the top, creates an isolated venv with FastAPI/uvicorn/httpx/tenacity/pyyaml, and runs.
-
-If you don't have `uv`:
+Or install dependencies yourself:
 
 ```bash
 pip install fastapi 'uvicorn[standard]' httpx 'tenacity>=8.0' pyyaml
@@ -78,22 +90,124 @@ python3 bridge.py
 
 The bridge listens on `127.0.0.1:4242` by default.
 
-### 2. Open the dashboard
+Open the dashboard:
 
-Visit [http://127.0.0.1:4242/](http://127.0.0.1:4242/). You'll see configured upstreams, profiles, the live token counter, and recent activity.
-
-### 3. Point your client at a profile
-
-#### Codex CLI (`~/.codex/config.toml`)
-
-```toml
-[model_providers.nan]
-base_url = "http://127.0.0.1:4242/codex/v1"
-env_key = "X_NAN_KEY"
-wire_api = "responses"
+```text
+http://127.0.0.1:4242/
 ```
 
-#### opencode (`~/.config/opencode/opencode.json`)
+Health check:
+
+```bash
+curl http://127.0.0.1:4242/health
+```
+
+## Configuration
+
+Default config path:
+
+```text
+~/.config/resilient-llm-bridge/config.yaml
+```
+
+Override it with:
+
+```bash
+BRIDGE_CONFIG_PATH=/path/to/config.yaml uv run bridge.py
+```
+
+Public example:
+
+```yaml
+upstreams:
+  nan:
+    url: "https://api.nan.builders/v1"
+    rate_limit_rpm: 1000
+    rate_limit_concurrent: 5
+    queue_timeout_s: 1200.0
+    stuck_warn_s: 1200.0
+
+profiles:
+  default:
+    upstream: nan
+    queue_priority: 0
+    auto_retries: true
+    force_stream: true
+    features:
+      - model_sampling_defaults
+      - drop_oai_only_fields
+      - effort_to_thinking_budget
+      - thinking_overflow_recovery
+      - silent_completion_recovery
+      - truncated_content_recovery
+      - empty_with_stop_retry
+
+  myproject:
+    upstream: nan
+    queue_priority: 5
+    auto_retries: true
+    force_stream: true
+    features:
+      - model_sampling_defaults
+      - drop_oai_only_fields
+      - effort_to_thinking_budget
+      - thinking_overflow_recovery
+      - silent_completion_recovery
+      - truncated_content_recovery
+      - empty_with_stop_retry
+
+default_profile: default
+```
+
+The same file is available at [examples/config.yaml](examples/config.yaml).
+
+## Profile Options
+
+Common profile fields:
+
+| Field | Meaning |
+| --- | --- |
+| `upstream` | Upstream name from `upstreams` |
+| `features` | Transform/recovery features enabled for the profile |
+| `queue_priority` | Higher values jump ahead in the upstream queue |
+| `auto_retries` | Retry transient upstream failures before bytes reach the client |
+| `force_stream` | Send `stream=true` upstream even when the client did not |
+| `force_model` | Optional hard model override, e.g. `qwen3.6` or `gemma4` |
+| `thinking_enabled` | `true`, `false`, or omitted to respect client/upstream defaults |
+| `default_thinking_effort` | Optional `low`, `medium`, `high`, or `xhigh` when profile enables thinking by default |
+| `default_max_output_tokens` | Fill output cap only when the client is silent |
+| `force_max_output_tokens` | Hard override for output cap |
+| `force_temperature` | Hard temperature override |
+| `force_top_p` | Hard top-p override |
+| `force_presence_penalty` | Hard presence-penalty override |
+| `model_aliases` | Optional client-model-id to upstream-model-id mapping |
+
+## Features Reference
+
+| Feature | What it does |
+| --- | --- |
+| `model_sampling_defaults` | Inject model-aware sampling defaults when the client is silent |
+| `drop_oai_only_fields` | Remove OpenAI-only fields the upstream rejects |
+| `effort_to_thinking_budget` | Translate `reasoning_effort` / `reasoning.effort` into NaN/vLLM thinking fields |
+| `thinking_overflow_recovery` | Recover when reasoning consumes the output budget before a final answer |
+| `silent_completion_recovery` | Recover completed responses that contain no useful message |
+| `truncated_content_recovery` | Continue answers that were cut by length mid-content |
+| `empty_with_stop_retry` | Retry once when the upstream returns empty content with `finish_reason=stop` |
+| `tool_call_args_retry` | Retry with thinking disabled when tool-call arguments miss required schema fields |
+| `xml_tool_residue_retry` | Retry when XML tool-call templates leak into text/reasoning |
+
+## Client Examples
+
+Any OpenAI-compatible client can point at a profile URL.
+
+Hermes-style:
+
+```yaml
+model:
+  base_url: http://127.0.0.1:4242/hermes/v1
+```
+
+opencode-style:
 
 ```json
 {
@@ -108,16 +222,31 @@ wire_api = "responses"
 }
 ```
 
-#### hermes (`~/.hermes/config.yaml`)
+Project-specific client:
 
-```yaml
-model:
-  base_url: http://127.0.0.1:4242/hermes/v1
+```text
+http://127.0.0.1:4242/myproject/v1
 ```
 
-Then run your client normally — it has no idea the bridge exists. Watch the dashboard while you work.
+Do not commit real API keys. Use environment variables such as `X_NAN_KEY` in your client config.
 
-### 4. (Optional) Run as a systemd user service
+## Dashboard
+
+The dashboard at `/` shows:
+
+- request count and success rate by time window
+- tokens in/out
+- latency percentiles
+- recovery counts
+- active in-flight requests
+- recent requests with model/profile/path/status
+- per-model stats
+- upstream queue and concurrency state
+- editable local profiles
+
+Recent activity respects the selected time window: `1m`, `5m`, `15m`, `1h`, or `all`.
+
+## Running As A systemd User Service
 
 ```bash
 mkdir -p ~/.config/resilient-llm-bridge
@@ -131,137 +260,31 @@ systemctl --user enable --now resilient-llm-bridge.service
 journalctl --user -u resilient-llm-bridge.service -f
 ```
 
-Make sure `loginctl enable-linger $USER` is set if you want it to survive logout.
+If you want the service to survive logout:
 
----
-
-## Configuration
-
-The bridge ships with **sensible defaults** (single upstream pointing at NaN Builders, profiles for codex/opencode/hermes/default). You only need a config file if you want to customize.
-
-Default config path: `~/.config/resilient-llm-bridge/config.yaml`. Override with `BRIDGE_CONFIG_PATH`.
-
-### Example: multiple upstreams, custom rate limits
-
-```yaml
-upstreams:
-  nan:
-    url: https://api.nan.builders/v1
-    rate_limit_rpm: 100
-    rate_limit_concurrent: 5
-    retry_max_attempts: 3
-    retry_initial_wait: 1.0
-    retry_max_wait: 20.0
-  groq:
-    url: https://api.groq.com/openai/v1
-    rate_limit_rpm: 30
-    rate_limit_concurrent: 3
-  local_vllm:
-    url: http://192.168.1.50:8000/v1
-    # no rate limit on a private deployment
-    rate_limit_rpm: 0
-
-profiles:
-  default:
-    upstream: nan
-    features:
-      - qwen_sampling_defaults
-      - drop_oai_only_fields
-      - effort_to_thinking_budget
-      - thinking_overflow_recovery
-      - truncated_content_recovery
-      - empty_with_stop_retry
-
-  codex:
-    upstream: nan
-    features:
-      # default features
-      - qwen_sampling_defaults
-      - drop_oai_only_fields
-      - effort_to_thinking_budget
-      - thinking_overflow_recovery
-      - truncated_content_recovery
-      - empty_with_stop_retry
-      # Codex-specific extras
-      - normalize_responses_input
-      - drop_namespace_tools
-      - force_serial_tool_calls
-      - parallel_tool_sse_fix
-
-  hermes:
-    upstream: nan
-    # leaner — well-behaved chat/completions client
-    features:
-      - qwen_sampling_defaults
-      - thinking_overflow_recovery
-      - truncated_content_recovery
-
-  fast:
-    upstream: groq
-    features: []   # Groq's strict — let it through unchanged
-
-default_profile: default
+```bash
+loginctl enable-linger "$USER"
 ```
 
-### Available features
-
-| Feature | What it does | Affects |
-| --- | --- | --- |
-| `qwen_sampling_defaults` | Inject Qwen3 sampling when caller didn't set them (`temperature=0.6`, `top_p`, `top_k`, `min_p`, `presence_penalty=0`) | Both endpoints |
-| `drop_oai_only_fields` | Strip OpenAI-only fields the upstream rejects | Both endpoints |
-| `effort_to_thinking_budget` | Translate `reasoning.effort` → `chat_template_kwargs.thinking_token_budget` | Both endpoints |
-| `normalize_responses_input` | Reshape `input` items for strict validators | `/v1/responses` only |
-| `drop_namespace_tools` | Drop `namespace`, `web_search`, `image_generation` etc. tools | `/v1/responses` only |
-| `force_serial_tool_calls` | Set `parallel_tool_calls: false` | `/v1/responses` only |
-| `parallel_tool_sse_fix` | Rewrite vLLM #39426 malformed parallel-tool SSE | `/v1/responses` streaming only |
-| `thinking_overflow_recovery` | Two-tier recovery on `incomplete + max_output_tokens` | Both endpoints |
-| `truncated_content_recovery` | `continue_final_message` when content cut mid-thought | Chat/completions non-stream |
-| `empty_with_stop_retry` | One cheap retry on empty content + `finish_reason=stop` | Chat/completions non-stream |
-
-### Environment variables
+## Environment Variables
 
 | Var | Default | Notes |
 | --- | --- | --- |
-| `BRIDGE_CONFIG_PATH` | `~/.config/resilient-llm-bridge/config.yaml` | Override config location |
+| `BRIDGE_CONFIG_PATH` | `~/.config/resilient-llm-bridge/config.yaml` | Config file path |
 | `PORT` | `4242` | Bind port |
-| `HOST` | `127.0.0.1` | Bind address |
+| `HOST` | `127.0.0.1` | Bind host |
 | `LOG_LEVEL` | `info` | uvicorn log level |
-| `BRIDGE_USAGE_RING_SIZE` | `32` | Last-N usage records kept in memory |
-| `BRIDGE_ACTIVITY_RING_SIZE` | `20` | Last-N activity records for the dashboard |
+| `BRIDGE_USAGE_RING_SIZE` | `1000` | In-memory usage rows |
+| `BRIDGE_ACTIVITY_RING_SIZE` | `1000` | In-memory activity rows |
 
----
+## Security Notes
 
-## Endpoints
-
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/` | HTML dashboard (status + activity) |
-| `GET` | `/health` | Liveness check + upstream/profile listing |
-| `GET` | `/usage/stream` | SSE feed of `{input_tokens, output_tokens, total_tokens, profile, model}` per completion |
-| `GET` | `/activity/stream` | SSE feed of recent request metadata `{ts, profile, upstream, path, method, status, duration_ms}` |
-| `POST` | `/{profile}/v1/responses` | Profile-routed Responses-API |
-| `POST` | `/{profile}/v1/chat/completions` | Profile-routed chat/completions |
-| `*` | `/{profile}/v1/{path}` | Profile-routed catch-all (embeddings, audio/transcriptions, models, etc.) |
-| `*` | `/v1/{path}` | Default-profile catch-all (backward compat) |
-
----
-
-## Reporting upstream
-
-Several of the bugs the bridge papers over should ideally be fixed at the source. Two worth filing:
-
-1. **vLLM's parallel-tool-call SSE bug** — [vllm-project/vllm#39426](https://github.com/vllm-project/vllm/issues/39426) and [#39584](https://github.com/vllm-project/vllm/issues/39584); fix in [PR #39600](https://github.com/vllm-project/vllm/pull/39600) (unmerged at time of writing). Once shipped, `parallel_tool_sse_fix` becomes a no-op.
-
-2. **vLLM started without `--reasoning-parser qwen3`** is a per-deployment config problem. Ask your provider operator to add:
-
-    ```
-    --reasoning-parser qwen3 --reasoning-config '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
-    ```
-
-Operators using LiteLLM in front of vLLM can also avoid the parallel-tool bug without touching vLLM by switching their LiteLLM `model_list` entry to `openai/<model>` with `use_chat_completions_api: true` — see [LiteLLM docs](https://docs.litellm.ai/docs/response_api).
-
----
+- The repo should not contain API keys, bearer tokens, local private profiles, or personal configs.
+- Keep real configs in `~/.config/resilient-llm-bridge/config.yaml`.
+- Keep keys in environment variables or your secret manager.
+- The bridge forwards `Authorization` headers to the upstream; do not expose it publicly without your own network controls.
+- `BRIDGE_NO_REDACT=1` is useful for local debugging but can store full request bodies in activity history. Do not enable it for shared or public deployments.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

@@ -35,6 +35,7 @@ def make_profile(
     *,
     thinking_enabled: bool | None = None,
     default_thinking_budget: int | None = None,
+    default_max_output_tokens: int | None = None,
     features: list[str] | None = None,
 ) -> bridge.ProfileConfig:
     return bridge.ProfileConfig(
@@ -43,11 +44,12 @@ def make_profile(
         features=set(features or ["effort_to_thinking_budget"]),
         thinking_enabled=thinking_enabled,
         default_thinking_budget=default_thinking_budget,
+        default_max_output_tokens=default_max_output_tokens,
     )
 
 
-def transform(body: dict, profile: bridge.ProfileConfig) -> dict:
-    return bridge._apply_request_transforms(copy.deepcopy(body), profile, kind="chat_completions")
+def transform(body: dict, profile: bridge.ProfileConfig, kind: str = "chat_completions") -> dict:
+    return bridge._apply_request_transforms(copy.deepcopy(body), profile, kind=kind)
 
 
 def fail(label: str, msg: str) -> None:
@@ -98,9 +100,8 @@ def case_default_profile_no_signals() -> None:
 
 def case_named_profile_client_effort_high() -> None:
     """Named profile (no overrides), client sends reasoning_effort=high.
-    Bridge translates → budget=8192. enable_thinking is NOT injected
-    (profile says no override) but upstream activates thinking
-    implicitly via budget alone (verified empirically)."""
+    Bridge translates → budget=8192 and explicitly enables thinking
+    because the client requested a reasoning effort."""
     label = "named profile + client effort=high"
     profile = make_profile("opencode-like")
     body = {
@@ -113,15 +114,15 @@ def case_named_profile_client_effort_high() -> None:
     if eb.get("thinking_token_budget") != 8192:
         fail(label, f"expected budget=8192 (translated from high), got {eb.get('thinking_token_budget')}")
     ctk = eb.get("chat_template_kwargs") or {}
-    if "enable_thinking" in ctk:
-        fail(label, f"expected NO enable_thinking key (no override), got {ctk!r}")
-    ok(label, "effort=high → budget=8192, no enable_thinking key")
+    if ctk.get("enable_thinking") is not True:
+        fail(label, f"expected enable_thinking=True, got {ctk!r}")
+    ok(label, "effort=high → budget=8192 + enable_thinking")
 
 
 def case_named_profile_client_responses_effort() -> None:
     """Named profile + client reasoning.effort=low (responses-API)."""
     label = "named profile + client reasoning.effort=low"
-    profile = make_profile("codex-like")
+    profile = make_profile("responses-like")
     body = {
         "model": "qwen3.6",
         "messages": [{"role": "user", "content": "hi"}],
@@ -135,9 +136,8 @@ def case_named_profile_client_responses_effort() -> None:
 
 
 def case_default_profile_client_disable_via_enable_thinking() -> None:
-    """Profile authoritative: thinking_enabled=True overrides client's
-    enable_thinking=False. Profile wins."""
-    label = "default profile (forced) + client enable_thinking=False"
+    """Default profile remains authoritative for anonymous clients."""
+    label = "default profile + client enable_thinking=False"
     profile = make_profile("default-like", thinking_enabled=True, default_thinking_budget=4096)
     body = {
         "model": "qwen3.6",
@@ -147,16 +147,15 @@ def case_default_profile_client_disable_via_enable_thinking() -> None:
     out = transform(body, profile)
     eb = out.get("extra_body") or {}
     if eb.get("chat_template_kwargs", {}).get("enable_thinking") is not True:
-        fail(label, f"expected profile to force enable_thinking=True, got {eb.get('chat_template_kwargs')}")
+        fail(label, f"expected profile enable_thinking=True, got {eb.get('chat_template_kwargs')}")
     if eb.get("thinking_token_budget") != 4096:
         fail(label, f"expected profile budget=4096, got {eb.get('thinking_token_budget')}")
-    ok(label, "profile overrides client disable signal")
+    ok(label, "profile default wins for anonymous client")
 
 
 def case_default_profile_client_disable_via_effort_none() -> None:
-    """Profile authoritative: client effort=none ignored when profile
-    forces thinking on. Translation only happens when profile is silent."""
-    label = "default profile (forced) + client effort=none"
+    """Default profile remains authoritative for anonymous clients."""
+    label = "default profile + client effort=none"
     profile = make_profile("default-like", thinking_enabled=True, default_thinking_budget=4096)
     body = {
         "model": "qwen3.6",
@@ -166,16 +165,15 @@ def case_default_profile_client_disable_via_effort_none() -> None:
     out = transform(body, profile)
     eb = out.get("extra_body") or {}
     if eb.get("chat_template_kwargs", {}).get("enable_thinking") is not True:
-        fail(label, f"expected profile-forced enable_thinking=True, got {eb.get('chat_template_kwargs')}")
-    if eb.get("thinking_token_budget") != 4096:
-        fail(label, f"expected profile budget=4096, got {eb.get('thinking_token_budget')}")
-    ok(label, "profile overrides effort=none")
+        fail(label, f"expected profile enable_thinking=True, got {eb.get('chat_template_kwargs')}")
+    if "thinking_token_budget" in eb:
+        fail(label, f"expected no budget when client sent effort=none, got {eb.get('thinking_token_budget')}")
+    ok(label, "profile keeps thinking on but effort=none suppresses budget")
 
 
 def case_default_profile_client_set_budget_explicit() -> None:
-    """Profile authoritative: client budget=512 ignored when profile
-    sets default_thinking_budget=4096. Profile wins."""
-    label = "default profile (forced) + client extra_body.thinking_token_budget=512"
+    """Client explicit budget wins over the profile default."""
+    label = "default profile + client extra_body.thinking_token_budget=512"
     profile = make_profile("default-like", thinking_enabled=True, default_thinking_budget=4096)
     body = {
         "model": "qwen3.6",
@@ -184,11 +182,11 @@ def case_default_profile_client_set_budget_explicit() -> None:
     }
     out = transform(body, profile)
     eb = out.get("extra_body") or {}
-    if eb.get("thinking_token_budget") != 4096:
-        fail(label, f"expected profile budget=4096 to override client 512, got {eb.get('thinking_token_budget')}")
+    if eb.get("thinking_token_budget") != 512:
+        fail(label, f"expected client budget=512 to survive, got {eb.get('thinking_token_budget')}")
     if eb.get("chat_template_kwargs", {}).get("enable_thinking") is not True:
-        fail(label, f"expected enable_thinking=True (profile authoritative), got {eb.get('chat_template_kwargs')}")
-    ok(label, "profile budget overrides client budget")
+        fail(label, f"expected profile default enable_thinking=True, got {eb.get('chat_template_kwargs')}")
+    ok(label, "client budget wins; profile fills missing enable_thinking")
 
 
 def case_named_profile_client_disable_respected() -> None:
@@ -277,6 +275,43 @@ def case_client_max_tokens_clamp_only() -> None:
     ok(label, "max_tokens=12345 unchanged (no budget inflation)")
 
 
+def case_profile_default_output_tokens_chat() -> None:
+    """Profile default output budget fills chat/completions max_tokens."""
+    label = "profile default output tokens for chat"
+    profile = make_profile("myproject-like", default_max_output_tokens=16000)
+    body = {"model": "qwen3.6", "messages": [{"role": "user", "content": "hi"}]}
+    out = transform(body, profile)
+    if out.get("max_tokens") != 16000:
+        fail(label, f"expected max_tokens=16000, got {out.get('max_tokens')}")
+    ok(label, "default_max_output_tokens → max_tokens")
+
+
+def case_profile_default_output_tokens_respects_client() -> None:
+    """Client max_tokens wins over profile default output budget."""
+    label = "client max_tokens wins over profile default"
+    profile = make_profile("myproject-like", default_max_output_tokens=16000)
+    body = {
+        "model": "qwen3.6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 6000,
+    }
+    out = transform(body, profile)
+    if out.get("max_tokens") != 6000:
+        fail(label, f"expected client max_tokens=6000, got {out.get('max_tokens')}")
+    ok(label, "client output cap preserved")
+
+
+def case_profile_default_output_tokens_responses() -> None:
+    """Profile default output budget fills responses max_output_tokens."""
+    label = "profile default output tokens for responses"
+    profile = make_profile("responses-like", default_max_output_tokens=32768)
+    body = {"model": "qwen3.6", "input": [{"role": "user", "content": "hi"}]}
+    out = transform(body, profile, kind="responses")
+    if out.get("max_output_tokens") != 32768:
+        fail(label, f"expected max_output_tokens=32768, got {out.get('max_output_tokens')}")
+    ok(label, "default_max_output_tokens → max_output_tokens")
+
+
 def main() -> int:
     cases = [
         case_named_profile_no_signals,
@@ -291,6 +326,9 @@ def main() -> int:
         case_named_profile_client_effort_none_respected,
         case_no_max_tokens_injection,
         case_client_max_tokens_clamp_only,
+        case_profile_default_output_tokens_chat,
+        case_profile_default_output_tokens_respects_client,
+        case_profile_default_output_tokens_responses,
     ]
     print(f"Running {len(cases)} thinking-policy cases...")
     failed = 0
