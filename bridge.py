@@ -116,6 +116,15 @@ class UpstreamConfig:
     queue_timeout_s: float = 120.0
     # Watchdog: log a warning when a slot has been held this long.
     stuck_warn_s: float = 300.0
+    # First-byte timeout: abort/retry an upstream request that opens no
+    # response bytes. This protects the concurrency pool from requests
+    # stuck in dashboard phase=waiting forever.
+    first_byte_timeout_s: float = 120.0
+    # Reserved concurrency: low-priority profiles may only occupy
+    # `rate_limit_concurrent - reserved_priority_slots` slots. Profiles
+    # at or above the threshold can use the full pool.
+    reserved_priority_slots: int = 0
+    reserved_priority_threshold: int = 1
     # Model context window — used to cap the bumped `max_tokens` when
     # the bridge injects a thinking budget, so we don't push the
     # request past the model's limit (manifested as a 400
@@ -269,6 +278,9 @@ def _builtin_defaults() -> BridgeConfig:
         url="https://api.nan.builders/v1",
         rate_limit_rpm=1000,
         rate_limit_concurrent=5,
+        reserved_priority_slots=2,
+        reserved_priority_threshold=1,
+        first_byte_timeout_s=120.0,
         retry_max_attempts=3,
     )
     return BridgeConfig(
@@ -324,6 +336,8 @@ _SAMPLE_CONFIG_YAML = """\
 # Schema:
 #   upstreams: <name>: { url, rate_limit_rpm, rate_limit_concurrent,
 #                        queue_timeout_s, stuck_warn_s,
+#                        first_byte_timeout_s,
+#                        reserved_priority_slots, reserved_priority_threshold,
 #                        retry_max_attempts, retry_initial_wait,
 #                        retry_max_wait }
 #   profiles:  <name>: { upstream, features:[...], queue_priority,
@@ -360,6 +374,9 @@ upstreams:
     rate_limit_concurrent: 5
     queue_timeout_s: 120.0    # 503 if a request waits longer than this
     stuck_warn_s: 300.0       # watchdog logs slots held longer than this
+    first_byte_timeout_s: 120.0
+    reserved_priority_slots: 2
+    reserved_priority_threshold: 1
 
 profiles:
   default:
@@ -460,6 +477,9 @@ def _load_config() -> BridgeConfig:
             retry_max_wait=_coerce(body.get("retry_max_wait"), float, 20.0),
             queue_timeout_s=_coerce(body.get("queue_timeout_s"), float, 120.0),
             stuck_warn_s=_coerce(body.get("stuck_warn_s"), float, 300.0),
+            first_byte_timeout_s=_coerce(body.get("first_byte_timeout_s"), float, 120.0),
+            reserved_priority_slots=_coerce(body.get("reserved_priority_slots"), int, 0),
+            reserved_priority_threshold=_coerce(body.get("reserved_priority_threshold"), int, 1),
         )
     if not upstreams:
         upstreams = _builtin_defaults().upstreams
@@ -840,8 +860,7 @@ class _UpstreamGate:
         `rate_limit_rpm/60` per second.
       * Concurrency cap: max `rate_limit_concurrent` slots in flight.
       * Priority heap: when slots are saturated, waiters queue in
-        priority order. Higher number wins (`opencode`
-        use priority=10; `hermes` and `default` use priority=0).
+        priority order. Higher number wins.
 
     Per-slot state is a dict so the dashboard can show oldest-age and
     the watchdog can spot stuck slots. The whole thing is acquired
@@ -855,6 +874,10 @@ class _UpstreamGate:
         self.concurrent_limit = (
             cfg.rate_limit_concurrent if cfg.rate_limit_concurrent > 0 else 1024
         )
+        self.reserved_priority_slots = max(
+            0, min(cfg.reserved_priority_slots, self.concurrent_limit)
+        )
+        self.reserved_priority_threshold = cfg.reserved_priority_threshold
         self._in_flight: dict[int, dict] = {}
         self._waiters: list[_Waiter] = []
         self._lock = asyncio.Lock()
@@ -895,7 +918,7 @@ class _UpstreamGate:
         # the heap. Both must happen under the lock to avoid
         # double-grants when slots free at the same time.
         async with self._lock:
-            if len(self._in_flight) < self.concurrent_limit:
+            if len(self._in_flight) < self._capacity_for_priority(priority):
                 slot_id = next(self._slot_id_counter)
                 self._in_flight[slot_id] = {
                     "started": time.monotonic(),
@@ -968,9 +991,13 @@ class _UpstreamGate:
         """Hand a slot to the highest-priority queued waiter. Caller
         must hold `self._lock`."""
         while self._waiters:
-            nxt = heapq.heappop(self._waiters)
+            nxt = self._waiters[0]
             if nxt.future.cancelled():
+                heapq.heappop(self._waiters)
                 continue
+            if len(self._in_flight) >= self._capacity_for_priority(nxt.priority):
+                return
+            heapq.heappop(self._waiters)
             slot_id = next(self._slot_id_counter)
             self._in_flight[slot_id] = {
                 "started": time.monotonic(),
@@ -986,6 +1013,11 @@ class _UpstreamGate:
                 self._in_flight.pop(slot_id, None)
                 continue
 
+    def _capacity_for_priority(self, priority: int) -> int:
+        if priority >= self.reserved_priority_threshold:
+            return self.concurrent_limit
+        return max(0, self.concurrent_limit - self.reserved_priority_slots)
+
     def snapshot(self) -> dict[str, Any]:
         cur, _ = self.bucket.snapshot()
         now = time.monotonic()
@@ -997,10 +1029,13 @@ class _UpstreamGate:
             "rpm_remaining": round(cur, 1),
             "concurrent_limit": self.concurrent_limit,
             "concurrent_in_flight": len(self._in_flight),
+            "reserved_priority_slots": self.reserved_priority_slots,
+            "reserved_priority_threshold": self.reserved_priority_threshold,
             "queue_waiting": len(self._waiters),
             "oldest_in_flight_s": max(ages) if ages else 0.0,
             "queue_timeout_s": self.cfg.queue_timeout_s,
             "stuck_warn_s": self.cfg.stuck_warn_s,
+            "first_byte_timeout_s": self.cfg.first_byte_timeout_s,
         }
 
 
@@ -1130,6 +1165,48 @@ def _retry_policy(cfg: UpstreamConfig, *, enabled: bool = True) -> AsyncRetrying
         ),
         reraise=True,
     )
+
+
+async def _with_first_byte_timeout(
+    awaitable: Awaitable[Any],
+    cfg: UpstreamConfig,
+    *,
+    phase: str,
+) -> Any:
+    timeout_s = cfg.first_byte_timeout_s
+    if timeout_s <= 0:
+        return await awaitable
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout_s)
+    except asyncio.TimeoutError as exc:
+        raise httpx.ReadTimeout(
+            f"upstream {cfg.name} timed out waiting for first byte "
+            f"during {phase} after {timeout_s:.0f}s"
+        ) from exc
+
+
+async def _aiter_bytes_with_first_byte_timeout(
+    response: httpx.Response,
+    cfg: UpstreamConfig,
+) -> AsyncIterator[bytes]:
+    iterator = response.aiter_bytes().__aiter__()
+    timeout_s = cfg.first_byte_timeout_s
+    first = True
+    while True:
+        try:
+            if first and timeout_s > 0:
+                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=timeout_s)
+            else:
+                chunk = await iterator.__anext__()
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError as exc:
+            raise httpx.ReadTimeout(
+                f"upstream {cfg.name} timed out waiting for first byte "
+                f"after {timeout_s:.0f}s"
+            ) from exc
+        first = False
+        yield chunk
 
 
 # =============================================================================
@@ -1873,9 +1950,13 @@ async def _post_chat_payload(
                 async with _gated(profile):
                     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, read=None)) as client:
                         if profile.force_stream:
-                            response = await client.send(
-                                client.build_request("POST", url, json=request_body, headers=headers),
-                                stream=True,
+                            response = await _with_first_byte_timeout(
+                                client.send(
+                                    client.build_request("POST", url, json=request_body, headers=headers),
+                                    stream=True,
+                                ),
+                                cfg,
+                                phase="stream open",
                             )
                             last_status = response.status_code
                             if response.status_code in _RETRYABLE_STATUS:
@@ -1893,7 +1974,7 @@ async def _post_chat_payload(
                                     body_bytes.decode("utf-8", errors="ignore"),
                                 )
                             buf = bytearray()
-                            async for chunk in response.aiter_bytes():
+                            async for chunk in _aiter_bytes_with_first_byte_timeout(response, cfg):
                                 buf.extend(chunk)
                             await response.aclose()
                             assembled = _assemble_chat_sse(bytes(buf), request_body.get("model"))
@@ -2340,11 +2421,15 @@ async def _stream_responses(
                 slot_transferred = False
                 try:
                     client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=None))
-                    response = await client.send(
-                        client.build_request(
-                            "POST", upstream_url, json=body, headers=headers
+                    response = await _with_first_byte_timeout(
+                        client.send(
+                            client.build_request(
+                                "POST", upstream_url, json=body, headers=headers
+                            ),
+                            stream=True,
                         ),
-                        stream=True,
+                        cfg,
+                        phase="responses stream open",
                     )
                     if response.status_code in _RETRYABLE_STATUS:
                         body_bytes = await response.aread()
@@ -2380,6 +2465,9 @@ async def _stream_responses(
         body_text = getattr(exc, "body", str(exc))
         yield _sse_responses_error(status, body_text)
         return
+    except httpx.ReadTimeout as exc:
+        yield _sse_responses_error(504, str(exc))
+        return
 
     try:
         if response.status_code >= 400:
@@ -2391,7 +2479,7 @@ async def _stream_responses(
         chunk_count = 0
         byte_count = 0
         first_byte_at: float | None = None
-        async for chunk in response.aiter_bytes():
+        async for chunk in _aiter_bytes_with_first_byte_timeout(response, cfg):
             if not chunk:
                 continue
             chunk_count += 1
@@ -2484,6 +2572,9 @@ async def _stream_responses(
                     continue
 
                 yield _sse(payload)
+    except httpx.ReadTimeout as exc:
+        yield _sse_responses_error(504, str(exc))
+        return
     finally:
         try:
             await response.aclose()
@@ -2776,6 +2867,7 @@ class _StreamStalledError(RuntimeError):
 
 async def _iter_bytes_with_keepalive(
     response: httpx.Response,
+    cfg: UpstreamConfig,
 ) -> AsyncIterator[bytes]:
     """Wrap `response.aiter_bytes()` with a heartbeat so a slow/stalled
     upstream doesn't trip the client's chunk-inactivity timeout.
@@ -2792,6 +2884,8 @@ async def _iter_bytes_with_keepalive(
     """
     iterator = response.aiter_bytes().__aiter__()
     last_real_chunk = time.monotonic()
+    started = last_real_chunk
+    saw_first_byte = False
     buffer = bytearray()
 
     def pop_complete_event() -> bytes | None:
@@ -2805,14 +2899,23 @@ async def _iter_bytes_with_keepalive(
 
     while True:
         try:
-            chunk = await asyncio.wait_for(
-                iterator.__anext__(), timeout=_STREAM_KEEPALIVE_INTERVAL_S
+            timeout_s = (
+                cfg.first_byte_timeout_s
+                if not saw_first_byte and cfg.first_byte_timeout_s > 0
+                else _STREAM_KEEPALIVE_INTERVAL_S
             )
+            chunk = await asyncio.wait_for(iterator.__anext__(), timeout=timeout_s)
         except StopAsyncIteration:
             if buffer:
                 yield bytes(buffer)
             return
         except asyncio.TimeoutError:
+            if not saw_first_byte:
+                waited = time.monotonic() - started
+                raise httpx.ReadTimeout(
+                    f"upstream {cfg.name} timed out waiting for first byte "
+                    f"after {waited:.0f}s"
+                )
             silence = time.monotonic() - last_real_chunk
             if silence >= _STREAM_SILENCE_LIMIT_S:
                 raise _StreamStalledError(
@@ -2821,6 +2924,7 @@ async def _iter_bytes_with_keepalive(
             yield _SSE_KEEPALIVE
             continue
         last_real_chunk = time.monotonic()
+        saw_first_byte = True
         buffer.extend(chunk)
         while True:
             event = pop_complete_event()
@@ -2877,11 +2981,15 @@ async def _stream_chat_completions(
                 slot_transferred = False
                 try:
                     client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=None))
-                    response = await client.send(
-                        client.build_request(
-                            "POST", upstream_url, json=body, headers=headers
+                    response = await _with_first_byte_timeout(
+                        client.send(
+                            client.build_request(
+                                "POST", upstream_url, json=body, headers=headers
+                            ),
+                            stream=True,
                         ),
-                        stream=True,
+                        cfg,
+                        phase="chat stream open",
                     )
                     if response.status_code in _RETRYABLE_STATUS:
                         body_bytes = await response.aread()
@@ -2917,6 +3025,9 @@ async def _stream_chat_completions(
         body_text = getattr(exc, "body", str(exc))
         yield _sse_chat_error(status, body_text)
         return
+    except httpx.ReadTimeout as exc:
+        yield _sse_chat_error(504, str(exc))
+        return
 
     thinking_retry_allowed = not _client_already_disabled_thinking(body)
     do_tool_call_retry = profile.has("tool_call_args_retry") and thinking_retry_allowed
@@ -2937,7 +3048,7 @@ async def _stream_chat_completions(
             byte_count = 0
             first_byte_at: float | None = None
             try:
-                async for chunk in _iter_bytes_with_keepalive(response):
+                async for chunk in _iter_bytes_with_keepalive(response, cfg):
                     if not chunk:
                         continue
                     chunk_count += 1
@@ -2967,7 +3078,7 @@ async def _stream_chat_completions(
                                 record = _extract_usage(profile.name, model_hint, payload)
                                 if record:
                                     _broadcast_usage(record)
-            except _StreamStalledError as exc:
+            except (_StreamStalledError, httpx.ReadTimeout) as exc:
                 yield _sse_chat_error(504, str(exc))
             return
 
@@ -3010,7 +3121,7 @@ async def _stream_chat_completions(
             return b""
 
         try:
-            async for chunk in _iter_bytes_with_keepalive(response):
+            async for chunk in _iter_bytes_with_keepalive(response, cfg):
                 if not chunk:
                     continue
                 chunk_count += 1
@@ -3078,7 +3189,7 @@ async def _stream_chat_completions(
                     # Move held bytes into the full buffer; nothing emitted.
                     upstream_buffer.extend(held_bytes)
                     held_bytes = bytearray()
-        except _StreamStalledError as exc:
+        except (_StreamStalledError, httpx.ReadTimeout) as exc:
             yield _sse_chat_error(504, str(exc))
             return
 
@@ -3993,6 +4104,9 @@ def _dump_config_yaml(cfg: BridgeConfig) -> str:
             "rate_limit_concurrent": u.rate_limit_concurrent,
             "queue_timeout_s": u.queue_timeout_s,
             "stuck_warn_s": u.stuck_warn_s,
+            "first_byte_timeout_s": u.first_byte_timeout_s,
+            "reserved_priority_slots": u.reserved_priority_slots,
+            "reserved_priority_threshold": u.reserved_priority_threshold,
             "retry_max_attempts": u.retry_max_attempts,
             "retry_initial_wait": u.retry_initial_wait,
             "retry_max_wait": u.retry_max_wait,
@@ -4180,6 +4294,9 @@ async def config_get() -> dict:
                 "rate_limit_concurrent": u.rate_limit_concurrent,
                 "queue_timeout_s": u.queue_timeout_s,
                 "stuck_warn_s": u.stuck_warn_s,
+                "first_byte_timeout_s": u.first_byte_timeout_s,
+                "reserved_priority_slots": u.reserved_priority_slots,
+                "reserved_priority_threshold": u.reserved_priority_threshold,
             }
             for u in CONFIG.upstreams.values()
         ],
@@ -5696,10 +5813,15 @@ def _dashboard_html() -> str:
         const oldestStr = oldest > 0 ? `${{oldest.toFixed(1)}}s` : '—';
         const rpmRemaining = Number(u.rpm_remaining || 0);
         const rpmCap = Number(u.rpm_capacity || 0);
+        const reserved = Number(u.reserved_priority_slots || 0);
+        const threshold = Number(u.reserved_priority_threshold || 1);
+        const slotTitle = reserved > 0
+          ? `${{reserved}} slots reserved for priority >= ${{threshold}}`
+          : 'no priority reservation';
         return `<tr><td>${{escapeHtml(u.name)}}</td>` +
           `<td><code>${{escapeHtml(u.url)}}</code></td>` +
           `<td><span class="status-pill ${{stateCls}}">${{state}}</span></td>` +
-          `<td class="num">${{inFlight}}/${{cap}}</td>` +
+          `<td class="num" title="${{escapeHtml(slotTitle)}}">${{inFlight}}/${{cap}}${{reserved > 0 ? ` · r${{reserved}}` : ''}}</td>` +
           `<td class="num ${{waiting > 0 ? 'lat-mid' : ''}}">${{waiting}}</td>` +
           `<td class="num">${{fmtRate(rpmRemaining)}}/${{fmt(rpmCap)}}</td>` +
           `<td class="num ${{oldestCls}}">${{oldestStr}}</td>` +

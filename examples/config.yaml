@@ -3,6 +3,9 @@ upstreams:
     url: "https://api.nan.builders/v1"
     rate_limit_rpm: 1000
     rate_limit_concurrent: 5
+    reserved_priority_slots: 2
+    reserved_priority_threshold: 1
+    first_byte_timeout_s: 120.0
     queue_timeout_s: 1200.0
     stuck_warn_s: 1200.0
 

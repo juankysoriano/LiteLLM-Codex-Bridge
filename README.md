@@ -68,12 +68,19 @@ Each upstream has a rate/concurrency gate:
 
 - `rate_limit_rpm`
 - `rate_limit_concurrent`
+- `reserved_priority_slots`
+- `reserved_priority_threshold`
+- `first_byte_timeout_s`
 - `queue_timeout_s`
 - `stuck_warn_s`
 
 When the upstream is saturated, requests wait in an internal priority queue instead of failing immediately. Higher `queue_priority` profiles go first.
 
 This is useful when the upstream has limits such as `1000 rpm` and `5` parallel requests. You can let interactive clients jump ahead of batch jobs while still keeping background work queued.
+
+`reserved_priority_slots` keeps part of the concurrency pool unavailable to low-priority profiles. For example, with `rate_limit_concurrent: 5`, `reserved_priority_slots: 2`, and `reserved_priority_threshold: 1`, priority `0` work can use at most 3 slots while priority `1+` can use all 5.
+
+`first_byte_timeout_s` aborts and retries requests that never produce upstream bytes. This prevents “waiting / 0 chunks / 0 bytes” calls from holding a slot indefinitely.
 
 ## Quick Start
 
@@ -126,6 +133,9 @@ upstreams:
     url: "https://api.nan.builders/v1"
     rate_limit_rpm: 1000
     rate_limit_concurrent: 5
+    reserved_priority_slots: 2
+    reserved_priority_threshold: 1
+    first_byte_timeout_s: 120.0
     queue_timeout_s: 1200.0
     stuck_warn_s: 1200.0
 
