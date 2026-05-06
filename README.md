@@ -4,6 +4,8 @@ NaN LLM Bridge is a local OpenAI-compatible proxy for routing multiple clients t
 
 It is meant to be a practical compatibility layer: point clients at `localhost:4242`, give each client or workload a profile, and let the bridge handle the small but important differences between what clients send and what the upstream expects.
 
+![NaN LLM Bridge dashboard](docs/dashboard.png)
+
 ```text
 http://localhost:4242/v1                  # default profile
 http://localhost:4242/myproject/v1        # example profile
