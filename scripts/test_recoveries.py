@@ -92,7 +92,14 @@ async def _serve_canned(path: str, request: Request):
     response = q.popleft()
     if isinstance(response, dict) and "stream_events" in response:
         async def event_stream():
-            for event in response["stream_events"]:
+            for item in response["stream_events"]:
+                delay_s = 0.0
+                event = item
+                if isinstance(item, dict) and "event" in item:
+                    event = item["event"]
+                    delay_s = float(item.get("delay_s") or 0.0)
+                if delay_s > 0:
+                    await asyncio.sleep(delay_s)
                 yield f"data: {json.dumps(event)}\n\n".encode("utf-8")
             yield b"data: [DONE]\n\n"
         return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -711,6 +718,80 @@ def case_xml_tool_residue_retry_stream(t: TestState) -> None:
     t.assert_recovery(label, label + " (stream)")
 
 
+def case_reasoning_content_stream_passthrough(t: TestState) -> None:
+    """Benign reasoning_content should reach the client before final content.
+
+    This protects the Gemma path where the upstream streams thought as
+    `delta.reasoning_content`/`delta.reasoning` and only later emits final
+    `delta.content`.
+    """
+    t.reset_mock()
+    t.queue("/v1/chat/completions", {
+        "stream_events": [
+            {
+                "id": "chatcmpl_reasoning_stream",
+                "object": "chat.completion.chunk",
+                "model": "test-model",
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl_reasoning_stream",
+                "object": "chat.completion.chunk",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"reasoning_content": "thinking live"},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "delay_s": 1.0,
+                "event": {
+                    "id": "chatcmpl_reasoning_stream",
+                    "object": "chat.completion.chunk",
+                    "model": "test-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "final answer"},
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+            },
+            {
+                "id": "chatcmpl_reasoning_stream",
+                "object": "chat.completion.chunk",
+                "model": "test-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+            },
+        ],
+    })
+    body = {
+        "model": "test-model",
+        "stream": True,
+        "messages": [{"role": "user", "content": "think briefly"}],
+    }
+    start = time.monotonic()
+    with httpx.stream("POST", f"{t.bridge}/test/v1/chat/completions", json=body, timeout=10) as r:
+        r.raise_for_status()
+        chunks = r.iter_text()
+        first = next(chunks)
+        first_elapsed = time.monotonic() - start
+        text = first + "".join(chunks)
+
+    if first_elapsed >= 0.5:
+        raise AssertionError(
+            f"reasoning_content was buffered for {first_elapsed:.2f}s instead of streaming early"
+        )
+    assert "thinking live" in first, first
+    assert "final answer" in text, text
+    print("  ✓ reasoning_content passthrough: thought streamed before final content")
+
+
 def case_tool_call_args_retry_nonstream(t: TestState) -> None:
     """Non-streaming chat/completions: model returns write_file with
     only `path`, missing required `content`. Bridge retries with
@@ -983,6 +1064,7 @@ def main() -> int:
             case_empty_with_stop_retry(t)
             case_xml_tool_residue_retry_nonstream(t)
             case_xml_tool_residue_retry_stream(t)
+            case_reasoning_content_stream_passthrough(t)
             case_tool_call_args_retry_nonstream(t)
             case_tool_call_args_retry_skips_when_client_disabled(t)
             case_tool_call_args_retry_failed_retry_passthrough(t)

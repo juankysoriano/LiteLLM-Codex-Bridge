@@ -730,6 +730,34 @@ def _delta_has_xml_tool_residue(delta: Any) -> bool:
     return False
 
 
+def _has_streamable_reasoning_delta(delta: Any) -> bool:
+    """Return True when a chat-completions delta carries thought text.
+
+    NaN/Gemma has changed this surface over time: some deployments put
+    visible thought in `reasoning_content`, others in `reasoning`, and
+    some providers may wrap reasoning in provider-specific fields. If we
+    do not treat these as streamable output, the bridge holds thought
+    chunks while waiting for final `content`.
+    """
+    if not isinstance(delta, dict):
+        return False
+    for key in ("reasoning_content", "reasoning"):
+        value = delta.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, (dict, list)) and value:
+            return True
+    fields = delta.get("provider_specific_fields")
+    if isinstance(fields, dict):
+        for key in ("reasoning_content", "reasoning"):
+            value = fields.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+            if isinstance(value, (dict, list)) and value:
+                return True
+    return False
+
+
 def _clean_visible_content(message: dict) -> str:
     content = message.get("content")
     if not isinstance(content, str):
@@ -3379,6 +3407,9 @@ async def _stream_chat_completions(
         #   - As soon as we see a non-empty `delta.content` text event,
         #     switch to passthrough mode (model committed to a
         #     conversational reply; tool_call retry doesn't apply).
+        #   - As soon as we see non-empty reasoning text, also switch
+        #     to passthrough. Current Gemma can stream thought as
+        #     `reasoning_content`/`reasoning` before final content.
         #   - If neither is seen by the time `finish_reason` arrives,
         #     flush the held bytes and emit the rest passthrough.
         #
@@ -3459,6 +3490,9 @@ async def _stream_chat_completions(
                                 break
                             if do_tool_call_retry and delta.get("tool_calls"):
                                 decision = DECISION_BUFFER
+                                break
+                            if _has_streamable_reasoning_delta(delta):
+                                decision = DECISION_PASSTHROUGH
                                 break
                             content = delta.get("content")
                             if isinstance(content, str) and content.strip():
@@ -6561,6 +6595,7 @@ def _dashboard_html() -> str:
        Profile editor
        ======================================================================== */
     let editorState = null;  // {{profiles: [...], originals: Map<name,obj>, upstreams, available_features, default_profile}}
+    let openProfileNames = null;  // null means initial page load: start collapsed
     const editorStatus = $('editor-status');
 
     function setStatus(text, kind) {{
@@ -6628,8 +6663,21 @@ def _dashboard_html() -> str:
       }};
     }}
 
-    async function loadEditor() {{
+    function captureOpenProfiles() {{
+      const root = $('profile-editor');
+      if (!root) return;
+      const rows = [...root.querySelectorAll('.profile-row')];
+      if (!rows.length) return;
+      openProfileNames = new Set(
+        rows.filter((row) => row.open)
+          .map((row) => row.dataset.profileName)
+          .filter(Boolean)
+      );
+    }}
+
+    async function loadEditor(opts = {{}}) {{
       try {{
+        if (opts.preserveOpen) captureOpenProfiles();
         const r = await fetch('/config');
         if (!r.ok) throw new Error('config returned ' + r.status);
         const d = await r.json();
@@ -6644,6 +6692,10 @@ def _dashboard_html() -> str:
           thinking_effort_options: d.thinking_effort_options || ['low', 'medium', 'high', 'xhigh'],
           default_profile: d.default_profile,
         }};
+        if (opts.openProfile) {{
+          if (!openProfileNames) openProfileNames = new Set();
+          openProfileNames.add(opts.openProfile);
+        }}
         renderEditor();
       }} catch (e) {{
         setStatus('failed to load config: ' + (e?.message || e), 'err');
@@ -6708,8 +6760,13 @@ def _dashboard_html() -> str:
     function renderEditor() {{
       if (!editorState) return;
       const root = $('profile-editor');
+      captureOpenProfiles();
       const html = editorState.profiles.map((prof, idx) => {{
         const dirty = isDirty(prof);
+        const shouldOpen = prof.isNew ||
+          (openProfileNames
+            ? openProfileNames.has(prof.name)
+            : false);
         const selected = (val) => prof.upstream === val ? 'selected' : '';
         const upstreamSel = editorState.upstreams.map((u) =>
           `<option value="${{escapeHtml(u)}}" ${{selected(u)}}>${{escapeHtml(u)}}</option>`
@@ -6730,7 +6787,7 @@ def _dashboard_html() -> str:
             `<button class="pf-alias-del" data-idx="${{idx}}" data-alias-del="${{ai}}" type="button">×</button>` +
           `</div>`
         ).join('');
-        return `<details class="profile-row ${{dirty ? 'dirty' : ''}}" data-idx="${{idx}}" ${{prof.isNew || prof.name === editorState.default_profile ? 'open' : ''}}>` +
+        return `<details class="profile-row ${{dirty ? 'dirty' : ''}}" data-idx="${{idx}}" data-profile-name="${{escapeHtml(prof.name)}}" ${{shouldOpen ? 'open' : ''}}>` +
           `<summary class="pf-head">` +
             (prof.isNew
               ? `<span class="pf-name"><input data-idx="${{idx}}" data-key="name" value="${{escapeHtml(prof.name)}}" placeholder="profile name"></span>`
@@ -6917,7 +6974,7 @@ def _dashboard_html() -> str:
         const d = await r.json().catch(() => ({{}}));
         if (!r.ok) throw new Error(d.error || ('save returned ' + r.status));
         fadeStatus(`saved ${{trimmedName}}`, 'ok');
-        await loadEditor();
+        await loadEditor({{ preserveOpen: true, openProfile: trimmedName }});
       }} catch (e) {{
         setStatus(`save failed: ${{e?.message || e}}`, 'err');
       }}
