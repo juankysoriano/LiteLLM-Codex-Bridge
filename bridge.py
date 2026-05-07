@@ -119,7 +119,7 @@ class UpstreamConfig:
     # First-byte timeout: abort/retry an upstream request that opens no
     # response bytes. This protects the concurrency pool from requests
     # stuck in dashboard phase=waiting forever.
-    first_byte_timeout_s: float = 120.0
+    first_byte_timeout_s: float = 60.0
     # Reserved concurrency: low-priority profiles may only occupy
     # `rate_limit_concurrent - reserved_priority_slots` slots. Profiles
     # at or above the threshold can use the full pool.
@@ -233,6 +233,7 @@ class ProfileConfig:
     # output has been emitted yet.
     auto_retries: bool = True
     force_stream: bool = True
+    model_fallback_enabled: bool = False
 
     def has(self, feature: str) -> bool:
         return feature in self.features
@@ -280,7 +281,7 @@ def _builtin_defaults() -> BridgeConfig:
         rate_limit_concurrent=5,
         reserved_priority_slots=2,
         reserved_priority_threshold=1,
-        first_byte_timeout_s=120.0,
+        first_byte_timeout_s=60.0,
         retry_max_attempts=3,
     )
     return BridgeConfig(
@@ -304,6 +305,7 @@ def _builtin_defaults() -> BridgeConfig:
                 default_max_output_tokens=None,
                 auto_retries=True,
                 force_stream=True,
+                model_fallback_enabled=False,
                 queue_priority=0,  # background / unknown
             ),
             "myproject": ProfileConfig(
@@ -321,6 +323,7 @@ def _builtin_defaults() -> BridgeConfig:
                 default_max_output_tokens=None,
                 auto_retries=True,
                 force_stream=True,
+                model_fallback_enabled=False,
                 queue_priority=5,
             ),
         },
@@ -342,7 +345,8 @@ _SAMPLE_CONFIG_YAML = """\
 #                        retry_max_wait }
 #   profiles:  <name>: { upstream, features:[...], queue_priority,
 #                        thinking_enabled, default_thinking_budget,
-#                        default_max_output_tokens, model_aliases:{...} }
+#                        default_max_output_tokens, model_aliases:{...},
+#                        model_fallback_enabled }
 #   default_profile: <name>      # which profile catches /v1/... (no prefix)
 #
 # Thinking policy:
@@ -374,7 +378,7 @@ upstreams:
     rate_limit_concurrent: 5
     queue_timeout_s: 120.0    # 503 if a request waits longer than this
     stuck_warn_s: 300.0       # watchdog logs slots held longer than this
-    first_byte_timeout_s: 120.0
+    first_byte_timeout_s: 60.0
     reserved_priority_slots: 2
     reserved_priority_threshold: 1
 
@@ -382,6 +386,7 @@ profiles:
   default:
     upstream: nan
     queue_priority: 0
+    model_fallback_enabled: false
     # default_max_output_tokens: 32768
     features:
       - model_sampling_defaults
@@ -395,6 +400,7 @@ profiles:
   myproject:
     upstream: nan
     queue_priority: 5
+    model_fallback_enabled: false
     # Example profile for one client/project. Rename it locally as needed.
     # http://127.0.0.1:4242/myproject/v1/chat/completions
     features:
@@ -408,6 +414,11 @@ profiles:
 
 default_profile: default
 """
+
+
+MODEL_HEALTH_MODELS = FORCE_MODEL_OPTIONS
+MODEL_HEALTH_INTERVAL_S = float(os.environ.get("BRIDGE_MODEL_HEALTH_INTERVAL_S", "60"))
+MODEL_HEALTH_TIMEOUT_S = float(os.environ.get("BRIDGE_MODEL_HEALTH_TIMEOUT_S", "30"))
 
 
 def _coerce(value: Any, kind: type, default: Any) -> Any:
@@ -477,7 +488,7 @@ def _load_config() -> BridgeConfig:
             retry_max_wait=_coerce(body.get("retry_max_wait"), float, 20.0),
             queue_timeout_s=_coerce(body.get("queue_timeout_s"), float, 120.0),
             stuck_warn_s=_coerce(body.get("stuck_warn_s"), float, 300.0),
-            first_byte_timeout_s=_coerce(body.get("first_byte_timeout_s"), float, 120.0),
+            first_byte_timeout_s=_coerce(body.get("first_byte_timeout_s"), float, 60.0),
             reserved_priority_slots=_coerce(body.get("reserved_priority_slots"), int, 0),
             reserved_priority_threshold=_coerce(body.get("reserved_priority_threshold"), int, 1),
         )
@@ -602,6 +613,7 @@ def _load_config() -> BridgeConfig:
             queue_priority=_coerce(body.get("queue_priority"), int, 0),
             auto_retries=bool(body.get("auto_retries", True)),
             force_stream=bool(body.get("force_stream", True)),
+            model_fallback_enabled=bool(body.get("model_fallback_enabled", False)),
         )
     if not profiles:
         profiles = _builtin_defaults().profiles
@@ -1207,6 +1219,238 @@ async def _aiter_bytes_with_first_byte_timeout(
             ) from exc
         first = False
         yield chunk
+
+
+_MODEL_HEALTH: dict[str, dict[str, dict[str, Any]]] = {}
+
+
+def _model_health_auth_header() -> dict[str, str] | None:
+    key = (
+        os.environ.get("X_NAN_KEY")
+        or os.environ.get("NAN_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or _read_auth_key_from_env_file()
+    )
+    if not key:
+        return None
+    return {"authorization": f"Bearer {key}"}
+
+
+def _read_auth_key_from_env_file() -> str | None:
+    env_path = os.environ.get("BRIDGE_AUTH_ENV_PATH")
+    if not env_path:
+        return None
+    try:
+        for line in Path(env_path).read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            if key in {"X_NAN_KEY", "NAN_API_KEY", "OPENAI_API_KEY"}:
+                return value.strip().strip('"').strip("'")
+    except OSError:
+        return None
+    return None
+
+
+def _model_health_snapshot() -> dict[str, dict[str, dict[str, Any]]]:
+    return {
+        upstream: {model: dict(status) for model, status in models.items()}
+        for upstream, models in _MODEL_HEALTH.items()
+    }
+
+
+def _is_model_active(upstream: str, model: str | None) -> bool:
+    if not isinstance(model, str):
+        return False
+    status = _MODEL_HEALTH.get(upstream, {}).get(model)
+    return bool(status and status.get("active") is True)
+
+
+def _is_model_inactive(upstream: str, model: str | None) -> bool:
+    if not isinstance(model, str):
+        return False
+    status = _MODEL_HEALTH.get(upstream, {}).get(model)
+    return bool(status and status.get("active") is False)
+
+
+def _active_fallback_model(profile: ProfileConfig, current_model: str | None) -> str | None:
+    if not profile.model_fallback_enabled or not isinstance(current_model, str):
+        return None
+    for candidate in MODEL_HEALTH_MODELS:
+        if candidate != current_model and _is_model_active(profile.upstream, candidate):
+            return candidate
+    return None
+
+
+def _apply_model_health_fallback(body: dict, profile: ProfileConfig) -> tuple[str | None, str | None]:
+    current = body.get("model")
+    if not isinstance(current, str):
+        return None, None
+    if not _is_model_inactive(profile.upstream, current):
+        return current, None
+    fallback = _active_fallback_model(profile, current)
+    if fallback:
+        body["model"] = fallback
+        return current, fallback
+    return current, None
+
+
+def _mark_model_inactive(upstream: str, model: str | None, reason: str) -> None:
+    if not isinstance(model, str) or not model:
+        return
+    _MODEL_HEALTH.setdefault(upstream, {})[model] = {
+        "active": False,
+        "checked_at": time.time(),
+        "latency_s": None,
+        "status": None,
+        "error": reason[:200],
+    }
+
+
+def _request_allows_runtime_model_fallback(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.ReadTimeout):
+        return True
+    if isinstance(exc, _UpstreamHTTPError):
+        return exc.status in _RETRYABLE_STATUS
+    if isinstance(exc, RetryError):
+        cause = exc.last_attempt.exception()
+        return bool(cause and _request_allows_runtime_model_fallback(cause))
+    return False
+
+
+def _apply_runtime_model_fallback(
+    body: dict,
+    profile: ProfileConfig,
+    exc: BaseException,
+    attempted_fallbacks: set[str],
+) -> str | None:
+    if not profile.model_fallback_enabled or not _request_allows_runtime_model_fallback(exc):
+        return None
+    current = body.get("model")
+    if not isinstance(current, str) or current in attempted_fallbacks:
+        return None
+    fallback = _active_fallback_model(profile, current)
+    if not fallback or fallback in attempted_fallbacks:
+        return None
+    attempted_fallbacks.add(current)
+    _mark_model_inactive(profile.upstream, current, str(exc))
+    body["model"] = fallback
+    print(
+        f"[model-fallback] profile={profile.name} upstream={profile.upstream} "
+        f"model={current} fallback={fallback} reason={type(exc).__name__}",
+        flush=True,
+    )
+    return fallback
+
+
+async def _probe_model_health(upstream: UpstreamConfig, model: str) -> dict[str, Any]:
+    headers = _model_health_auth_header()
+    if headers is None:
+        return {
+            "active": False,
+            "checked_at": time.time(),
+            "latency_s": None,
+            "status": None,
+            "error": "missing health-check auth env",
+        }
+    headers = {
+        **headers,
+        "content-type": "application/json",
+        "accept": "text/event-stream",
+        "accept-encoding": "identity",
+    }
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 8,
+        "stream": True,
+        "stream_options": {"include_usage": False},
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+    }
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(MODEL_HEALTH_TIMEOUT_S, read=None)
+        ) as client:
+            response = await asyncio.wait_for(
+                client.send(
+                    client.build_request(
+                        "POST",
+                        f"{upstream.url}/chat/completions",
+                        json=body,
+                        headers=headers,
+                    ),
+                    stream=True,
+                ),
+                timeout=MODEL_HEALTH_TIMEOUT_S,
+            )
+            try:
+                if response.status_code >= 400:
+                    body_bytes = await response.aread()
+                    return {
+                        "active": False,
+                        "checked_at": time.time(),
+                        "latency_s": round(time.monotonic() - started, 3),
+                        "status": response.status_code,
+                        "error": body_bytes.decode("utf-8", errors="ignore")[:200],
+                    }
+                iterator = response.aiter_bytes().__aiter__()
+                await asyncio.wait_for(iterator.__anext__(), timeout=MODEL_HEALTH_TIMEOUT_S)
+                return {
+                    "active": True,
+                    "checked_at": time.time(),
+                    "latency_s": round(time.monotonic() - started, 3),
+                    "status": response.status_code,
+                    "error": None,
+                }
+            finally:
+                await response.aclose()
+    except Exception as exc:
+        return {
+            "active": False,
+            "checked_at": time.time(),
+            "latency_s": round(time.monotonic() - started, 3),
+            "status": None,
+            "error": str(exc)[:200],
+        }
+
+
+async def _model_health_loop() -> None:
+    while True:
+        try:
+            checks = []
+            keys = []
+            for upstream in CONFIG.upstreams.values():
+                for model in MODEL_HEALTH_MODELS:
+                    keys.append((upstream.name, model))
+                    checks.append(_probe_model_health(upstream, model))
+            results = await asyncio.gather(*checks, return_exceptions=True)
+            for (upstream_name, model), result in zip(keys, results):
+                if isinstance(result, Exception):
+                    status = {
+                        "active": False,
+                        "checked_at": time.time(),
+                        "latency_s": None,
+                        "status": None,
+                        "error": str(result)[:200],
+                    }
+                else:
+                    status = result
+                _MODEL_HEALTH.setdefault(upstream_name, {})[model] = status
+                state = "active" if status.get("active") else "inactive"
+                print(
+                    f"[model-health] upstream={upstream_name} model={model} "
+                    f"state={state} latency={status.get('latency_s')} "
+                    f"status={status.get('status')}",
+                    flush=True,
+                )
+            await asyncio.sleep(MODEL_HEALTH_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            print(f"[model-health] error: {exc!r}", flush=True)
+            await asyncio.sleep(MODEL_HEALTH_INTERVAL_S)
 
 
 # =============================================================================
@@ -1874,6 +2118,13 @@ def _apply_request_transforms(body: dict, profile: ProfileConfig, kind: str) -> 
         resolved = profile.resolve_model(original)
         if isinstance(resolved, str) and resolved != original:
             body["model"] = resolved
+    original_model, fallback_model = _apply_model_health_fallback(body, profile)
+    if fallback_model:
+        print(
+            f"[model-fallback] profile={profile.name} upstream={profile.upstream} "
+            f"model={original_model} fallback={fallback_model} reason=health-inactive",
+            flush=True,
+        )
     if profile.force_stream:
         _force_stream(body, kind)
     if profile.has("effort_to_thinking_budget"):
@@ -1944,53 +2195,63 @@ async def _post_chat_payload(
         request_body.pop("stream_options", None)
     last_status = 502
     last_payload: dict = {"error": {"message": "unreachable"}}
+    attempted_fallbacks: set[str] = set()
     try:
-        async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
-            with attempt:
-                async with _gated(profile):
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, read=None)) as client:
-                        if profile.force_stream:
-                            response = await _with_first_byte_timeout(
-                                client.send(
-                                    client.build_request("POST", url, json=request_body, headers=headers),
-                                    stream=True,
-                                ),
-                                cfg,
-                                phase="stream open",
-                            )
-                            last_status = response.status_code
-                            if response.status_code in _RETRYABLE_STATUS:
-                                body_bytes = await response.aread()
-                                await response.aclose()
-                                raise _UpstreamHTTPError(
-                                    response.status_code,
-                                    body_bytes.decode("utf-8", errors="ignore"),
-                                )
-                            if response.status_code >= 400:
-                                body_bytes = await response.aread()
-                                await response.aclose()
-                                return response.status_code, _parse_upstream_error(
-                                    response.status_code,
-                                    body_bytes.decode("utf-8", errors="ignore"),
-                                )
-                            buf = bytearray()
-                            async for chunk in _aiter_bytes_with_first_byte_timeout(response, cfg):
-                                buf.extend(chunk)
-                            await response.aclose()
-                            assembled = _assemble_chat_sse(bytes(buf), request_body.get("model"))
-                            return response.status_code, assembled["payload"]
-                        r = await client.post(url, json=request_body, headers=headers)
-                last_status = r.status_code
-                if r.status_code in _RETRYABLE_STATUS:
-                    raise _UpstreamHTTPError(r.status_code, r.text)
-                if r.status_code >= 400:
-                    return r.status_code, _parse_upstream_error(r.status_code, r.text)
-                payload = (
-                    r.json()
-                    if r.headers.get("content-type", "").startswith("application/json")
-                    else {}
+        while True:
+            try:
+                async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
+                    with attempt:
+                        async with _gated(profile):
+                            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, read=None)) as client:
+                                if profile.force_stream:
+                                    response = await _with_first_byte_timeout(
+                                        client.send(
+                                            client.build_request("POST", url, json=request_body, headers=headers),
+                                            stream=True,
+                                        ),
+                                        cfg,
+                                        phase="stream open",
+                                    )
+                                    last_status = response.status_code
+                                    if response.status_code in _RETRYABLE_STATUS:
+                                        body_bytes = await response.aread()
+                                        await response.aclose()
+                                        raise _UpstreamHTTPError(
+                                            response.status_code,
+                                            body_bytes.decode("utf-8", errors="ignore"),
+                                        )
+                                    if response.status_code >= 400:
+                                        body_bytes = await response.aread()
+                                        await response.aclose()
+                                        return response.status_code, _parse_upstream_error(
+                                            response.status_code,
+                                            body_bytes.decode("utf-8", errors="ignore"),
+                                        )
+                                    buf = bytearray()
+                                    async for chunk in _aiter_bytes_with_first_byte_timeout(response, cfg):
+                                        buf.extend(chunk)
+                                    await response.aclose()
+                                    assembled = _assemble_chat_sse(bytes(buf), request_body.get("model"))
+                                    return response.status_code, assembled["payload"]
+                                r = await client.post(url, json=request_body, headers=headers)
+                        last_status = r.status_code
+                        if r.status_code in _RETRYABLE_STATUS:
+                            raise _UpstreamHTTPError(r.status_code, r.text)
+                        if r.status_code >= 400:
+                            return r.status_code, _parse_upstream_error(r.status_code, r.text)
+                        payload = (
+                            r.json()
+                            if r.headers.get("content-type", "").startswith("application/json")
+                            else {}
+                        )
+                        return r.status_code, payload
+            except (RetryError, _UpstreamHTTPError, httpx.ReadTimeout) as exc:
+                fallback = _apply_runtime_model_fallback(
+                    request_body, profile, exc, attempted_fallbacks
                 )
-                return r.status_code, payload
+                if fallback:
+                    continue
+                raise
     except _QueueTimeout as exc:
         return 503, {"error": {"message": str(exc), "retry_after_s": 10}}
     except (RetryError, _UpstreamHTTPError):
@@ -2403,46 +2664,59 @@ async def _stream_responses(
         # Slot is acquired manually so it can be held for the whole
         # SSE body (see `_acquire_gate_slot`). Released on retryable
         # errors here; ownership transfers to the caller on success.
-        async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
-            with attempt:
-                gate, slot_id = await _acquire_gate_slot(
-                    profile, path="/v1/responses"
-                )
-                await gate.update_slot(
-                    slot_id,
-                    model=str(model_hint) if model_hint else None,
-                    method="POST",
-                    stream=True,
-                    phase="connecting",
-                    params=_inspect_thinking_params(body, "responses"),
-                    chunks=0,
-                    bytes=0,
-                )
-                slot_transferred = False
-                try:
-                    client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=None))
-                    response = await _with_first_byte_timeout(
-                        client.send(
-                            client.build_request(
-                                "POST", upstream_url, json=body, headers=headers
-                            ),
-                            stream=True,
-                        ),
-                        cfg,
-                        phase="responses stream open",
-                    )
-                    if response.status_code in _RETRYABLE_STATUS:
-                        body_bytes = await response.aread()
-                        await response.aclose()
-                        await client.aclose()
-                        raise _UpstreamHTTPError(
-                            response.status_code, body_bytes.decode("utf-8", errors="ignore")
+        nonlocal model_hint
+        attempted_fallbacks: set[str] = set()
+        while True:
+            try:
+                async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
+                    with attempt:
+                        gate, slot_id = await _acquire_gate_slot(
+                            profile, path="/v1/responses"
                         )
-                    slot_transferred = True
-                    return client, response, gate, slot_id
-                finally:
-                    if not slot_transferred:
-                        await gate.release(slot_id)
+                        await gate.update_slot(
+                            slot_id,
+                            model=str(model_hint) if model_hint else None,
+                            method="POST",
+                            stream=True,
+                            phase="connecting",
+                            params=_inspect_thinking_params(body, "responses"),
+                            chunks=0,
+                            bytes=0,
+                        )
+                        slot_transferred = False
+                        try:
+                            client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=None))
+                            response = await _with_first_byte_timeout(
+                                client.send(
+                                    client.build_request(
+                                        "POST", upstream_url, json=body, headers=headers
+                                    ),
+                                    stream=True,
+                                ),
+                                cfg,
+                                phase="responses stream open",
+                            )
+                            if response.status_code in _RETRYABLE_STATUS:
+                                body_bytes = await response.aread()
+                                await response.aclose()
+                                await client.aclose()
+                                raise _UpstreamHTTPError(
+                                    response.status_code, body_bytes.decode("utf-8", errors="ignore")
+                                )
+                            slot_transferred = True
+                            return client, response, gate, slot_id
+                        finally:
+                            if not slot_transferred:
+                                await gate.release(slot_id)
+            except (RetryError, _UpstreamHTTPError, httpx.ReadTimeout) as exc:
+                fallback = _apply_runtime_model_fallback(
+                    body, profile, exc, attempted_fallbacks
+                )
+                if fallback:
+                    model_hint = fallback
+                    state["model"] = fallback
+                    continue
+                raise
         raise RuntimeError("unreachable")  # pragma: no cover
 
     try:
@@ -2852,11 +3126,12 @@ _SSE_KEEPALIVE = b": keepalive\n\n"
 # stay safely under client-side chunk timeouts (opencode default 30s, others
 # usually similar) so the client never sees inactivity.
 _STREAM_KEEPALIVE_INTERVAL_S = 15.0
-# How long the upstream may go silent in total before we give up. Distinct
-# from connect/idle limits in `httpx.Timeout`: we want to keep streams alive
-# through long thinking pauses (heavy reasoning models can sit silent for a
-# minute mid-tool-call) but a 5-minute black hole is a dead connection.
-_STREAM_SILENCE_LIMIT_S = 300.0
+    # How long the upstream may go silent in total before we give up. Distinct
+# from connect/idle limits in `httpx.Timeout`: we keep client-visible
+# heartbeats flowing, but if the upstream produces no real SSE event for
+# a full minute, abort so model fallback can recover before a slot is
+# held indefinitely.
+_STREAM_SILENCE_LIMIT_S = 60.0
 
 
 class _StreamStalledError(RuntimeError):
@@ -2963,46 +3238,59 @@ async def _stream_chat_completions(
     async def _open_stream():
         # See `_stream_responses._open_stream` — slot stays held for
         # the whole SSE body via `_acquire_gate_slot`.
-        async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
-            with attempt:
-                gate, slot_id = await _acquire_gate_slot(
-                    profile, path="/v1/chat/completions"
-                )
-                await gate.update_slot(
-                    slot_id,
-                    model=str(model_hint) if model_hint else None,
-                    method="POST",
-                    stream=True,
-                    phase="connecting",
-                    params=_inspect_thinking_params(body, "chat_completions"),
-                    chunks=0,
-                    bytes=0,
-                )
-                slot_transferred = False
-                try:
-                    client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=None))
-                    response = await _with_first_byte_timeout(
-                        client.send(
-                            client.build_request(
-                                "POST", upstream_url, json=body, headers=headers
-                            ),
-                            stream=True,
-                        ),
-                        cfg,
-                        phase="chat stream open",
-                    )
-                    if response.status_code in _RETRYABLE_STATUS:
-                        body_bytes = await response.aread()
-                        await response.aclose()
-                        await client.aclose()
-                        raise _UpstreamHTTPError(
-                            response.status_code, body_bytes.decode("utf-8", errors="ignore")
+        nonlocal model_hint
+        attempted_fallbacks: set[str] = set()
+        while True:
+            try:
+                async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
+                    with attempt:
+                        gate, slot_id = await _acquire_gate_slot(
+                            profile, path="/v1/chat/completions"
                         )
-                    slot_transferred = True
-                    return client, response, gate, slot_id
-                finally:
-                    if not slot_transferred:
-                        await gate.release(slot_id)
+                        await gate.update_slot(
+                            slot_id,
+                            model=str(model_hint) if model_hint else None,
+                            method="POST",
+                            stream=True,
+                            phase="connecting",
+                            params=_inspect_thinking_params(body, "chat_completions"),
+                            chunks=0,
+                            bytes=0,
+                        )
+                        slot_transferred = False
+                        try:
+                            client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=None))
+                            response = await _with_first_byte_timeout(
+                                client.send(
+                                    client.build_request(
+                                        "POST", upstream_url, json=body, headers=headers
+                                    ),
+                                    stream=True,
+                                ),
+                                cfg,
+                                phase="chat stream open",
+                            )
+                            if response.status_code in _RETRYABLE_STATUS:
+                                body_bytes = await response.aread()
+                                await response.aclose()
+                                await client.aclose()
+                                raise _UpstreamHTTPError(
+                                    response.status_code, body_bytes.decode("utf-8", errors="ignore")
+                                )
+                            slot_transferred = True
+                            return client, response, gate, slot_id
+                        finally:
+                            if not slot_transferred:
+                                await gate.release(slot_id)
+            except (RetryError, _UpstreamHTTPError, httpx.ReadTimeout) as exc:
+                fallback = _apply_runtime_model_fallback(
+                    body, profile, exc, attempted_fallbacks
+                )
+                if fallback:
+                    model_hint = fallback
+                    state["model"] = fallback
+                    continue
+                raise
         raise RuntimeError("unreachable")  # pragma: no cover
 
     try:
@@ -3447,22 +3735,32 @@ async def _post_responses_nonstream(
     upstream_url = f"{_upstream_url(profile)}/responses"
     last_status = 502
     last_body = ""
+    attempted_fallbacks: set[str] = set()
     try:
-        async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
-            with attempt:
-                async with _gated(profile):
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
-                        r = await client.post(upstream_url, json=body, headers=headers)
-                last_status = r.status_code
-                last_body = r.text
-                if r.status_code in _RETRYABLE_STATUS:
-                    raise _UpstreamHTTPError(r.status_code, r.text)
-                payload = (
-                    r.json()
-                    if r.headers.get("content-type", "").startswith("application/json")
-                    else {}
+        while True:
+            try:
+                async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
+                    with attempt:
+                        async with _gated(profile):
+                            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+                                r = await client.post(upstream_url, json=body, headers=headers)
+                        last_status = r.status_code
+                        last_body = r.text
+                        if r.status_code in _RETRYABLE_STATUS:
+                            raise _UpstreamHTTPError(r.status_code, r.text)
+                        payload = (
+                            r.json()
+                            if r.headers.get("content-type", "").startswith("application/json")
+                            else {}
+                        )
+                        return r.status_code, payload
+            except (RetryError, _UpstreamHTTPError, httpx.ReadTimeout) as exc:
+                fallback = _apply_runtime_model_fallback(
+                    body, profile, exc, attempted_fallbacks
                 )
-                return r.status_code, payload
+                if fallback:
+                    continue
+                raise
     except _QueueTimeout as exc:
         return 503, {"error": {"message": str(exc), "retry_after_s": 10}}
     except (RetryError, _UpstreamHTTPError):
@@ -3480,22 +3778,31 @@ async def _post_responses_nonstream(
 app = FastAPI(title="NaN LLM Bridge")
 
 _watchdog_task: asyncio.Task | None = None
+_model_health_task: asyncio.Task | None = None
 
 
 @app.on_event("startup")
 async def _start_watchdog() -> None:
-    global _watchdog_task
+    global _watchdog_task, _model_health_task
     if _watchdog_task is None or _watchdog_task.done():
         _watchdog_task = asyncio.create_task(_gate_watchdog_loop())
+    if _model_health_task is None or _model_health_task.done():
+        _model_health_task = asyncio.create_task(_model_health_loop())
 
 
 @app.on_event("shutdown")
 async def _stop_watchdog() -> None:
-    global _watchdog_task
+    global _watchdog_task, _model_health_task
     if _watchdog_task and not _watchdog_task.done():
         _watchdog_task.cancel()
         try:
             await _watchdog_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    if _model_health_task and not _model_health_task.done():
+        _model_health_task.cancel()
+        try:
+            await _model_health_task
         except (asyncio.CancelledError, Exception):
             pass
 
@@ -3703,6 +4010,7 @@ async def health() -> dict:
         "uptime_s": round(time.time() - _started_at, 1),
         "profiles": list(CONFIG.profiles.keys()),
         "upstreams": [g.snapshot() for g in _UPSTREAM_GATES.values()],
+        "model_health": _model_health_snapshot(),
     }
 
 
@@ -3991,6 +4299,7 @@ async def stats(
         "lifetime": lifetime,
         "windows": {},
         "upstreams": [g.snapshot() for g in _UPSTREAM_GATES.values()],
+        "model_health": _model_health_snapshot(),
         "profiles": [
             {"name": p.name, "upstream": p.upstream, "features": sorted(p.features)}
             for p in CONFIG.profiles.values()
@@ -4139,6 +4448,7 @@ def _dump_config_yaml(cfg: BridgeConfig) -> str:
             entry["force_presence_penalty"] = p.force_presence_penalty
         entry["auto_retries"] = p.auto_retries
         entry["force_stream"] = p.force_stream
+        entry["model_fallback_enabled"] = p.model_fallback_enabled
         if p.force_model:
             entry["force_model"] = p.force_model
         if p.model_aliases:
@@ -4276,6 +4586,7 @@ def _validate_profile_payload(name: str, body: dict) -> tuple[ProfileConfig | No
             queue_priority=priority,
             auto_retries=bool(body.get("auto_retries", True)),
             force_stream=bool(body.get("force_stream", True)),
+            model_fallback_enabled=bool(body.get("model_fallback_enabled", False)),
         ),
         None,
     )
@@ -4316,6 +4627,7 @@ async def config_get() -> dict:
                 "thinking_enabled": p.thinking_enabled,
                 "auto_retries": p.auto_retries,
                 "force_stream": p.force_stream,
+                "model_fallback_enabled": p.model_fallback_enabled,
                 "force_model": p.force_model,
                 "model_aliases": dict(p.model_aliases),
             }
@@ -4409,7 +4721,7 @@ async def _handle_responses(
                 params=inspected,
                 body=redacted,
                 forwarded=forwarded,
-                model=model_id,
+                model=stream_state.get("model") or model_id,
                 recovery=stream_state.get("recovery"),
             )
         return StreamingResponse(
@@ -4496,6 +4808,7 @@ async def _handle_responses(
         record = _extract_usage(profile.name, body.get("model"), payload)
         if record:
             _broadcast_usage(record)
+    model_id = body.get("model") if isinstance(body.get("model"), str) else model_id
     _record_activity(
         profile,
         f"/{profile.name}/v1/responses",
@@ -4550,7 +4863,7 @@ async def _handle_chat_completions(
                 params=inspected,
                 body=redacted,
                 forwarded=forwarded,
-                model=model_id,
+                model=stream_state.get("model") or model_id,
                 recovery=stream_state.get("recovery"),
             )
         return StreamingResponse(
@@ -4563,22 +4876,39 @@ async def _handle_chat_completions(
     last_status = 502
     last_body = ""
     payload: dict = {"error": {"message": "unreachable"}}
+    attempted_fallbacks: set[str] = set()
     try:
-        async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
-            with attempt:
-                async with _gated(profile):
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
-                        r = await client.post(upstream_url, json=body, headers=headers)
-                last_status = r.status_code
-                last_body = r.text
-                if r.status_code in _RETRYABLE_STATUS:
-                    raise _UpstreamHTTPError(r.status_code, r.text)
-                payload = (
-                    r.json()
-                    if r.headers.get("content-type", "").startswith("application/json")
-                    else {}
-                )
+        while True:
+            try:
+                async for attempt in _retry_policy(cfg, enabled=profile.auto_retries):
+                    with attempt:
+                        async with _gated(profile):
+                            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+                                r = await client.post(upstream_url, json=body, headers=headers)
+                        last_status = r.status_code
+                        last_body = r.text
+                        if r.status_code in _RETRYABLE_STATUS:
+                            raise _UpstreamHTTPError(r.status_code, r.text)
+                        payload = (
+                            r.json()
+                            if r.headers.get("content-type", "").startswith("application/json")
+                            else {}
+                        )
+                        break
                 break
+            except (RetryError, _UpstreamHTTPError, httpx.ReadTimeout) as exc:
+                fallback = _apply_runtime_model_fallback(
+                    body, profile, exc, attempted_fallbacks
+                )
+                if fallback:
+                    model_id = fallback
+                    inspected = _diff_thinking_params(
+                        client_params,
+                        _inspect_thinking_params(body, "chat_completions"),
+                    )
+                    forwarded = _redact_body(body)
+                    continue
+                raise
     except _QueueTimeout as exc:
         last_status = 503
         payload = {"error": {"message": str(exc), "retry_after_s": 10}}
@@ -4678,6 +5008,7 @@ async def _handle_chat_completions(
         record = _extract_usage(profile.name, body.get("model"), payload)
         if record:
             _broadcast_usage(record)
+    model_id = body.get("model") if isinstance(body.get("model"), str) else model_id
     _record_activity(
         profile,
         f"/{profile.name}/v1/chat/completions",
@@ -5382,6 +5713,17 @@ def _dashboard_html() -> str:
     </table>
   </div>
 
+  <h2>Model health</h2>
+  <div class="card">
+    <table>
+      <thead><tr>
+        <th>upstream</th><th>model</th><th>state</th>
+        <th class="num">latency</th><th class="num">checked</th><th>error</th>
+      </tr></thead>
+      <tbody id="model-health-body"><tr><td colspan="6" class="empty">waiting for first health check…</td></tr></tbody>
+    </table>
+  </div>
+
   <h2>Upstreams</h2>
   <div class="card">
     <table>
@@ -5797,6 +6139,29 @@ def _dashboard_html() -> str:
         }}).join('');
       $('models-body').innerHTML = modelRows ||
         `<tr><td colspan="9" class="empty">no model completions recorded</td></tr>`;
+
+      // Model health. Independent from request history: a background
+      // probe marks each configured model active/inactive every minute.
+      const healthRows = [];
+      const health = stats.model_health || {{}};
+      for (const [upstream, models] of Object.entries(health)) {{
+        for (const [model, row] of Object.entries(models || {{}})) {{
+          const active = row && row.active === true;
+          const checked = row && row.checked_at ? `${{Math.max(0, Math.round(Date.now() / 1000 - row.checked_at))}}s ago` : '—';
+          const latency = row && row.latency_s != null ? fmtMs(Number(row.latency_s) * 1000) : '—';
+          const error = row && row.error ? row.error : '—';
+          healthRows.push(`<tr>` +
+            `<td>${{escapeHtml(upstream)}}</td>` +
+            `<td>${{escapeHtml(model)}}</td>` +
+            `<td><span class="status-pill ${{active ? 'ok' : 'hot'}}">${{active ? 'active' : 'inactive'}}</span></td>` +
+            `<td class="num ${{active ? 'lat-fast' : 'lat-slow'}}">${{latency}}</td>` +
+            `<td class="num">${{checked}}</td>` +
+            `<td>${{escapeHtml(error)}}</td>` +
+          `</tr>`);
+        }}
+      }}
+      $('model-health-body').innerHTML = healthRows.join('') ||
+        `<tr><td colspan="6" class="empty">waiting for first health check…</td></tr>`;
 
       // Upstreams. Show operational state rather than raw counters.
       const upRows = (stats.upstreams || []).map(u => {{
@@ -6255,6 +6620,7 @@ def _dashboard_html() -> str:
         force_presence_penalty: p.force_presence_penalty,
         auto_retries: p.auto_retries !== false,
         force_stream: p.force_stream !== false,
+        model_fallback_enabled: p.model_fallback_enabled === true,
         force_model: p.force_model || '',
         features: new Set(p.features || []),
         aliases: aliasesToList(p.model_aliases),
@@ -6303,6 +6669,7 @@ def _dashboard_html() -> str:
         force_presence_penalty: prof.force_presence_penalty,
         auto_retries: prof.auto_retries,
         force_stream: prof.force_stream,
+        model_fallback_enabled: prof.model_fallback_enabled,
         force_model: prof.force_model || null,
         model_aliases: aliasesToMap(prof.aliases),
       }});
@@ -6400,6 +6767,7 @@ def _dashboard_html() -> str:
               `<div class="pf-switch-grid">` +
                 `<label class="pf-switch-card"><input type="checkbox" data-idx="${{idx}}" data-key="auto_retries" ${{prof.auto_retries ? 'checked' : ''}}><strong>auto retries</strong><p>Retry transient upstream failures such as 524 before bytes reach the client.</p></label>` +
                 `<label class="pf-switch-card"><input type="checkbox" data-idx="${{idx}}" data-key="force_stream" ${{prof.force_stream ? 'checked' : ''}}><strong>force stream</strong><p>Send stream=true upstream, including buffered bridge recovery retries.</p></label>` +
+                `<label class="pf-switch-card"><input type="checkbox" data-idx="${{idx}}" data-key="model_fallback_enabled" ${{prof.model_fallback_enabled ? 'checked' : ''}}><strong>model fallback</strong><p>Fallback to another active model when the selected model is unhealthy or fails before bytes reach the client.</p></label>` +
               `</div>` +
             `</div>` +
             `<div>` +
@@ -6451,7 +6819,7 @@ def _dashboard_html() -> str:
             }}
           }} else if (key === 'default_thinking_effort') {{
             prof[key] = t.value || '';
-          }} else if (key === 'auto_retries' || key === 'force_stream') {{
+          }} else if (key === 'auto_retries' || key === 'force_stream' || key === 'model_fallback_enabled') {{
             prof[key] = !!t.checked;
           }} else {{
             prof[key] = t.value;
@@ -6538,6 +6906,7 @@ def _dashboard_html() -> str:
         model_aliases: aliasesToMap(prof.aliases),
         auto_retries: prof.auto_retries,
         force_stream: prof.force_stream,
+        model_fallback_enabled: prof.model_fallback_enabled,
       }};
       try {{
         const r = await fetch('/config/profiles/' + encodeURIComponent(trimmedName), {{
@@ -6594,6 +6963,7 @@ def _dashboard_html() -> str:
         force_presence_penalty: null,
         auto_retries: true,
         force_stream: true,
+        model_fallback_enabled: false,
         force_model: '',
         features: new Set(['model_sampling_defaults', 'effort_to_thinking_budget',
           'thinking_overflow_recovery', 'silent_completion_recovery',

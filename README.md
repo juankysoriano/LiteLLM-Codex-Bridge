@@ -80,7 +80,7 @@ This is useful when the upstream has limits such as `1000 rpm` and `5` parallel 
 
 `reserved_priority_slots` keeps part of the concurrency pool unavailable to low-priority profiles. For example, with `rate_limit_concurrent: 5`, `reserved_priority_slots: 2`, and `reserved_priority_threshold: 1`, priority `0` work can use at most 3 slots while priority `1+` can use all 5.
 
-`first_byte_timeout_s` aborts and retries requests that never produce upstream bytes. This prevents “waiting / 0 chunks / 0 bytes” calls from holding a slot indefinitely.
+`first_byte_timeout_s` aborts and retries streaming requests that never produce upstream bytes. Set it around `60` seconds to avoid “waiting / 0 chunks / 0 bytes” calls holding a slot indefinitely.
 
 ## Quick Start
 
@@ -135,7 +135,7 @@ upstreams:
     rate_limit_concurrent: 5
     reserved_priority_slots: 2
     reserved_priority_threshold: 1
-    first_byte_timeout_s: 120.0
+    first_byte_timeout_s: 60.0
     queue_timeout_s: 1200.0
     stuck_warn_s: 1200.0
 
@@ -145,6 +145,7 @@ profiles:
     queue_priority: 0
     auto_retries: true
     force_stream: true
+    model_fallback_enabled: false
     features:
       - model_sampling_defaults
       - drop_oai_only_fields
@@ -159,6 +160,7 @@ profiles:
     queue_priority: 5
     auto_retries: true
     force_stream: true
+    model_fallback_enabled: false
     features:
       - model_sampling_defaults
       - drop_oai_only_fields
@@ -184,6 +186,7 @@ Common profile fields:
 | `queue_priority` | Higher values jump ahead in the upstream queue |
 | `auto_retries` | Retry transient upstream failures before bytes reach the client |
 | `force_stream` | Send `stream=true` upstream even when the client did not |
+| `model_fallback_enabled` | Fallback to another active model when the selected model is unhealthy or fails before bytes reach the client |
 | `force_model` | Optional hard model override, e.g. `qwen3.6` or `gemma4` |
 | `thinking_enabled` | `true`, `false`, or omitted to respect client/upstream defaults |
 | `default_thinking_effort` | Optional `low`, `medium`, `high`, or `xhigh` when profile enables thinking by default |
@@ -193,6 +196,14 @@ Common profile fields:
 | `force_top_p` | Hard top-p override |
 | `force_presence_penalty` | Hard presence-penalty override |
 | `model_aliases` | Optional client-model-id to upstream-model-id mapping |
+
+## Model Health And Fallback
+
+The bridge probes configured NaN models once per minute with a small `ping` chat request and thinking disabled. A model is marked active only when it returns bytes within `30` seconds; otherwise it is treated as inactive. The status is exposed in `/health` and `/stats`.
+
+Set `model_fallback_enabled: true` on a profile to use the health table. If the selected model is inactive and another configured model is active, the bridge rewrites the request to the active model. If every model is inactive, it keeps the requested model.
+
+Fallback can also trigger before client-visible bytes are sent when the upstream returns a retryable failure such as `524` or times out waiting for the first byte. Health checks need an auth token from `X_NAN_KEY`, `NAN_API_KEY`, `OPENAI_API_KEY`, or an env file pointed to by `BRIDGE_AUTH_ENV_PATH`.
 
 ## Features Reference
 

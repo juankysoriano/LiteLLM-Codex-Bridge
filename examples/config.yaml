@@ -5,7 +5,7 @@ upstreams:
     rate_limit_concurrent: 5
     reserved_priority_slots: 2
     reserved_priority_threshold: 1
-    first_byte_timeout_s: 120.0
+    first_byte_timeout_s: 60.0
     queue_timeout_s: 1200.0
     stuck_warn_s: 1200.0
 
@@ -15,6 +15,7 @@ profiles:
     queue_priority: 0
     auto_retries: true
     force_stream: true
+    model_fallback_enabled: false
     features:
       - model_sampling_defaults
       - drop_oai_only_fields
@@ -29,6 +30,7 @@ profiles:
     queue_priority: 5
     auto_retries: true
     force_stream: true
+    model_fallback_enabled: false
     # This profile is intentionally generic. Rename it locally for a
     # real client, daemon, or project-specific workload.
     features:
