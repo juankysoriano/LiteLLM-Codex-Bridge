@@ -730,6 +730,38 @@ def _delta_has_xml_tool_residue(delta: Any) -> bool:
     return False
 
 
+def _body_has_tool_result(body: dict) -> bool:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    return any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages)
+
+
+def _strip_gemma_thought_sentinel(text: str) -> str:
+    stripped = text.lstrip()
+    if not stripped.startswith("thought"):
+        return text
+    rest = stripped[len("thought"):]
+    if rest and rest[0].islower():
+        return text
+    return rest.lstrip()
+
+
+def _message_has_gemma_thought_leak(message: Any) -> bool:
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    return isinstance(content, str) and _strip_gemma_thought_sentinel(content) != content
+
+
+def _strip_gemma_thought_sentinel_from_payload(payload: dict) -> dict:
+    choice = (payload.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    if isinstance(message, dict) and isinstance(message.get("content"), str):
+        message["content"] = _strip_gemma_thought_sentinel(message["content"])
+    return payload
+
+
 def _has_streamable_reasoning_delta(delta: Any) -> bool:
     """Return True when a chat-completions delta carries thought text.
 
@@ -1642,6 +1674,7 @@ _recovery_counts: dict[str, int] = {
     "empty_with_stop_retry": 0,
     "tool_call_args_retry": 0,
     "xml_tool_residue": 0,
+    "gemma_thought_leak_retry": 0,
 }
 _retry_counts: dict[str, int] = {"retried": 0, "gave_up": 0}
 
@@ -1860,13 +1893,35 @@ def _content_to_string(content: Any) -> str:
 
 
 
+def _chat_template_kwargs_from_body(body: dict) -> dict:
+    value = body.get("chat_template_kwargs")
+    return value if isinstance(value, dict) else {}
+
+
+def _chat_template_kwargs_from_extra(extra: dict) -> dict:
+    value = extra.get("chat_template_kwargs")
+    return value if isinstance(value, dict) else {}
+
+
+def _model_uses_gemma_thinking(body: dict) -> bool:
+    return "gemma" in str(body.get("model") or "").lower()
+
+
+def _model_supports_thinking_budget(body: dict) -> bool:
+    # Gemma4 thinking is triggered by chat_template_kwargs.enable_thinking.
+    # vLLM's Gemma4 docs do not list it among the model families with
+    # thinking_token_budget support, so defaults must not inject a cap.
+    return not _model_uses_gemma_thinking(body)
+
+
 def _thinking_enabled_for_sampling(body: dict) -> bool | None:
+    top_value = _chat_template_kwargs_from_body(body).get("enable_thinking")
+    if isinstance(top_value, bool):
+        return top_value
     extra = body.get("extra_body")
     if not isinstance(extra, dict):
         return None
-    chat_kwargs = extra.get("chat_template_kwargs")
-    if not isinstance(chat_kwargs, dict):
-        return None
+    chat_kwargs = _chat_template_kwargs_from_extra(extra)
     value = chat_kwargs.get("enable_thinking")
     return value if isinstance(value, bool) else None
 
@@ -1920,22 +1975,25 @@ def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
         (e.g. Codex's
         `reasoning.effort=high`) without an explicit
         `extra_body.thinking_token_budget`, the bridge translates the
-        effort via `_EFFORT_TO_THINKING_BUDGET`. Otherwise it only adds
-        a budget if the profile explicitly defines one. Effort values in `_CLIENT_DISABLE_EFFORTS`
-        are translated to `enable_thinking=false`.
+        effort via `_EFFORT_TO_THINKING_BUDGET` only for models with
+        documented budget support. Otherwise it only adds a budget if
+        the profile explicitly defines one and the model supports it.
+        Effort values in `_CLIENT_DISABLE_EFFORTS` are translated to
+        `enable_thinking=false`.
 
     Placement:
       - `thinking_token_budget` → top-level of `extra_body` (vLLM
         SamplingParams reads it there)
       - `enable_thinking` → `extra_body.chat_template_kwargs`
         (Qwen3 chat template reads it there)
+      - Gemma4 also receives `chat_template_kwargs` at top-level, which
+        is the raw OpenAI-compatible JSON shape documented by vLLM.
     """
     extra = body.get("extra_body")
     if not isinstance(extra, dict):
         extra = {}
-    chat_kwargs = extra.get("chat_template_kwargs")
-    if not isinstance(chat_kwargs, dict):
-        chat_kwargs = {}
+    top_chat_kwargs = dict(_chat_template_kwargs_from_body(body))
+    chat_kwargs = dict(_chat_template_kwargs_from_extra(extra))
 
     effort: str | None = None
     reasoning = body.get("reasoning")
@@ -1944,11 +2002,15 @@ def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
     if effort is None and isinstance(body.get("reasoning_effort"), str):
         effort = body["reasoning_effort"].strip().lower()
 
-    client_set_enable = "enable_thinking" in chat_kwargs
+    client_set_enable = (
+        "enable_thinking" in chat_kwargs
+        or "enable_thinking" in top_chat_kwargs
+    )
     client_set_budget = "thinking_token_budget" in extra
     client_disabled_with_effort = effort in _CLIENT_DISABLE_EFFORTS
     profile_forces_off = profile.thinking_enabled is False
     profile_forces_on = profile.thinking_enabled is True
+    supports_budget = _model_supports_thinking_budget(body)
 
     # ----- enable_thinking decision -----
     if profile_forces_off:
@@ -1963,10 +2025,10 @@ def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
         chat_kwargs["enable_thinking"] = True
     # else: respect whatever the client/upstream decides.
 
-    client_disabled_thinking = (
-        chat_kwargs.get("enable_thinking") is False
-        or client_disabled_with_effort
+    effective_enable = chat_kwargs.get(
+        "enable_thinking", top_chat_kwargs.get("enable_thinking")
     )
+    client_disabled_thinking = effective_enable is False or client_disabled_with_effort
 
     # ----- thinking_token_budget decision -----
     if client_disabled_thinking:
@@ -1975,16 +2037,22 @@ def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
         extra.pop("thinking_token_budget", None)
     elif client_set_budget:
         pass
-    elif effort and effort in _EFFORT_TO_THINKING_BUDGET:
+    elif supports_budget and effort and effort in _EFFORT_TO_THINKING_BUDGET:
         extra["thinking_token_budget"] = _EFFORT_TO_THINKING_BUDGET[effort]
-    elif profile_forces_on and profile.default_thinking_effort in _EFFORT_TO_THINKING_BUDGET:
+    elif supports_budget and profile_forces_on and profile.default_thinking_effort in _EFFORT_TO_THINKING_BUDGET:
         extra["thinking_token_budget"] = _EFFORT_TO_THINKING_BUDGET[profile.default_thinking_effort]
-    elif profile_forces_on and isinstance(profile.default_thinking_budget, int) and profile.default_thinking_budget > 0:
+    elif supports_budget and profile_forces_on and isinstance(profile.default_thinking_budget, int) and profile.default_thinking_budget > 0:
         extra["thinking_token_budget"] = profile.default_thinking_budget
     # else: stay silent — no default budget means client/upstream decides.
 
     if chat_kwargs:
         extra["chat_template_kwargs"] = chat_kwargs
+    if _model_uses_gemma_thinking(body):
+        gemma_chat_kwargs = dict(top_chat_kwargs)
+        gemma_chat_kwargs.update(chat_kwargs)
+        if gemma_chat_kwargs:
+            body["chat_template_kwargs"] = gemma_chat_kwargs
+            extra["chat_template_kwargs"] = gemma_chat_kwargs
     body["extra_body"] = extra
     # No more max_tokens inflation: `_ensure_room_for_injected_thinking`
     # is gone. The thinking budget enforces upstream now (verified
@@ -2476,8 +2544,14 @@ def _validate_tool_calls(tool_calls: Any, tools_list: Any) -> bool:
     for tc in tool_calls:
         if not isinstance(tc, dict):
             return False
+        if not isinstance(tc.get("id"), str) or not tc.get("id"):
+            return False
+        if tc.get("type") not in (None, "function"):
+            return False
         fn = tc.get("function") or {}
         name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            return False
         args_raw = fn.get("arguments")
         if not isinstance(args_raw, str):
             return False
@@ -2496,6 +2570,9 @@ def _validate_tool_calls(tool_calls: Any, tools_list: Any) -> bool:
 def _client_already_disabled_thinking(body: dict) -> bool:
     """Return True if the body explicitly disables thinking, so retrying
     with thinking-off would be a no-op."""
+    top_ctk = body.get("chat_template_kwargs") or {}
+    if isinstance(top_ctk, dict) and top_ctk.get("enable_thinking") is False:
+        return True
     eb = body.get("extra_body") or {}
     if not isinstance(eb, dict):
         return False
@@ -2524,6 +2601,11 @@ def _build_thinking_off_retry_body(body: dict) -> dict:
     retry = copy.deepcopy(body)
     retry["stream"] = False
     retry.pop("stream_options", None)
+    top_ctk = retry.get("chat_template_kwargs")
+    if not isinstance(top_ctk, dict):
+        top_ctk = {}
+    top_ctk["enable_thinking"] = False
+    retry["chat_template_kwargs"] = top_ctk
     eb = retry.get("extra_body")
     if not isinstance(eb, dict):
         eb = {}
@@ -2760,20 +2842,32 @@ async def _stream_responses(
             bytes=0,
         )
     except _QueueTimeout as exc:
+        state["response"] = _redact_response(
+            {"error": {"status": 503, "message": str(exc)}}
+        )
         yield _sse_responses_error(503, str(exc))
         return
     except (RetryError, _UpstreamHTTPError) as exc:
         status = getattr(exc, "status", 502)
         body_text = getattr(exc, "body", str(exc))
+        state["response"] = _redact_response(
+            {"error": {"status": status, "body": body_text}}
+        )
         yield _sse_responses_error(status, body_text)
         return
     except httpx.ReadTimeout as exc:
+        state["response"] = _redact_response(
+            {"error": {"status": 504, "message": str(exc)}}
+        )
         yield _sse_responses_error(504, str(exc))
         return
 
     try:
         if response.status_code >= 400:
             error_text = (await response.aread()).decode("utf-8", errors="ignore")
+            state["response"] = _redact_response(
+                {"error": {"status": response.status_code, "body": error_text}}
+            )
             yield _sse_responses_error(response.status_code, error_text)
             return
 
@@ -3058,6 +3152,7 @@ async def _stream_responses(
         record = _extract_usage(profile.name, model_hint, fixed_response)
         if record:
             _broadcast_usage(record)
+        state["response"] = _redact_response(fixed_completed)
         yield _sse(fixed_completed)
         return
 
@@ -3136,6 +3231,7 @@ async def _stream_responses(
     record = _extract_usage(profile.name, model_hint, response_obj)
     if record:
         _broadcast_usage(record)
+    state["response"] = _redact_response(completed_payload)
     yield _sse(completed_payload)
 
 
@@ -3334,25 +3430,47 @@ async def _stream_chat_completions(
             bytes=0,
         )
     except _QueueTimeout as exc:
+        state["response"] = _redact_response(
+            {"error": {"status": 503, "message": str(exc)}}
+        )
         yield _sse_chat_error(503, str(exc))
         return
     except (RetryError, _UpstreamHTTPError) as exc:
         status = getattr(exc, "status", 502)
         body_text = getattr(exc, "body", str(exc))
+        state["response"] = _redact_response(
+            {"error": {"status": status, "body": body_text}}
+        )
         yield _sse_chat_error(status, body_text)
         return
     except httpx.ReadTimeout as exc:
+        state["response"] = _redact_response(
+            {"error": {"status": 504, "message": str(exc)}}
+        )
         yield _sse_chat_error(504, str(exc))
         return
 
     thinking_retry_allowed = not _client_already_disabled_thinking(body)
     do_tool_call_retry = profile.has("tool_call_args_retry") and thinking_retry_allowed
     do_xml_residue_retry = profile.has("xml_tool_residue_retry") and thinking_retry_allowed
-    do_retry_recovery = do_tool_call_retry or do_xml_residue_retry
+    do_gemma_tool_result_cleanup = (
+        profile.has("tool_call_args_retry")
+        and _model_uses_gemma_thinking(body)
+        and _body_has_tool_result(body)
+    )
+    do_gemma_tool_result_retry = do_gemma_tool_result_cleanup and thinking_retry_allowed
+    do_retry_recovery = (
+        do_tool_call_retry
+        or do_xml_residue_retry
+        or do_gemma_tool_result_cleanup
+    )
 
     try:
         if response.status_code >= 400:
             error_text = (await response.aread()).decode("utf-8", errors="ignore")
+            state["response"] = _redact_response(
+                {"error": {"status": response.status_code, "body": error_text}}
+            )
             yield _sse_chat_error(response.status_code, error_text)
             return
 
@@ -3360,6 +3478,7 @@ async def _stream_chat_completions(
             # Existing path: byte-for-byte forward, sniff usage as it
             # passes by.
             buffer = b""
+            response_bytes = bytearray()
             chunk_count = 0
             byte_count = 0
             first_byte_at: float | None = None
@@ -3375,6 +3494,7 @@ async def _stream_chat_completions(
                     yield chunk
                     if chunk == _SSE_KEEPALIVE:
                         continue
+                    response_bytes.extend(chunk)
                     buffer += chunk
                     while b"\n\n" in buffer:
                         event, buffer = buffer.split(b"\n\n", 1)
@@ -3395,7 +3515,12 @@ async def _stream_chat_completions(
                                 if record:
                                     _broadcast_usage(record)
             except (_StreamStalledError, httpx.ReadTimeout) as exc:
+                state["response"] = _redact_response(
+                    {"error": {"status": 504, "message": str(exc)}}
+                )
                 yield _sse_chat_error(504, str(exc))
+            if response_bytes:
+                state["response"] = _redact_chat_sse_response(response_bytes, model_hint)
             return
 
         # Speculative passthrough path:
@@ -3420,11 +3545,12 @@ async def _stream_chat_completions(
         DECISION_PENDING = 0
         DECISION_PASSTHROUGH = 1
         DECISION_BUFFER = 2
-        decision = DECISION_PENDING
+        decision = DECISION_BUFFER if do_gemma_tool_result_cleanup else DECISION_PENDING
         held_bytes = bytearray()       # bytes received before decision was made
         upstream_buffer = bytearray()  # full buffer when in DECISION_BUFFER mode
         sse_buf = b""                  # incremental SSE event-line splitter (pre-decision)
         usage_obj: dict | None = None  # sniffed usage for passthrough path
+        response_bytes = bytearray()
         chunk_count = 0
         byte_count = 0
         first_byte_at: float | None = None
@@ -3451,6 +3577,7 @@ async def _stream_chat_completions(
                 if chunk == _SSE_KEEPALIVE:
                     yield chunk
                     continue
+                response_bytes.extend(chunk)
                 if decision == DECISION_PASSTHROUGH:
                     yield chunk
                     # still sniff usage in passthrough
@@ -3512,12 +3639,17 @@ async def _stream_chat_completions(
                     upstream_buffer.extend(held_bytes)
                     held_bytes = bytearray()
         except (_StreamStalledError, httpx.ReadTimeout) as exc:
+            state["response"] = _redact_response(
+                {"error": {"status": 504, "message": str(exc)}}
+            )
             yield _sse_chat_error(504, str(exc))
             return
 
         # End of upstream stream.
         if decision == DECISION_PASSTHROUGH:
             # Already streamed everything (plus held flush).
+            if response_bytes:
+                state["response"] = _redact_chat_sse_response(response_bytes, model_hint)
             if usage_obj:
                 rec = _extract_usage(profile.name, model_hint,
                                      {"usage": usage_obj, "model": model_hint})
@@ -3529,11 +3661,14 @@ async def _stream_chat_completions(
             flushed = await _flush_held()
             if flushed:
                 yield flushed
+            if response_bytes:
+                state["response"] = _redact_chat_sse_response(response_bytes, model_hint)
             return
 
         # DECISION_BUFFER: full buffer. Parse, validate, maybe retry.
         assembled = _assemble_chat_sse(bytes(upstream_buffer), model_hint)
         upstream_payload = assembled["payload"]
+        state["response"] = _redact_response(upstream_payload)
         msg = ((upstream_payload.get("choices") or [{}])[0]).get("message") or {}
         if do_xml_residue_retry and _message_has_xml_tool_residue(msg):
             require_tool_call = bool(body.get("tools")) and not _clean_visible_content(msg)
@@ -3544,10 +3679,33 @@ async def _stream_chat_completions(
                     retry_payload, body.get("tools"), require_tool_call
                 )
             ):
+                state["response"] = _redact_response(retry_payload)
                 for synth_chunk in _synthesize_chat_sse(retry_payload, model_hint):
                     yield synth_chunk
                 state["recovery"] = "xml_tool_residue"
                 _record_recovery("xml_tool_residue")
+                usage = retry_payload.get("usage")
+                if isinstance(usage, dict):
+                    rec = _extract_usage(profile.name, model_hint, retry_payload)
+                    if rec: _broadcast_usage(rec)
+                return
+
+        if do_gemma_tool_result_retry and _message_has_gemma_thought_leak(msg):
+            r_status, retry_payload = await _retry_chat_thinking_off(body, headers, profile)
+            retry_choice = (retry_payload.get("choices") or [{}])[0] if isinstance(retry_payload, dict) else {}
+            retry_msg = retry_choice.get("message") or {}
+            if (
+                r_status < 400
+                and isinstance(retry_payload, dict)
+                and isinstance(retry_msg, dict)
+                and _clean_visible_content(retry_msg)
+            ):
+                _strip_gemma_thought_sentinel_from_payload(retry_payload)
+                state["response"] = _redact_response(retry_payload)
+                for synth_chunk in _synthesize_chat_sse(retry_payload, model_hint):
+                    yield synth_chunk
+                state["recovery"] = "gemma_thought_leak_retry"
+                _record_recovery("gemma_thought_leak_retry")
                 usage = retry_payload.get("usage")
                 if isinstance(usage, dict):
                     rec = _extract_usage(profile.name, model_hint, retry_payload)
@@ -3581,6 +3739,7 @@ async def _stream_chat_completions(
 
         for synth_chunk in _synthesize_chat_sse(retry_payload, model_hint):
             yield synth_chunk
+        state["response"] = _redact_response(retry_payload)
         state["recovery"] = "tool_call_args_retry"
         _record_recovery("tool_call_args_retry")
         usage = retry_payload.get("usage")
@@ -3687,6 +3846,14 @@ def _assemble_chat_sse(buf: bytes, model_hint: str | None) -> dict:
         },
         "usage": usage_obj,
     }
+
+
+def _redact_chat_sse_response(buf: bytes | bytearray, model_hint: str | None) -> dict:
+    try:
+        assembled = _assemble_chat_sse(bytes(buf), model_hint)
+        return _redact_response(assembled["payload"])
+    except Exception as exc:
+        return {"_capture_error": str(exc)}
 
 
 def _synthesize_chat_sse(payload: dict, model_hint: str | None) -> list[bytes]:
@@ -3920,6 +4087,47 @@ def _redact_body(body: Any, max_bytes: int = 65536) -> dict:
     return redacted
 
 
+def _redact_response(body: Any, max_bytes: int = 65536) -> dict:
+    """Return a dashboard-safe response snapshot.
+
+    BRIDGE_NO_REDACT keeps the full payload for local debugging. Without
+    it, preserve shape and metadata while replacing generated text/tool
+    arguments with length placeholders.
+    """
+    if os.environ.get("BRIDGE_NO_REDACT"):
+        return copy.deepcopy(body) if isinstance(body, dict) else {"_": "<non-dict>"}
+    if not isinstance(body, dict):
+        return {"_": "<non-dict response>"}
+
+    def _summary_str(s: str) -> str:
+        return f"<str {len(s)} chars>"
+
+    def _redact_value(value: Any, key: str | None = None) -> Any:
+        if isinstance(value, str):
+            if key in {
+                "content",
+                "reasoning",
+                "reasoning_content",
+                "text",
+                "delta",
+                "arguments",
+                "body",
+            }:
+                return _summary_str(value)
+            return value
+        if isinstance(value, list):
+            return [_redact_value(item) for item in value]
+        if isinstance(value, dict):
+            return {k: _redact_value(v, k) for k, v in value.items()}
+        return value
+
+    redacted = _redact_value(copy.deepcopy(body))
+    encoded = json.dumps(redacted, ensure_ascii=False, default=str)
+    if len(encoded) > max_bytes:
+        return {"_truncated_to": max_bytes, "_preview": encoded[:max_bytes]}
+    return redacted
+
+
 def _diff_thinking_params(before: dict, after: dict) -> dict:
     """Merge a pre-transform and post-transform `_inspect_thinking_params`
     snapshot into a single map, marking fields the bridge injected /
@@ -4012,6 +4220,7 @@ def _record_activity(
     params: dict | None = None,
     body: dict | None = None,
     forwarded: dict | None = None,
+    response: dict | None = None,
     model: str | None = None,
     recovery: str | None = None,
 ) -> None:
@@ -4034,6 +4243,8 @@ def _record_activity(
         record["body"] = body
     if forwarded is not None:
         record["forwarded"] = forwarded
+    if response is not None:
+        record["response"] = response
     _broadcast_activity(record)
 
 
@@ -4158,6 +4369,7 @@ def _read_disk_history(limit: int = 1000, *, strip_bodies: bool = True) -> tuple
                 if strip_bodies:
                     obj.pop("body", None)
                     obj.pop("forwarded", None)
+                    obj.pop("response", None)
                 activity.append(obj)
             else:
                 usage.append(obj)
@@ -4179,6 +4391,7 @@ def _strip_activity_bodies_except_recent(rows: list[dict], keep_recent: int = 10
         if idx < keep_from:
             copied.pop("body", None)
             copied.pop("forwarded", None)
+            copied.pop("response", None)
         out.append(copied)
     return out
 
@@ -4755,6 +4968,7 @@ async def _handle_responses(
                 params=inspected,
                 body=redacted,
                 forwarded=forwarded,
+                response=stream_state.get("response"),
                 model=stream_state.get("model") or model_id,
                 recovery=stream_state.get("recovery"),
             )
@@ -4852,6 +5066,7 @@ async def _handle_responses(
         params=inspected,
         body=redacted,
         forwarded=forwarded,
+        response=_redact_response(payload),
         model=model_id,
         recovery=recovery_kind,
     )
@@ -4897,6 +5112,7 @@ async def _handle_chat_completions(
                 params=inspected,
                 body=redacted,
                 forwarded=forwarded,
+                response=stream_state.get("response"),
                 model=stream_state.get("model") or model_id,
                 recovery=stream_state.get("recovery"),
             )
@@ -5052,6 +5268,7 @@ async def _handle_chat_completions(
         params=inspected,
         body=redacted,
         forwarded=forwarded,
+        response=_redact_response(payload),
         model=model_id,
         recovery=recovery_kind,
     )
@@ -6315,14 +6532,19 @@ def _dashboard_html() -> str:
               `<td class="num ${{latClass(r.duration_ms)}}">${{fmtMs(r.duration_ms)}}</td>` +
               `<td class="num">${{tokIn}}</td><td class="num">${{tokOut}}</td>` +
               `<td>${{renderParams(r.params)}}</td></tr>`;
-            // Forwarded body is enough — it shows everything the
-            // client sent plus inline diff markers (green +bridge for
-            // injected fields, orange "was X" for changed values).
-            const bodyJson = r.forwarded
+            const requestJson = r.forwarded
               ? annotatedJson(r.forwarded, r.body)
               : (r.body
                   ? jsonHighlight(r.body)
                   : '<span class="jnull">no body captured</span>');
+            const responseJson = r.response
+              ? jsonHighlight(r.response)
+              : '<span class="jnull">no response captured</span>';
+            const bodyJson =
+              `<div class="body-label">request <span class="dim">forwarded upstream</span></div>` +
+              requestJson +
+              `<div class="body-label">response <span class="dim">captured downstream</span></div>` +
+              responseJson;
             const expand = `<tr class="${{bodyCls}}" id="${{targetId}}">` +
               `<td colspan="10"><div class="body-pre">${{bodyJson}}</div></td></tr>`;
             return main + expand;

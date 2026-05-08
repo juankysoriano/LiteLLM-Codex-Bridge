@@ -198,6 +198,20 @@ def _write_test_config(path: Path, mock_url: str) -> None:
                     "xml_tool_residue_retry",
                 ],
             },
+            "test_force_stream": {
+                "upstream": "mock",
+                "queue_priority": 0,
+                "force_stream": True,
+                "default_thinking_budget": 4096,
+                "features": [
+                    "thinking_overflow_recovery",
+                    "silent_completion_recovery",
+                    "truncated_content_recovery",
+                    "empty_with_stop_retry",
+                    "tool_call_args_retry",
+                    "xml_tool_residue_retry",
+                ],
+            },
         },
         "default_profile": "test",
     }
@@ -222,6 +236,7 @@ class TestState:
             "empty_with_stop_retry": 0,
             "tool_call_args_retry": 0,
             "xml_tool_residue": 0,
+            "gemma_thought_leak_retry": 0,
         }
 
     def reset_mock(self) -> None:
@@ -565,6 +580,19 @@ _READ_TOOL = {
     },
 }
 
+_TIME_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_system_time",
+        "description": "Return the current local system time.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+}
+
 
 def case_xml_tool_residue_retry_nonstream(t: TestState) -> None:
     """Qwen leaks its XML tool template into reasoning_content instead
@@ -789,7 +817,120 @@ def case_reasoning_content_stream_passthrough(t: TestState) -> None:
         )
     assert "thinking live" in first, first
     assert "final answer" in text, text
+    latest = t.latest_activity()
+    if latest is None:
+        raise AssertionError("missing activity row after reasoning_content stream")
+    response = latest.get("response") or {}
+    msg = (((response.get("choices") or [{}])[0]).get("message") or {})
+    if msg.get("reasoning_content") != "<str 13 chars>":
+        raise AssertionError(f"response capture missing reasoning_content: {response}")
+    if msg.get("content") != "<str 12 chars>":
+        raise AssertionError(f"response capture missing content: {response}")
     print("  ✓ reasoning_content passthrough: thought streamed before final content")
+
+
+def case_gemma_tool_result_thought_leak_retry_stream(t: TestState) -> None:
+    """Gemma can stream post-tool hidden thought as visible `content`
+    prefixed with the literal sentinel `thought`. The bridge must keep
+    upstream streaming, buffer this specific post-tool turn, retry with
+    thinking off, strip the residual sentinel prefix, and synthesize
+    clean SSE for the client."""
+    label = "gemma_thought_leak_retry"
+    t.reset_mock()
+    t.queue("/v1/chat/completions", {
+        "stream_events": [
+            {
+                "id": "chatcmpl_gemma_leak",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl_gemma_leak",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "thought\nI should now answer from the tool result.\n"},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl_gemma_leak",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [{"index": 0, "delta": {"content": "Son las 12:00."}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl_gemma_leak",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 30, "total_tokens": 80},
+            },
+        ],
+    })
+    t.queue("/v1/chat/completions", {
+        "stream_events": [
+            {
+                "id": "chatcmpl_gemma_retry",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl_gemma_retry",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [{"index": 0, "delta": {"content": "thoughtSon las 12:00."}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl_gemma_retry",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55},
+            },
+        ],
+    })
+    body = {
+        "model": "gemma4",
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "que hora es?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_time",
+                    "type": "function",
+                    "function": {"name": "get_system_time", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_time", "content": "2026-05-08 12:00:00 CEST"},
+        ],
+        "tools": [_TIME_TOOL],
+    }
+    with httpx.stream("POST", f"{t.bridge}/test_force_stream/v1/chat/completions", json=body, timeout=15) as r:
+        r.raise_for_status()
+        text = "".join(r.iter_text())
+    assert "Son las 12:00." in text, text
+    assert "thought" not in text, text
+
+    seen = httpx.get(f"{t.mock}/scenario/seen", timeout=5).json()
+    retry_body = seen["/v1/chat/completions"][1]
+    assert retry_body.get("stream") is True, retry_body
+    assert retry_body.get("chat_template_kwargs", {}).get("enable_thinking") is False, retry_body
+    assert (
+        retry_body.get("extra_body", {})
+        .get("chat_template_kwargs", {})
+        .get("enable_thinking")
+        is False
+    ), retry_body
+
+    t.assert_recovery(label, label + " (stream)")
 
 
 def case_tool_call_args_retry_nonstream(t: TestState) -> None:
@@ -1029,6 +1170,10 @@ def case_no_recovery_baseline(t: TestState) -> None:
     latest = t.latest_activity()
     if latest is None or latest.get("recovery") is not None:
         raise AssertionError(f"baseline activity row should not have recovery, got {latest}")
+    response = latest.get("response") or {}
+    msg = (((response.get("choices") or [{}])[0]).get("message") or {})
+    if msg.get("content") != "<str 17 chars>":
+        raise AssertionError(f"baseline activity row should capture redacted response, got {response}")
 
     # And per-model stats should now be non-zero (the bug fix).
     by_model = (stats.get("lifetime") or {}).get("by_model") or {}
@@ -1065,6 +1210,7 @@ def main() -> int:
             case_xml_tool_residue_retry_nonstream(t)
             case_xml_tool_residue_retry_stream(t)
             case_reasoning_content_stream_passthrough(t)
+            case_gemma_tool_result_thought_leak_retry_stream(t)
             case_tool_call_args_retry_nonstream(t)
             case_tool_call_args_retry_skips_when_client_disabled(t)
             case_tool_call_args_retry_failed_retry_passthrough(t)

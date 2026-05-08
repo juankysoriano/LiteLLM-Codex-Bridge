@@ -34,6 +34,7 @@ def make_profile(
     name: str,
     *,
     thinking_enabled: bool | None = None,
+    default_thinking_effort: str | None = None,
     default_thinking_budget: int | None = None,
     default_max_output_tokens: int | None = None,
     features: list[str] | None = None,
@@ -43,6 +44,7 @@ def make_profile(
         upstream="nan",
         features=set(features or ["effort_to_thinking_budget"]),
         thinking_enabled=thinking_enabled,
+        default_thinking_effort=default_thinking_effort,
         default_thinking_budget=default_thinking_budget,
         default_max_output_tokens=default_max_output_tokens,
     )
@@ -242,6 +244,95 @@ def case_named_profile_client_set_budget_explicit() -> None:
     ok(label, "named profile preserves client budget")
 
 
+def case_gemma_forced_thinking_uses_template_kwargs_without_budget() -> None:
+    """Gemma thinking is enabled via chat_template_kwargs, not by the
+    Qwen-style thinking_token_budget default."""
+    label = "gemma force thinking on"
+    profile = make_profile(
+        "hermes-like",
+        thinking_enabled=True,
+        default_thinking_effort="medium",
+        default_thinking_budget=4096,
+    )
+    body = {"model": "gemma4", "messages": [{"role": "user", "content": "hi"}]}
+    out = transform(body, profile)
+    eb = out.get("extra_body") or {}
+    ctk = eb.get("chat_template_kwargs") or {}
+    top_ctk = out.get("chat_template_kwargs") or {}
+    if ctk.get("enable_thinking") is not True:
+        fail(label, f"expected extra_body enable_thinking=True, got {ctk!r}")
+    if top_ctk.get("enable_thinking") is not True:
+        fail(label, f"expected top-level enable_thinking=True, got {top_ctk!r}")
+    if "thinking_token_budget" in eb:
+        fail(label, f"expected no Gemma default budget, got {eb.get('thinking_token_budget')}")
+    ok(label, "template kwargs mirrored; no default budget")
+
+
+def case_gemma_client_effort_enables_without_budget() -> None:
+    """Client reasoning_effort should enable Gemma thinking but not invent
+    a budget field the Gemma path does not document."""
+    label = "gemma client effort=high"
+    profile = make_profile("opencode-like")
+    body = {
+        "model": "gemma4",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+    }
+    out = transform(body, profile)
+    eb = out.get("extra_body") or {}
+    ctk = eb.get("chat_template_kwargs") or {}
+    top_ctk = out.get("chat_template_kwargs") or {}
+    if ctk.get("enable_thinking") is not True:
+        fail(label, f"expected extra_body enable_thinking=True, got {ctk!r}")
+    if top_ctk.get("enable_thinking") is not True:
+        fail(label, f"expected top-level enable_thinking=True, got {top_ctk!r}")
+    if "thinking_token_budget" in eb:
+        fail(label, f"expected no Gemma effort budget, got {eb.get('thinking_token_budget')}")
+    ok(label, "effort enables Gemma thinking without budget")
+
+
+def case_gemma_top_level_disable_respected() -> None:
+    """If a named-profile client explicitly disables Gemma thinking using
+    vLLM's top-level chat_template_kwargs shape, the bridge should not
+    re-enable it from reasoning_effort."""
+    label = "gemma top-level disable respected"
+    profile = make_profile("hermes-like")
+    body = {
+        "model": "gemma4",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    out = transform(body, profile)
+    eb = out.get("extra_body") or {}
+    if (out.get("chat_template_kwargs") or {}).get("enable_thinking") is not False:
+        fail(label, f"expected top-level enable_thinking=False, got {out.get('chat_template_kwargs')}")
+    if (eb.get("chat_template_kwargs") or {}).get("enable_thinking") is not False:
+        fail(label, f"expected extra_body enable_thinking=False, got {eb.get('chat_template_kwargs')}")
+    if "thinking_token_budget" in eb:
+        fail(label, f"expected no budget when disabled, got {eb.get('thinking_token_budget')}")
+    ok(label, "top-level disable wins on named profile")
+
+
+def case_gemma_client_budget_explicit_preserved() -> None:
+    """The bridge does not invent Gemma budgets, but still preserves an
+    explicit budget from a caller that knows the upstream supports it."""
+    label = "gemma explicit client budget"
+    profile = make_profile("gemma-like", thinking_enabled=True, default_thinking_effort="medium")
+    body = {
+        "model": "gemma4",
+        "messages": [{"role": "user", "content": "hi"}],
+        "extra_body": {"thinking_token_budget": 512},
+    }
+    out = transform(body, profile)
+    eb = out.get("extra_body") or {}
+    if eb.get("thinking_token_budget") != 512:
+        fail(label, f"expected explicit budget=512, got {eb.get('thinking_token_budget')}")
+    if (out.get("chat_template_kwargs") or {}).get("enable_thinking") is not True:
+        fail(label, f"expected top-level enable_thinking=True, got {out.get('chat_template_kwargs')}")
+    ok(label, "explicit budget preserved")
+
+
 def case_no_max_tokens_injection() -> None:
     """Bridge no longer inflates max_tokens. With no client max_tokens,
     none should appear in the forwarded body."""
@@ -324,6 +415,10 @@ def main() -> int:
         case_named_profile_client_set_budget_explicit,
         case_named_profile_client_disable_respected,
         case_named_profile_client_effort_none_respected,
+        case_gemma_forced_thinking_uses_template_kwargs_without_budget,
+        case_gemma_client_effort_enables_without_budget,
+        case_gemma_top_level_disable_respected,
+        case_gemma_client_budget_explicit_preserved,
         case_no_max_tokens_injection,
         case_client_max_tokens_clamp_only,
         case_profile_default_output_tokens_chat,
