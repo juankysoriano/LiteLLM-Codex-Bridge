@@ -150,7 +150,7 @@ ALL_FEATURES = {
     # Request transforms (responses-API + chat/completions)
     "model_sampling_defaults",      # inject model-aware sampling defaults for qwen/gemma
     "drop_oai_only_fields",         # drop OpenAI-only fields the upstream rejects
-    "effort_to_thinking_budget",    # translate reasoning.effort → thinking_token_budget
+    "effort_to_thinking_budget",    # translate reasoning.effort → model-specific thinking fields
     # Request transforms (responses-API only)
     # Stream rewriters (responses-API only)
     # Recovery triggers (responses-API; chat/completions has its own)
@@ -164,7 +164,8 @@ ALL_FEATURES = {
 
 FORCE_MODEL_OPTIONS = ("qwen3.6", "gemma4")
 
-# Maps reasoning.effort → thinking_token_budget (vLLM extra_body).
+# Maps reasoning.effort → thinking_token_budget for models with documented
+# budget support. Gemma4 uses chat_template_kwargs.enable_thinking instead.
 # Defined before config loading because profile validation needs the
 # closed effort set.
 _EFFORT_TO_THINKING_BUDGET = {"low": 2048, "medium": 4096, "high": 8192, "xhigh": 16384}
@@ -173,7 +174,7 @@ _THINKING_EFFORT_OPTIONS = tuple(_EFFORT_TO_THINKING_BUDGET.keys())
 FEATURE_DESCRIPTIONS = {
     "model_sampling_defaults": "Inject model-aware sampling defaults after final model resolution. Qwen uses thinking/non-thinking presets; Gemma4 follows NaN's provider docs. Client-provided values always win.",
     "drop_oai_only_fields": "Remove OpenAI-only fields the upstream rejects, such as store, metadata, and some response formats.",
-    "effort_to_thinking_budget": "Translate reasoning_effort/reasoning.effort into enable_thinking plus thinking_token_budget.",
+    "effort_to_thinking_budget": "Translate reasoning_effort/reasoning.effort into model-specific thinking fields; Gemma4 gets enable_thinking without an invented budget.",
     "thinking_overflow_recovery": "Recover when reasoning hits max tokens before producing a final message.",
     "silent_completion_recovery": "Recover when the upstream reports completed but emits no useful message text.",
     "truncated_content_recovery": "Continue an answer that ended with finish_reason=length mid-sentence.",
@@ -353,12 +354,14 @@ _SAMPLE_CONFIG_YAML = """\
 #   Omit thinking_enabled to respect client/upstream defaults. Set true/false
 #   only when a profile should force thinking on/off. Omit
 #   default_thinking_budget to avoid injecting a budget; client
-#   reasoning_effort is still translated when present.
+#   reasoning_effort is still translated when present for models with
+#   documented budget support. Gemma4 is enabled with
+#   chat_template_kwargs.enable_thinking and does not get an invented budget.
 #
 # Available `features` (toggle on/off per profile):
 #   model_sampling_defaults     inject model-aware sampling defaults
 #   drop_oai_only_fields        strip OpenAI-only fields the upstream rejects
-#   effort_to_thinking_budget   reasoning.effort → enable_thinking + thinking_token_budget
+#   effort_to_thinking_budget   reasoning.effort → model-specific thinking fields
 #   thinking_overflow_recovery  incomplete + max_output_tokens → recover
 #   silent_completion_recovery  completed + no message item → recover
 #   truncated_content_recovery  length + cut mid-thought → continue
@@ -1972,13 +1975,12 @@ def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
       * If the client sent no explicit enable value, profile policy decides:
         force on, force off, or stay silent so the upstream/client default wins.
       * For budget specifically, when the client gave an `effort` hint
-        (e.g. Codex's
-        `reasoning.effort=high`) without an explicit
+        (e.g. Codex's `reasoning.effort=high`) without an explicit
         `extra_body.thinking_token_budget`, the bridge translates the
         effort via `_EFFORT_TO_THINKING_BUDGET` only for models with
-        documented budget support. Otherwise it only adds a budget if
-        the profile explicitly defines one and the model supports it.
-        Effort values in `_CLIENT_DISABLE_EFFORTS` are translated to
+        documented budget support. For models without documented support
+        (Gemma4), the bridge strips any budget field instead of forwarding
+        it. Effort values in `_CLIENT_DISABLE_EFFORTS` are translated to
         `enable_thinking=false`.
 
     Placement:
@@ -2031,9 +2033,11 @@ def _apply_effort_budget(body: dict, profile: ProfileConfig) -> None:
     client_disabled_thinking = effective_enable is False or client_disabled_with_effort
 
     # ----- thinking_token_budget decision -----
-    if client_disabled_thinking:
-        # A disabled-thinking request must not carry a budget. On some
-        # upstreams a budget can re-enable or alter thinking behavior.
+    if client_disabled_thinking or not supports_budget:
+        # A disabled-thinking request, or a model without documented
+        # budget support, must not carry a budget. On some upstreams a
+        # budget can re-enable or alter thinking behavior; for Gemma4 it
+        # is not a documented control surface at all.
         extra.pop("thinking_token_budget", None)
     elif client_set_budget:
         pass

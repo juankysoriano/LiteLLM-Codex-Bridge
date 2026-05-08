@@ -314,10 +314,10 @@ def case_gemma_top_level_disable_respected() -> None:
     ok(label, "top-level disable wins on named profile")
 
 
-def case_gemma_client_budget_explicit_preserved() -> None:
-    """The bridge does not invent Gemma budgets, but still preserves an
-    explicit budget from a caller that knows the upstream supports it."""
-    label = "gemma explicit client budget"
+def case_gemma_client_budget_explicit_dropped() -> None:
+    """Gemma budgets are not a documented vLLM control surface, so the
+    bridge must drop even an explicit caller-provided budget."""
+    label = "gemma explicit client budget dropped"
     profile = make_profile("gemma-like", thinking_enabled=True, default_thinking_effort="medium")
     body = {
         "model": "gemma4",
@@ -326,11 +326,11 @@ def case_gemma_client_budget_explicit_preserved() -> None:
     }
     out = transform(body, profile)
     eb = out.get("extra_body") or {}
-    if eb.get("thinking_token_budget") != 512:
-        fail(label, f"expected explicit budget=512, got {eb.get('thinking_token_budget')}")
+    if "thinking_token_budget" in eb:
+        fail(label, f"expected explicit Gemma budget to be dropped, got {eb.get('thinking_token_budget')}")
     if (out.get("chat_template_kwargs") or {}).get("enable_thinking") is not True:
         fail(label, f"expected top-level enable_thinking=True, got {out.get('chat_template_kwargs')}")
-    ok(label, "explicit budget preserved")
+    ok(label, "explicit budget dropped")
 
 
 def case_no_max_tokens_injection() -> None:
@@ -418,7 +418,7 @@ def main() -> int:
         case_gemma_forced_thinking_uses_template_kwargs_without_budget,
         case_gemma_client_effort_enables_without_budget,
         case_gemma_top_level_disable_respected,
-        case_gemma_client_budget_explicit_preserved,
+        case_gemma_client_budget_explicit_dropped,
         case_no_max_tokens_injection,
         case_client_max_tokens_clamp_only,
         case_profile_default_output_tokens_chat,

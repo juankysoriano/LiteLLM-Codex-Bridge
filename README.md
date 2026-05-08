@@ -211,7 +211,7 @@ Fallback can also trigger before client-visible bytes are sent when the upstream
 | --- | --- |
 | `model_sampling_defaults` | Inject model-aware sampling defaults when the client is silent |
 | `drop_oai_only_fields` | Remove OpenAI-only fields the upstream rejects |
-| `effort_to_thinking_budget` | Translate `reasoning_effort` / `reasoning.effort` into NaN/vLLM thinking fields |
+| `effort_to_thinking_budget` | Translate `reasoning_effort` / `reasoning.effort` into model-specific thinking fields; Gemma4 gets `enable_thinking` without an invented budget |
 | `thinking_overflow_recovery` | Recover when reasoning consumes the output budget before a final answer |
 | `silent_completion_recovery` | Recover completed responses that contain no useful message |
 | `truncated_content_recovery` | Continue answers that were cut by length mid-content |
