@@ -21,7 +21,7 @@ Only `default` and `myproject` are shipped as public example profiles. Real loca
 - Profile routing via `/{profile}/v1/...`, so different clients can have different behavior.
 - NaN Builders upstream by default, with configurable upstreams if you want to point elsewhere.
 - Per-profile policies for thinking, reasoning effort translation, output-token defaults, model overrides, sampling overrides, forced streaming, and retries.
-- Internal queue with profile priorities for upstream limits such as `1000 rpm` and `5` concurrent requests.
+- Internal queue with profile priorities for upstream limits such as `100 rpm` and `5` concurrent requests.
 - Stream-first behavior to reduce Cloudflare or proxy idle timeouts when a client forgets `stream=true`.
 - Recovery and retry mechanisms for common failure cases.
 - Dashboard at `/` with recent activity, active requests, profiles, models, token usage, latency, recoveries, and upstream load.
@@ -76,7 +76,7 @@ Each upstream has a rate/concurrency gate:
 
 When the upstream is saturated, requests wait in an internal priority queue instead of failing immediately. Higher `queue_priority` profiles go first.
 
-This is useful when the upstream has limits such as `1000 rpm` and `5` parallel requests. You can let interactive clients jump ahead of batch jobs while still keeping background work queued.
+This is useful when the upstream has limits such as `100 rpm` and `5` parallel requests. You can let interactive clients jump ahead of batch jobs while still keeping background work queued.
 
 `reserved_priority_slots` keeps part of the concurrency pool unavailable to low-priority profiles. For example, with `rate_limit_concurrent: 5`, `reserved_priority_slots: 2`, and `reserved_priority_threshold: 1`, priority `0` work can use at most 3 slots while priority `1+` can use all 5.
 
@@ -131,7 +131,7 @@ Public example:
 upstreams:
   nan:
     url: "https://api.nan.builders/v1"
-    rate_limit_rpm: 1000
+    rate_limit_rpm: 100
     rate_limit_concurrent: 5
     reserved_priority_slots: 2
     reserved_priority_threshold: 1
@@ -154,6 +154,7 @@ profiles:
       - silent_completion_recovery
       - truncated_content_recovery
       - empty_with_stop_retry
+      - gemma_thought_leak_retry
 
   myproject:
     upstream: nan
@@ -169,6 +170,8 @@ profiles:
       - silent_completion_recovery
       - truncated_content_recovery
       - empty_with_stop_retry
+      - gemma_thought_leak_retry
+    disabled_features: []
 
 default_profile: default
 ```
@@ -183,6 +186,7 @@ Common profile fields:
 | --- | --- |
 | `upstream` | Upstream name from `upstreams` |
 | `features` | Transform/recovery features enabled for the profile |
+| `disabled_features` | Explicitly disable default-on features, currently `gemma_thought_leak_retry` |
 | `queue_priority` | Higher values jump ahead in the upstream queue |
 | `auto_retries` | Retry transient upstream failures before bytes reach the client |
 | `force_stream` | Send `stream=true` upstream even when the client did not |
@@ -218,6 +222,7 @@ Fallback can also trigger before client-visible bytes are sent when the upstream
 | `empty_with_stop_retry` | Retry once when the upstream returns empty content with `finish_reason=stop` |
 | `tool_call_args_retry` | Retry with thinking disabled when tool-call arguments miss required schema fields |
 | `xml_tool_residue_retry` | Retry when XML tool-call templates leak into text/reasoning |
+| `gemma_thought_leak_retry` | Retry Gemma post-tool turns with thinking disabled when hidden thought leaks into visible content; enabled by default unless disabled per profile |
 
 ## Client Examples
 

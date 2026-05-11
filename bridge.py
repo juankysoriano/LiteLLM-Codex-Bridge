@@ -160,6 +160,15 @@ ALL_FEATURES = {
     "empty_with_stop_retry",        # empty + stop → one cheap retry
     "tool_call_args_retry",         # tool_call args missing required fields → retry with thinking off
     "xml_tool_residue_retry",       # Qwen XML tool-call template leaked into reasoning/text → retry with thinking off
+    "gemma_thought_leak_retry",     # Gemma post-tool thought leaked into content → retry with thinking off
+}
+
+# Features that are active unless a profile explicitly lists them under
+# `disabled_features`. Keep this small: most features remain opt-in via
+# `features`; this set is only for behavior that already existed before
+# becoming profile-controllable.
+DEFAULT_ON_FEATURES = {
+    "gemma_thought_leak_retry",
 }
 
 FORCE_MODEL_OPTIONS = ("qwen3.6", "gemma4")
@@ -181,6 +190,7 @@ FEATURE_DESCRIPTIONS = {
     "empty_with_stop_retry": "Retry once when the upstream returns an empty completion with finish_reason=stop.",
     "tool_call_args_retry": "Retry with thinking disabled when streamed tool-call arguments miss required schema fields.",
     "xml_tool_residue_retry": "Retry with thinking disabled when Qwen-style XML tool templates leak into text/reasoning.",
+    "gemma_thought_leak_retry": "Retry Gemma post-tool turns with thinking disabled when hidden thought leaks into visible content.",
 }
 
 
@@ -190,6 +200,7 @@ class ProfileConfig:
     name: str
     upstream: str
     features: set[str] = field(default_factory=set)
+    disabled_features: set[str] = field(default_factory=set)
     model_aliases: dict[str, str] = field(default_factory=dict)
     # Optional hard override. When set, the bridge ignores the client
     # model and sends this model upstream. When None/empty, the client
@@ -237,7 +248,12 @@ class ProfileConfig:
     model_fallback_enabled: bool = False
 
     def has(self, feature: str) -> bool:
-        return feature in self.features
+        if feature in self.disabled_features:
+            return False
+        return feature in self.features or feature in DEFAULT_ON_FEATURES
+
+    def effective_features(self) -> set[str]:
+        return (set(self.features) | DEFAULT_ON_FEATURES) - set(self.disabled_features)
 
     def resolve_model(self, model: str | None) -> str | None:
         """Translate a client-facing model id to the upstream id.
@@ -278,7 +294,7 @@ def _builtin_defaults() -> BridgeConfig:
     nan = UpstreamConfig(
         name="nan",
         url="https://api.nan.builders/v1",
-        rate_limit_rpm=1000,
+        rate_limit_rpm=100,
         rate_limit_concurrent=5,
         reserved_priority_slots=2,
         reserved_priority_threshold=1,
@@ -344,7 +360,7 @@ _SAMPLE_CONFIG_YAML = """\
 #                        reserved_priority_slots, reserved_priority_threshold,
 #                        retry_max_attempts, retry_initial_wait,
 #                        retry_max_wait }
-#   profiles:  <name>: { upstream, features:[...], queue_priority,
+#   profiles:  <name>: { upstream, features:[...], disabled_features:[...], queue_priority,
 #                        thinking_enabled, default_thinking_budget,
 #                        default_max_output_tokens, model_aliases:{...},
 #                        model_fallback_enabled }
@@ -366,7 +382,12 @@ _SAMPLE_CONFIG_YAML = """\
 #   silent_completion_recovery  completed + no message item → recover
 #   truncated_content_recovery  length + cut mid-thought → continue
 #   empty_with_stop_retry       empty + stop → one cheap retry
+#   tool_call_args_retry        tool-call args missing required fields → retry
 #   xml_tool_residue_retry      XML tool-call template leaked as reasoning/text → retry
+#   gemma_thought_leak_retry    Gemma post-tool thought leaked → retry
+#
+# Default-on features:
+#   gemma_thought_leak_retry is enabled unless listed in disabled_features.
 #
 # `queue_priority`: HIGHER number = jumps ahead in the upstream queue
 # when slots are saturated. Same priority resolves FIFO. Suggested:
@@ -377,7 +398,7 @@ _SAMPLE_CONFIG_YAML = """\
 upstreams:
   nan:
     url: "https://api.nan.builders/v1"
-    rate_limit_rpm: 1000
+    rate_limit_rpm: 100
     rate_limit_concurrent: 5
     queue_timeout_s: 120.0    # 503 if a request waits longer than this
     stuck_warn_s: 300.0       # watchdog logs slots held longer than this
@@ -399,6 +420,7 @@ profiles:
       - silent_completion_recovery
       - truncated_content_recovery
       - empty_with_stop_retry
+      - gemma_thought_leak_retry
 
   myproject:
     upstream: nan
@@ -414,6 +436,8 @@ profiles:
       - silent_completion_recovery
       - truncated_content_recovery
       - empty_with_stop_retry
+      - gemma_thought_leak_retry
+    disabled_features: []
 
 default_profile: default
 """
@@ -422,6 +446,12 @@ default_profile: default
 MODEL_HEALTH_MODELS = FORCE_MODEL_OPTIONS
 MODEL_HEALTH_INTERVAL_S = float(os.environ.get("BRIDGE_MODEL_HEALTH_INTERVAL_S", "60"))
 MODEL_HEALTH_TIMEOUT_S = float(os.environ.get("BRIDGE_MODEL_HEALTH_TIMEOUT_S", "30"))
+MODEL_HEALTH_QUEUE_TIMEOUT_S = float(
+    os.environ.get("BRIDGE_MODEL_HEALTH_QUEUE_TIMEOUT_S", "0.25")
+)
+MODEL_HEALTH_QUEUE_PRIORITY = int(
+    os.environ.get("BRIDGE_MODEL_HEALTH_QUEUE_PRIORITY", "-100")
+)
 
 
 def _coerce(value: Any, kind: type, default: Any) -> Any:
@@ -526,6 +556,19 @@ def _load_config() -> BridgeConfig:
                 flush=True,
             )
             feats -= invalid
+        disabled_raw = body.get("disabled_features") or []
+        if not isinstance(disabled_raw, list):
+            print(f"[config] profile {name!r} disabled_features must be a list; ignored", flush=True)
+            disabled_raw = []
+        disabled_features = set(str(f) for f in disabled_raw)
+        invalid_disabled = disabled_features - ALL_FEATURES
+        if invalid_disabled:
+            print(
+                f"[config] profile {name!r} references unknown disabled_features: "
+                f"{sorted(invalid_disabled)}",
+                flush=True,
+            )
+            disabled_features -= invalid_disabled
         aliases_raw = body.get("model_aliases") or {}
         if not isinstance(aliases_raw, dict):
             print(
@@ -603,6 +646,7 @@ def _load_config() -> BridgeConfig:
             name=name,
             upstream=upstream_name,
             features=feats,
+            disabled_features=disabled_features,
             model_aliases=model_aliases,
             force_model=force_model or None,
             default_thinking_effort=default_effort or None,
@@ -702,6 +746,7 @@ _XML_TOOL_RESIDUE_RE = re.compile(
 _XML_TOOL_CLOSING_TAIL_RE = re.compile(
     r"(?:\n?\s*</parameter>\s*\n\s*</function>\s*\n\s*</tool_call>\s*)+$"
 )
+_GEMMA_CHANNEL_MARKER = "<channel|>"
 
 
 def _has_xml_tool_residue(text: Any) -> bool:
@@ -755,6 +800,54 @@ def _message_has_gemma_thought_leak(message: Any) -> bool:
         return False
     content = message.get("content")
     return isinstance(content, str) and _strip_gemma_thought_sentinel(content) != content
+
+
+def _gemma_channel_content(text: str) -> str | None:
+    idx = text.rfind(_GEMMA_CHANNEL_MARKER)
+    if idx < 0:
+        return None
+    content = text[idx + len(_GEMMA_CHANNEL_MARKER):].lstrip()
+    return content if content.strip() else None
+
+
+def _drop_gemma_private_fields(message: dict) -> None:
+    for key in ("reasoning", "reasoning_content", "provider_specific_fields"):
+        message.pop(key, None)
+
+
+def _fix_gemma_thought_leak_payload(
+    payload: dict, tools_list: Any
+) -> tuple[dict | None, str | None]:
+    choice = (payload.get("choices") or [{}])[0]
+    if not isinstance(choice, dict):
+        return None, None
+    message = choice.get("message") or {}
+    if not isinstance(message, dict) or not _message_has_gemma_thought_leak(message):
+        return None, None
+
+    tool_calls = message.get("tool_calls")
+    if tool_calls and _validate_tool_calls(tool_calls, tools_list):
+        fixed = copy.deepcopy(payload)
+        fixed_choice = (fixed.get("choices") or [{}])[0]
+        fixed_message = fixed_choice.get("message") or {}
+        fixed_message["content"] = ""
+        _drop_gemma_private_fields(fixed_message)
+        fixed_choice["finish_reason"] = "tool_calls"
+        return fixed, "gemma_thought_leak_fix"
+
+    content = message.get("content")
+    if isinstance(content, str) and not tool_calls:
+        channel_content = _gemma_channel_content(content)
+        if channel_content is not None:
+            fixed = copy.deepcopy(payload)
+            fixed_choice = (fixed.get("choices") or [{}])[0]
+            fixed_message = fixed_choice.get("message") or {}
+            fixed_message["content"] = channel_content
+            _drop_gemma_private_fields(fixed_message)
+            fixed_choice["finish_reason"] = "stop"
+            return fixed, "gemma_thought_leak_channel_fix"
+
+    return None, None
 
 
 def _strip_gemma_thought_sentinel_from_payload(payload: dict) -> dict:
@@ -1371,6 +1464,27 @@ def _mark_model_inactive(upstream: str, model: str | None, reason: str) -> None:
     }
 
 
+def _preserve_model_health_status(
+    upstream: str,
+    model: str,
+    reason: str,
+    *,
+    latency_s: float | None = None,
+    status: int | None = None,
+) -> dict[str, Any]:
+    previous = dict(_MODEL_HEALTH.get(upstream, {}).get(model) or {})
+    active = previous.get("active") if "active" in previous else None
+    return {
+        **previous,
+        "active": active,
+        "checked_at": time.time(),
+        "latency_s": latency_s,
+        "status": status,
+        "error": reason[:200],
+        "stale": True,
+    }
+
+
 def _request_allows_runtime_model_fallback(exc: BaseException) -> bool:
     if isinstance(exc, httpx.ReadTimeout):
         return True
@@ -1397,11 +1511,13 @@ def _apply_runtime_model_fallback(
     if not fallback or fallback in attempted_fallbacks:
         return None
     attempted_fallbacks.add(current)
-    _mark_model_inactive(profile.upstream, current, str(exc))
+    if not (isinstance(exc, _UpstreamHTTPError) and exc.status == 429):
+        _mark_model_inactive(profile.upstream, current, str(exc))
     body["model"] = fallback
+    reason = f"http-{exc.status}" if isinstance(exc, _UpstreamHTTPError) else type(exc).__name__
     print(
         f"[model-fallback] profile={profile.name} upstream={profile.upstream} "
-        f"model={current} fallback={fallback} reason={type(exc).__name__}",
+        f"model={current} fallback={fallback} reason={reason}",
         flush=True,
     )
     return fallback
@@ -1417,6 +1533,24 @@ async def _probe_model_health(upstream: UpstreamConfig, model: str) -> dict[str,
             "status": None,
             "error": "missing health-check auth env",
         }
+    gate = _UPSTREAM_GATES.get(upstream.name)
+    slot_id: int | None = None
+    if gate is not None:
+        try:
+            slot_id = await gate.acquire(
+                profile_name="model-health",
+                path=f"/model-health/{model}",
+                priority=MODEL_HEALTH_QUEUE_PRIORITY,
+                queue_timeout=MODEL_HEALTH_QUEUE_TIMEOUT_S,
+            )
+            await gate.update_slot(slot_id, model=model)
+        except _QueueTimeout as exc:
+            return _preserve_model_health_status(
+                upstream.name,
+                model,
+                f"health probe skipped: upstream gate busy ({exc})",
+                latency_s=round(MODEL_HEALTH_QUEUE_TIMEOUT_S, 3),
+            )
     headers = {
         **headers,
         "content-type": "application/json",
@@ -1451,12 +1585,21 @@ async def _probe_model_health(upstream: UpstreamConfig, model: str) -> dict[str,
             try:
                 if response.status_code >= 400:
                     body_bytes = await response.aread()
+                    error = body_bytes.decode("utf-8", errors="ignore")[:200]
+                    if response.status_code == 429:
+                        return _preserve_model_health_status(
+                            upstream.name,
+                            model,
+                            f"health probe rate-limited: {error}",
+                            latency_s=round(time.monotonic() - started, 3),
+                            status=response.status_code,
+                        )
                     return {
                         "active": False,
                         "checked_at": time.time(),
                         "latency_s": round(time.monotonic() - started, 3),
                         "status": response.status_code,
-                        "error": body_bytes.decode("utf-8", errors="ignore")[:200],
+                        "error": error,
                     }
                 iterator = response.aiter_bytes().__aiter__()
                 await asyncio.wait_for(iterator.__anext__(), timeout=MODEL_HEALTH_TIMEOUT_S)
@@ -1470,13 +1613,15 @@ async def _probe_model_health(upstream: UpstreamConfig, model: str) -> dict[str,
             finally:
                 await response.aclose()
     except Exception as exc:
-        return {
-            "active": False,
-            "checked_at": time.time(),
-            "latency_s": round(time.monotonic() - started, 3),
-            "status": None,
-            "error": str(exc)[:200],
-        }
+        return _preserve_model_health_status(
+            upstream.name,
+            model,
+            f"health probe inconclusive: {exc}",
+            latency_s=round(time.monotonic() - started, 3),
+        )
+    finally:
+        if gate is not None and slot_id is not None:
+            await gate.release(slot_id)
 
 
 async def _model_health_loop() -> None:
@@ -1501,7 +1646,21 @@ async def _model_health_loop() -> None:
                 else:
                     status = result
                 _MODEL_HEALTH.setdefault(upstream_name, {})[model] = status
-                state = "active" if status.get("active") else "inactive"
+                active_value = status.get("active")
+                if status.get("stale"):
+                    if active_value is True:
+                        state = "stale"
+                    elif active_value is None:
+                        state = "unknown"
+                    else:
+                        state = "stale-inactive"
+                else:
+                    if active_value is True:
+                        state = "active"
+                    elif active_value is None:
+                        state = "unknown"
+                    else:
+                        state = "inactive"
                 print(
                     f"[model-health] upstream={upstream_name} model={model} "
                     f"state={state} latency={status.get('latency_s')} "
@@ -1677,6 +1836,8 @@ _recovery_counts: dict[str, int] = {
     "empty_with_stop_retry": 0,
     "tool_call_args_retry": 0,
     "xml_tool_residue": 0,
+    "gemma_thought_leak_fix": 0,
+    "gemma_thought_leak_channel_fix": 0,
     "gemma_thought_leak_retry": 0,
 }
 _retry_counts: dict[str, int] = {"retried": 0, "gave_up": 0}
@@ -3458,7 +3619,7 @@ async def _stream_chat_completions(
     do_tool_call_retry = profile.has("tool_call_args_retry") and thinking_retry_allowed
     do_xml_residue_retry = profile.has("xml_tool_residue_retry") and thinking_retry_allowed
     do_gemma_tool_result_cleanup = (
-        profile.has("tool_call_args_retry")
+        profile.has("gemma_thought_leak_retry")
         and _model_uses_gemma_thinking(body)
         and _body_has_tool_result(body)
     )
@@ -3683,6 +3844,7 @@ async def _stream_chat_completions(
                     retry_payload, body.get("tools"), require_tool_call
                 )
             ):
+                state["original_response"] = _redact_response(upstream_payload)
                 state["response"] = _redact_response(retry_payload)
                 for synth_chunk in _synthesize_chat_sse(retry_payload, model_hint):
                     yield synth_chunk
@@ -3694,27 +3856,45 @@ async def _stream_chat_completions(
                     if rec: _broadcast_usage(rec)
                 return
 
-        if do_gemma_tool_result_retry and _message_has_gemma_thought_leak(msg):
-            r_status, retry_payload = await _retry_chat_thinking_off(body, headers, profile)
-            retry_choice = (retry_payload.get("choices") or [{}])[0] if isinstance(retry_payload, dict) else {}
-            retry_msg = retry_choice.get("message") or {}
-            if (
-                r_status < 400
-                and isinstance(retry_payload, dict)
-                and isinstance(retry_msg, dict)
-                and _clean_visible_content(retry_msg)
-            ):
-                _strip_gemma_thought_sentinel_from_payload(retry_payload)
-                state["response"] = _redact_response(retry_payload)
-                for synth_chunk in _synthesize_chat_sse(retry_payload, model_hint):
+        if do_gemma_tool_result_cleanup and _message_has_gemma_thought_leak(msg):
+            fixed_payload, fixed_kind = _fix_gemma_thought_leak_payload(
+                upstream_payload, body.get("tools")
+            )
+            if fixed_payload and fixed_kind:
+                state["original_response"] = _redact_response(upstream_payload)
+                state["response"] = _redact_response(fixed_payload)
+                for synth_chunk in _synthesize_chat_sse(fixed_payload, model_hint):
                     yield synth_chunk
-                state["recovery"] = "gemma_thought_leak_retry"
-                _record_recovery("gemma_thought_leak_retry")
-                usage = retry_payload.get("usage")
+                state["recovery"] = fixed_kind
+                _record_recovery(fixed_kind)
+                usage = fixed_payload.get("usage")
                 if isinstance(usage, dict):
-                    rec = _extract_usage(profile.name, model_hint, retry_payload)
+                    rec = _extract_usage(profile.name, model_hint, fixed_payload)
                     if rec: _broadcast_usage(rec)
                 return
+
+            if do_gemma_tool_result_retry:
+                r_status, retry_payload = await _retry_chat_thinking_off(body, headers, profile)
+                retry_choice = (retry_payload.get("choices") or [{}])[0] if isinstance(retry_payload, dict) else {}
+                retry_msg = retry_choice.get("message") or {}
+                if (
+                    r_status < 400
+                    and isinstance(retry_payload, dict)
+                    and isinstance(retry_msg, dict)
+                    and _clean_visible_content(retry_msg)
+                ):
+                    _strip_gemma_thought_sentinel_from_payload(retry_payload)
+                    state["original_response"] = _redact_response(upstream_payload)
+                    state["response"] = _redact_response(retry_payload)
+                    for synth_chunk in _synthesize_chat_sse(retry_payload, model_hint):
+                        yield synth_chunk
+                    state["recovery"] = "gemma_thought_leak_retry"
+                    _record_recovery("gemma_thought_leak_retry")
+                    usage = retry_payload.get("usage")
+                    if isinstance(usage, dict):
+                        rec = _extract_usage(profile.name, model_hint, retry_payload)
+                        if rec: _broadcast_usage(rec)
+                    return
 
         tool_calls = msg.get("tool_calls")
         if (
@@ -3741,6 +3921,7 @@ async def _stream_chat_completions(
             yield bytes(upstream_buffer)
             return
 
+        state["original_response"] = _redact_response(upstream_payload)
         for synth_chunk in _synthesize_chat_sse(retry_payload, model_hint):
             yield synth_chunk
         state["response"] = _redact_response(retry_payload)
@@ -4224,6 +4405,7 @@ def _record_activity(
     params: dict | None = None,
     body: dict | None = None,
     forwarded: dict | None = None,
+    original_response: dict | None = None,
     response: dict | None = None,
     model: str | None = None,
     recovery: str | None = None,
@@ -4247,6 +4429,8 @@ def _record_activity(
         record["body"] = body
     if forwarded is not None:
         record["forwarded"] = forwarded
+    if original_response is not None:
+        record["original_response"] = original_response
     if response is not None:
         record["response"] = response
     _broadcast_activity(record)
@@ -4373,6 +4557,7 @@ def _read_disk_history(limit: int = 1000, *, strip_bodies: bool = True) -> tuple
                 if strip_bodies:
                     obj.pop("body", None)
                     obj.pop("forwarded", None)
+                    obj.pop("original_response", None)
                     obj.pop("response", None)
                 activity.append(obj)
             else:
@@ -4395,6 +4580,7 @@ def _strip_activity_bodies_except_recent(rows: list[dict], keep_recent: int = 10
         if idx < keep_from:
             copied.pop("body", None)
             copied.pop("forwarded", None)
+            copied.pop("original_response", None)
             copied.pop("response", None)
         out.append(copied)
     return out
@@ -4552,7 +4738,7 @@ async def stats(
         "upstreams": [g.snapshot() for g in _UPSTREAM_GATES.values()],
         "model_health": _model_health_snapshot(),
         "profiles": [
-            {"name": p.name, "upstream": p.upstream, "features": sorted(p.features)}
+            {"name": p.name, "upstream": p.upstream, "features": sorted(p.effective_features())}
             for p in CONFIG.profiles.values()
         ],
         "history": {
@@ -4677,6 +4863,8 @@ def _dump_config_yaml(cfg: BridgeConfig) -> str:
             "queue_priority": p.queue_priority,
             "features": sorted(p.features),
         }
+        if p.disabled_features:
+            entry["disabled_features"] = sorted(p.disabled_features)
         # Only emit thinking_enabled when the profile has set it
         # explicitly (True or False). None means "profile silent" —
         # omit the key so the YAML stays minimal.
@@ -4735,6 +4923,13 @@ def _validate_profile_payload(name: str, body: dict) -> tuple[ProfileConfig | No
     invalid = feats - ALL_FEATURES
     if invalid:
         return None, f"unknown features: {sorted(invalid)}"
+    disabled_raw = body.get("disabled_features") or []
+    if not isinstance(disabled_raw, list):
+        return None, "disabled_features must be a list of strings"
+    disabled_features = set(str(f) for f in disabled_raw)
+    invalid_disabled = disabled_features - ALL_FEATURES
+    if invalid_disabled:
+        return None, f"unknown disabled_features: {sorted(invalid_disabled)}"
     aliases_raw = body.get("model_aliases") or {}
     if not isinstance(aliases_raw, dict):
         return None, "model_aliases must be a string→string mapping"
@@ -4824,6 +5019,7 @@ def _validate_profile_payload(name: str, body: dict) -> tuple[ProfileConfig | No
             name=name,
             upstream=upstream,
             features=feats,
+            disabled_features=disabled_features,
             model_aliases=aliases,
             force_model=force_model or None,
             default_thinking_effort=default_effort or None,
@@ -4866,7 +5062,8 @@ async def config_get() -> dict:
             {
                 "name": p.name,
                 "upstream": p.upstream,
-                "features": sorted(p.features),
+                "features": sorted(p.effective_features()),
+                "disabled_features": sorted(p.disabled_features),
                 "queue_priority": p.queue_priority,
                 "default_thinking_effort": p.default_thinking_effort,
                 "default_thinking_budget": p.default_thinking_budget,
@@ -4886,6 +5083,7 @@ async def config_get() -> dict:
         ],
         "default_profile": CONFIG.default_profile,
         "available_features": sorted(ALL_FEATURES),
+        "default_on_features": sorted(DEFAULT_ON_FEATURES),
         "feature_descriptions": FEATURE_DESCRIPTIONS,
         "force_model_options": list(FORCE_MODEL_OPTIONS),
         "thinking_effort_options": list(_THINKING_EFFORT_OPTIONS),
@@ -4972,6 +5170,7 @@ async def _handle_responses(
                 params=inspected,
                 body=redacted,
                 forwarded=forwarded,
+                original_response=stream_state.get("original_response"),
                 response=stream_state.get("response"),
                 model=stream_state.get("model") or model_id,
                 recovery=stream_state.get("recovery"),
@@ -5116,6 +5315,7 @@ async def _handle_chat_completions(
                 params=inspected,
                 body=redacted,
                 forwarded=forwarded,
+                original_response=stream_state.get("original_response"),
                 response=stream_state.get("response"),
                 model=stream_state.get("model") or model_id,
                 recovery=stream_state.get("recovery"),
@@ -5172,7 +5372,9 @@ async def _handle_chat_completions(
         last_status = 502
         payload = {"error": {"message": f"upstream error: {e}"}}
     recovery_kind: str | None = None
+    original_response: dict | None = None
     if last_status < 400 and isinstance(payload, dict):
+        original_payload = copy.deepcopy(payload)
         choice = (payload.get("choices") or [{}])[0]
         finish = choice.get("finish_reason")
         message = choice.get("message") or {}
@@ -5190,6 +5392,7 @@ async def _handle_chat_completions(
                     retry_payload, body.get("tools"), require_tool_call
                 )
             ):
+                original_response = _redact_response(original_payload)
                 payload = retry_payload
                 recovery_kind = "xml_tool_residue"
                 _record_recovery(recovery_kind)
@@ -5208,6 +5411,7 @@ async def _handle_chat_completions(
         ):
             extra = await _recover_truncated_content(body, content, headers, profile)
             if extra:
+                original_response = _redact_response(original_payload)
                 message["content"] = extra
                 choice["finish_reason"] = "stop"
                 recovery_kind = "truncated_content"
@@ -5230,6 +5434,7 @@ async def _handle_chat_completions(
                 retry_msg = retry_choice.get("message") or {}
                 retry_tcs = retry_msg.get("tool_calls")
                 if retry_tcs and _validate_tool_calls(retry_tcs, body.get("tools")):
+                    original_response = _redact_response(original_payload)
                     payload = retry_payload
                     recovery_kind = "tool_call_args_retry"
                     _record_recovery(recovery_kind)
@@ -5254,6 +5459,7 @@ async def _handle_chat_completions(
                     retry_message = retry_choice.get("message") or {}
                     retry_content = retry_message.get("content") or ""
                     if retry_content.strip():
+                        original_response = _redact_response(original_payload)
                         payload = retry_payload
                         recovery_kind = "empty_with_stop_retry"
                         _record_recovery(recovery_kind)
@@ -5272,6 +5478,7 @@ async def _handle_chat_completions(
         params=inspected,
         body=redacted,
         forwarded=forwarded,
+        original_response=original_response,
         response=_redact_response(payload),
         model=model_id,
         recovery=recovery_kind,
@@ -5666,7 +5873,9 @@ def _dashboard_html() -> str:
     .params .pair {{ display: inline-block; margin-right: 0.6rem;
       background: var(--panel2); padding: 0.05rem 0.35rem; border-radius: 3px; }}
     .params .pp-tag {{ font-size: 0.78em; margin-left: 0.3rem;
-      padding: 0.02rem 0.3rem; border-radius: 2px; opacity: 0.85; }}
+      padding: 0.02rem 0.3rem; border-radius: 2px; opacity: 0.85;
+      user-select: none; }}
+    .params .pp-tag::before {{ content: attr(data-label); }}
     .params .pp-bridge {{ background: rgba(210, 168, 255, 0.15); color: var(--accent2); }}
     .params .pp-changed {{ background: rgba(240, 136, 62, 0.15); color: var(--warn); }}
     .params .pp-stripped {{ background: rgba(255, 123, 114, 0.12); color: var(--bad); }}
@@ -5677,8 +5886,8 @@ def _dashboard_html() -> str:
     .body-row.expanded {{ display: table-row; }}
     .body-pre {{ background: var(--panel2); border-radius: 4px;
       padding: 0.6rem 0.8rem; font-size: 0.82em; line-height: 1.4;
-      white-space: pre-wrap; word-break: break-word; max-height: 500px;
-      overflow-y: auto; color: var(--fg); }}
+      white-space: pre; word-break: normal; max-height: 500px;
+      overflow: auto; color: var(--fg); }}
     .body-pre .jk {{ color: var(--accent); }}
     .body-pre .js {{ color: var(--good); }}
     .body-pre .jn {{ color: var(--accent2); }}
@@ -5689,7 +5898,9 @@ def _dashboard_html() -> str:
     .body-pre .jline-added {{ background: rgba(86, 211, 100, 0.06); }}
     .body-pre .jline-changed {{ background: rgba(240, 136, 62, 0.06); }}
     .body-pre .jbadge {{ font-size: 0.85em; margin-left: 0.4rem;
-      padding: 0.02rem 0.3rem; border-radius: 2px; opacity: 0.85; }}
+      padding: 0.02rem 0.3rem; border-radius: 2px; opacity: 0.85;
+      user-select: none; white-space: nowrap; }}
+    .body-pre .jbadge::before {{ content: attr(data-label); }}
     .body-pre .jb-add {{ background: rgba(86, 211, 100, 0.15); color: var(--good); }}
     .body-pre .jb-change {{ background: rgba(240, 136, 62, 0.15); color: var(--warn); }}
     .body-label {{ color: var(--dim); font-size: 0.78rem;
@@ -5818,7 +6029,8 @@ def _dashboard_html() -> str:
     .rec-badge {{ display: inline-block; margin-left: 0.4rem;
       padding: 0.02rem 0.35rem; border-radius: 2px;
       background: rgba(210, 168, 255, 0.15); color: var(--accent2);
-      font-size: 0.72rem; letter-spacing: 0.02em; }}
+      font-size: 0.72rem; letter-spacing: 0.02em; user-select: none; }}
+    .rec-badge::before {{ content: attr(data-label); }}
 
     /* Upstream rate bars */
     .rate-bar {{ background: var(--panel2); height: 6px; border-radius: 3px;
@@ -6065,6 +6277,14 @@ def _dashboard_html() -> str:
         '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
       }})[c]);
     }}
+    function jsonPreview(value) {{
+      try {{
+        const encoded = JSON.stringify(value);
+        return encoded === undefined ? String(value) : encoded;
+      }} catch (_) {{
+        return String(value);
+      }}
+    }}
     function statusClass(s) {{
       if (s >= 500) return 'status-5xx';
       if (s >= 400) return 'status-4xx';
@@ -6100,16 +6320,17 @@ def _dashboard_html() -> str:
           kCls = 'pk dropped';
         }} else if (source === 'bridge') {{
           kCls = 'pk pk-bridge';
-          badge = '<span class="pp-tag pp-bridge">+bridge</span>';
+          badge = '<span class="pp-tag pp-bridge" data-label="+bridge" title="bridge injected this value" aria-label="bridge injected this value"></span>';
         }} else if (source === 'changed') {{
           kCls = 'pk pk-changed';
-          badge = `<span class="pp-tag pp-changed">was ${{escapeHtml(was)}}</span>`;
+          const wasLabel = `was ${{jsonPreview(was)}}`;
+          badge = `<span class="pp-tag pp-changed" data-label="${{escapeHtml(wasLabel)}}" title="${{escapeHtml(wasLabel)}}" aria-label="${{escapeHtml(wasLabel)}}"></span>`;
         }} else if (stripped) {{
           kCls = 'pk dropped';
-          badge = '<span class="pp-tag pp-stripped">stripped</span>';
+          badge = '<span class="pp-tag pp-stripped" data-label="stripped" title="stripped by bridge" aria-label="stripped by bridge"></span>';
         }}
         return `<span class="pair"><span class="${{kCls}}">${{escapeHtml(k)}}</span>=<span class="pv">${{escapeHtml(val)}}</span>${{badge}}</span>`;
-      }}).join('') + '</span>';
+      }}).join(' ') + '</span>';
     }}
 
     // Sparkline renderer (SVG path from points 0..1)
@@ -6396,20 +6617,24 @@ def _dashboard_html() -> str:
         `<tr><td colspan="9" class="empty">no model completions recorded</td></tr>`;
 
       // Model health. Independent from request history: a background
-      // probe marks each configured model active/inactive every minute.
+      // low-priority probe marks each configured model active/inactive/stale.
       const healthRows = [];
       const health = stats.model_health || {{}};
       for (const [upstream, models] of Object.entries(health)) {{
         for (const [model, row] of Object.entries(models || {{}})) {{
           const active = row && row.active === true;
+          const unknown = !row || row.active === null || row.active === undefined;
+          const stale = row && row.stale === true;
+          const state = stale ? (active ? 'stale' : unknown ? 'unknown' : 'stale down') : active ? 'active' : unknown ? 'unknown' : 'inactive';
+          const stateCls = active ? 'ok' : unknown || stale ? 'busy' : 'hot';
           const checked = row && row.checked_at ? `${{Math.max(0, Math.round(Date.now() / 1000 - row.checked_at))}}s ago` : '—';
           const latency = row && row.latency_s != null ? fmtMs(Number(row.latency_s) * 1000) : '—';
           const error = row && row.error ? row.error : '—';
           healthRows.push(`<tr>` +
             `<td>${{escapeHtml(upstream)}}</td>` +
             `<td>${{escapeHtml(model)}}</td>` +
-            `<td><span class="status-pill ${{active ? 'ok' : 'hot'}}">${{active ? 'active' : 'inactive'}}</span></td>` +
-            `<td class="num ${{active ? 'lat-fast' : 'lat-slow'}}">${{latency}}</td>` +
+            `<td><span class="status-pill ${{stateCls}}">${{state}}</span></td>` +
+            `<td class="num ${{active ? 'lat-fast' : unknown || stale ? 'lat-mid' : 'lat-slow'}}">${{latency}}</td>` +
             `<td class="num">${{checked}}</td>` +
             `<td>${{escapeHtml(error)}}</td>` +
           `</tr>`);
@@ -6525,8 +6750,9 @@ def _dashboard_html() -> str:
             const usage = findUsageFor(r.profile, r.ts);
             const tokIn = usage ? fmt(usage.input_tokens) : '—';
             const tokOut = usage ? fmt(usage.total_output_tokens || usage.output_tokens) : '—';
-            const recBadge = r.recovery
-              ? `<span class="rec-badge" title="recovery fired">${{escapeHtml(r.recovery.replace(/_/g, ' '))}}</span>`
+            const recLabel = r.recovery ? r.recovery.replace(/_/g, ' ') : '';
+            const recBadge = recLabel
+              ? `<span class="rec-badge" data-label="${{escapeHtml(recLabel)}}" title="recovery fired: ${{escapeHtml(recLabel)}}" aria-label="recovery fired: ${{escapeHtml(recLabel)}}"></span>`
               : '';
             const main = `<tr class="${{mainCls}}" data-key="${{key}}" data-target="${{targetId}}">` +
               `<td>${{fmtTime(r.ts)}}</td><td>${{escapeHtml(r.profile)}}</td>` +
@@ -6544,9 +6770,13 @@ def _dashboard_html() -> str:
             const responseJson = r.response
               ? jsonHighlight(r.response)
               : '<span class="jnull">no response captured</span>';
+            const originalResponseJson = r.original_response
+              ? `<div class="body-label">original response <span class="dim">before recovery</span></div>` + jsonHighlight(r.original_response)
+              : '';
             const bodyJson =
               `<div class="body-label">request <span class="dim">forwarded upstream</span></div>` +
               requestJson +
+              originalResponseJson +
               `<div class="body-label">response <span class="dim">captured downstream</span></div>` +
               responseJson;
             const expand = `<tr class="${{bodyCls}}" id="${{targetId}}">` +
@@ -6589,8 +6819,16 @@ def _dashboard_html() -> str:
     // (bridge changed an existing value). Falls back to the plain
     // highlighter when no comparison body is supplied.
     function flattenJson(obj, prefix, out) {{
-      if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {{
+      if (obj === null || typeof obj !== 'object') {{
         out.set(prefix, obj);
+        return;
+      }}
+      if (Array.isArray(obj)) {{
+        if (obj.length === 0) {{
+          out.set(prefix, obj);
+          return;
+        }}
+        obj.forEach((v, i) => flattenJson(v, pathOfArrayChild(prefix, i), out));
         return;
       }}
       if (Object.keys(obj).length === 0) {{
@@ -6616,21 +6854,48 @@ def _dashboard_html() -> str:
       }}
       return {{ added, changed }};
     }}
+    function jsonScalarHtml(v) {{
+      if (v === null) return '<span class="jnull">null</span>';
+      if (typeof v === 'string') return `<span class="js">${{escapeHtml(JSON.stringify(v))}}</span>`;
+      if (typeof v === 'number') return `<span class="jn">${{escapeHtml(jsonPreview(v))}}</span>`;
+      if (typeof v === 'boolean') return `<span class="jbool">${{v}}</span>`;
+      return `<span class="js">${{escapeHtml(JSON.stringify(String(v)))}}</span>`;
+    }}
+    function jsonKeyHtml(k, cls = 'jk') {{
+      return `<span class="${{cls}}">${{escapeHtml(JSON.stringify(k))}}</span>`;
+    }}
+    function jsonBadgeHtml(label, cls, title) {{
+      const safeLabel = escapeHtml(label);
+      const safeTitle = escapeHtml(title || label);
+      return `<span class="jbadge ${{cls}}" data-label="${{safeLabel}}" title="${{safeTitle}}" aria-label="${{safeTitle}}"></span>`;
+    }}
+    function pathOfChild(prefix, key) {{
+      return prefix ? `${{prefix}}.${{key}}` : key;
+    }}
+    function pathOfArrayChild(prefix, idx) {{
+      return prefix ? `${{prefix}}[${{idx}}]` : `[${{idx}}]`;
+    }}
+    function plainJson(obj, indent) {{
+      if (obj === null || typeof obj !== 'object') return jsonScalarHtml(obj);
+      if (Array.isArray(obj)) {{
+        if (obj.length === 0) return '[]';
+        const lines = obj.map((v, i) =>
+          `${{indent}}  ${{plainJson(v, indent + '  ')}}${{i < obj.length - 1 ? ',' : ''}}`
+        );
+        return `[\\n${{lines.join('\\n')}}\\n${{indent}}]`;
+      }}
+      const keys = Object.keys(obj);
+      if (keys.length === 0) return '{{}}';
+      const lines = keys.map((k, i) =>
+        `${{indent}}  ${{jsonKeyHtml(k)}}: ${{plainJson(obj[k], indent + '  ')}}${{i < keys.length - 1 ? ',' : ''}}`
+      );
+      return `{{\\n${{lines.join('\\n')}}\\n${{indent}}}}`;
+    }}
     function annotatedJson(forwarded, client) {{
       if (!forwarded) return '<span class="jnull">no body</span>';
       if (!client) return jsonHighlight(forwarded);
       const {{ added, changed }} = diffJson(client, forwarded);
 
-      function fmtVal(v) {{
-        if (v === null) return '<span class="jnull">null</span>';
-        if (typeof v === 'string') return `<span class="js">"${{escapeHtml(v)}}"</span>`;
-        if (typeof v === 'number') return `<span class="jn">${{v}}</span>`;
-        if (typeof v === 'boolean') return `<span class="jbool">${{v}}</span>`;
-        return escapeHtml(String(v));
-      }}
-      function pathOfChild(prefix, key) {{
-        return prefix ? `${{prefix}}.${{key}}` : key;
-      }}
       function isUnderAdded(path) {{
         // A child path is implicitly "added" when its parent was added.
         let p = path;
@@ -6642,18 +6907,30 @@ def _dashboard_html() -> str:
         }}
         return false;
       }}
+      function leafBadge(path) {{
+        if (added.has(path) || isUnderAdded(path)) {{
+          return jsonBadgeHtml('+bridge', 'jb-add', 'bridge injected this value');
+        }}
+        if (changed.has(path)) {{
+          const oldValue = jsonPreview(changed.get(path));
+          return jsonBadgeHtml(`was ${{oldValue}}`, 'jb-change', `client sent ${{oldValue}}`);
+        }}
+        return '';
+      }}
       function render(obj, indent, prefix, suppressBadge) {{
-        if (obj === null || typeof obj !== 'object') return fmtVal(obj);
+        if (obj === null || typeof obj !== 'object') {{
+          return jsonScalarHtml(obj) + (suppressBadge ? '' : leafBadge(prefix));
+        }}
         if (Array.isArray(obj)) {{
           if (obj.length === 0) return '[]';
-          const inner = obj.map((v) =>
-            `${{indent}}  ${{render(v, indent + '  ', prefix, true)}}`
-          ).join(',\\n');
+          const inner = obj.map((v, i) =>
+            `${{indent}}  ${{render(v, indent + '  ', pathOfArrayChild(prefix, i), suppressBadge)}}${{i < obj.length - 1 ? ',' : ''}}`
+          ).join('\\n');
           return `[\\n${{inner}}\\n${{indent}}]`;
         }}
         const keys = Object.keys(obj);
         if (keys.length === 0) return '{{}}';
-        const lines = keys.map((k) => {{
+        const lines = keys.map((k, i) => {{
           const path = pathOfChild(prefix, k);
           const isAdded = added.has(path) || isUnderAdded(path);
           const isChanged = changed.has(path);
@@ -6663,32 +6940,27 @@ def _dashboard_html() -> str:
           if (isAdded) {{
             cls = 'jk jk-added';
             lineCls = 'jline-added';
-            if (!suppressBadge) badge = '<span class="jbadge jb-add">+bridge</span>';
+            if (!suppressBadge) badge = jsonBadgeHtml('+bridge', 'jb-add', 'bridge injected this field');
           }} else if (isChanged) {{
             cls = 'jk jk-changed';
             lineCls = 'jline-changed';
-            badge = `<span class="jbadge jb-change">was ${{escapeHtml(JSON.stringify(changed.get(path)))}}</span>`;
+            const oldValue = jsonPreview(changed.get(path));
+            badge = jsonBadgeHtml(`was ${{oldValue}}`, 'jb-change', `client sent ${{oldValue}}`);
           }}
           const valHtml = render(obj[k], indent + '  ', path, suppressBadge || isAdded);
           const linePrefix = lineCls ? `<span class="${{lineCls}}">` : '';
           const lineSuffix = lineCls ? `</span>` : '';
-          return `${{indent}}  ${{linePrefix}}<span class="${{cls}}">"${{escapeHtml(k)}}"</span>: ${{valHtml}}${{badge}}${{lineSuffix}}`;
+          return `${{indent}}  ${{linePrefix}}${{jsonKeyHtml(k, cls)}}: ${{valHtml}}${{badge}}${{lineSuffix}}${{i < keys.length - 1 ? ',' : ''}}`;
         }});
-        return `{{\\n${{lines.join(',\\n')}}\\n${{indent}}}}`;
+        return `{{\\n${{lines.join('\\n')}}\\n${{indent}}}}`;
       }}
       return render(forwarded, '', '', false);
     }}
 
-    // Tiny JSON syntax highlighter.
+    // JSON syntax highlighter. It walks the parsed value instead of
+    // regexing escaped JSON text, so nested quotes and "\\n" stay readable.
     function jsonHighlight(obj) {{
-      const json = JSON.stringify(obj, null, 2);
-      const escaped = escapeHtml(json);
-      return escaped
-        .replace(/&quot;([^&]+?)&quot;:/g, '<span class="jk">"$1"</span>:')
-        .replace(/: &quot;(.*?)&quot;([,\\n}}\\]])/g, ': <span class="js">"$1"</span>$2')
-        .replace(/: (-?\\d+\\.?\\d*)([,\\n}}\\]])/g, ': <span class="jn">$1</span>$2')
-        .replace(/: (true|false)([,\\n}}\\]])/g, ': <span class="jbool">$1</span>$2')
-        .replace(/: null([,\\n}}\\]])/g, ': <span class="jnull">null</span>$1');
+      return plainJson(obj, '');
     }}
 
     async function refreshInflight() {{
@@ -6848,6 +7120,10 @@ def _dashboard_html() -> str:
       }}
       return out;
     }}
+    function disabledDefaultFeatures(prof) {{
+      const defaults = new Set(editorState?.default_on_features || []);
+      return [...defaults].filter((f) => !prof.features.has(f)).sort();
+    }}
 
     const FEATURE_GROUPS = [
       {{
@@ -6858,7 +7134,7 @@ def _dashboard_html() -> str:
       {{
         id: 'recovery',
         title: 'recovery and resilience',
-        features: ['thinking_overflow_recovery', 'silent_completion_recovery', 'truncated_content_recovery', 'empty_with_stop_retry', 'tool_call_args_retry', 'xml_tool_residue_retry'],
+        features: ['thinking_overflow_recovery', 'silent_completion_recovery', 'truncated_content_recovery', 'empty_with_stop_retry', 'tool_call_args_retry', 'xml_tool_residue_retry', 'gemma_thought_leak_retry'],
       }},
     ];
 
@@ -6914,6 +7190,7 @@ def _dashboard_html() -> str:
           upstreams: (d.upstreams || []).map((u) => u.name),
           available_features: d.available_features || [],
           feature_descriptions: d.feature_descriptions || {{}},
+          default_on_features: d.default_on_features || [],
           force_model_options: d.force_model_options || ['qwen3.6', 'gemma4'],
           thinking_effort_options: d.thinking_effort_options || ['low', 'medium', 'high', 'xhigh'],
           default_profile: d.default_profile,
@@ -6936,6 +7213,7 @@ def _dashboard_html() -> str:
         name: prof.name,
         upstream: prof.upstream,
         features: [...prof.features].sort(),
+        disabled_features: disabledDefaultFeatures(prof),
         queue_priority: prof.queue_priority,
         thinking_enabled: prof.thinking_enabled,
         default_thinking_effort: prof.thinking_enabled === true ? (prof.default_thinking_effort || null) : null,
@@ -7176,6 +7454,7 @@ def _dashboard_html() -> str:
       const payload = {{
         upstream: prof.upstream,
         features: [...prof.features],
+        disabled_features: disabledDefaultFeatures(prof),
         queue_priority: prof.queue_priority,
         thinking_enabled: prof.thinking_enabled,
         default_thinking_effort: prof.thinking_enabled === true ? (prof.default_thinking_effort || null) : null,
@@ -7251,7 +7530,7 @@ def _dashboard_html() -> str:
         features: new Set(['model_sampling_defaults', 'effort_to_thinking_budget',
           'thinking_overflow_recovery', 'silent_completion_recovery',
           'truncated_content_recovery', 'empty_with_stop_retry',
-          'drop_oai_only_fields']),
+          'drop_oai_only_fields', 'gemma_thought_leak_retry']),
         aliases: emptyAliases(),
         isNew: true,
       }});

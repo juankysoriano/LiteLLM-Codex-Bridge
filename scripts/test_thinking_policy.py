@@ -38,15 +38,19 @@ def make_profile(
     default_thinking_budget: int | None = None,
     default_max_output_tokens: int | None = None,
     features: list[str] | None = None,
+    disabled_features: list[str] | None = None,
+    model_fallback_enabled: bool = False,
 ) -> bridge.ProfileConfig:
     return bridge.ProfileConfig(
         name=name,
         upstream="nan",
         features=set(features or ["effort_to_thinking_budget"]),
+        disabled_features=set(disabled_features or []),
         thinking_enabled=thinking_enabled,
         default_thinking_effort=default_thinking_effort,
         default_thinking_budget=default_thinking_budget,
         default_max_output_tokens=default_max_output_tokens,
+        model_fallback_enabled=model_fallback_enabled,
     )
 
 
@@ -83,6 +87,68 @@ def case_named_profile_no_signals() -> None:
     if "max_tokens" in out:
         fail(label, f"expected NO max_tokens, got {out['max_tokens']}")
     ok(label, "no overrides — pure passthrough")
+
+
+def case_default_on_feature_can_be_disabled() -> None:
+    label = "default-on gemma leak retry can be disabled"
+    enabled = make_profile("enabled")
+    disabled = make_profile("disabled", disabled_features=["gemma_thought_leak_retry"])
+
+    if enabled.has("gemma_thought_leak_retry") is not True:
+        fail(label, "expected gemma_thought_leak_retry to be default-on")
+    if disabled.has("gemma_thought_leak_retry") is not False:
+        fail(label, "expected disabled_features to turn off gemma_thought_leak_retry")
+    ok(label, "disabled_features overrides default-on")
+
+
+def case_runtime_429_fallback_does_not_mark_model_inactive() -> None:
+    label = "runtime 429 fallback keeps model health"
+    previous_health = copy.deepcopy(bridge._MODEL_HEALTH)
+    try:
+        bridge._MODEL_HEALTH.clear()
+        bridge._MODEL_HEALTH["nan"] = {
+            "qwen3.6": {"active": True},
+            "gemma4": {"active": True},
+        }
+        profile = make_profile("stockbot", model_fallback_enabled=True)
+        body = {"model": "qwen3.6"}
+        fallback = bridge._apply_runtime_model_fallback(
+            body,
+            profile,
+            bridge._UpstreamHTTPError(429, "parallel request limit exceeded"),
+            attempted_fallbacks=set(),
+        )
+        if fallback != "gemma4" or body.get("model") != "gemma4":
+            fail(label, f"expected one-request fallback to gemma4, got {fallback!r}")
+        if bridge._MODEL_HEALTH["nan"]["qwen3.6"].get("active") is not True:
+            fail(label, "429 should not mark qwen3.6 inactive globally")
+        ok(label, "429 is treated as transient saturation")
+    finally:
+        bridge._MODEL_HEALTH.clear()
+        bridge._MODEL_HEALTH.update(previous_health)
+
+
+def case_health_rate_limit_preserves_previous_status() -> None:
+    label = "health 429 preserves previous status"
+    previous_health = copy.deepcopy(bridge._MODEL_HEALTH)
+    try:
+        bridge._MODEL_HEALTH.clear()
+        bridge._MODEL_HEALTH["nan"] = {"gemma4": {"active": True, "status": 200}}
+        status = bridge._preserve_model_health_status(
+            "nan",
+            "gemma4",
+            "health probe rate-limited",
+            status=429,
+            latency_s=0.1,
+        )
+        if status.get("active") is not True:
+            fail(label, f"expected active=True to be preserved, got {status}")
+        if status.get("stale") is not True or status.get("status") != 429:
+            fail(label, f"expected stale 429 status, got {status}")
+        ok(label, "rate limit is stale health, not inactive health")
+    finally:
+        bridge._MODEL_HEALTH.clear()
+        bridge._MODEL_HEALTH.update(previous_health)
 
 
 def case_default_profile_no_signals() -> None:
@@ -406,6 +472,9 @@ def case_profile_default_output_tokens_responses() -> None:
 def main() -> int:
     cases = [
         case_named_profile_no_signals,
+        case_default_on_feature_can_be_disabled,
+        case_runtime_429_fallback_does_not_mark_model_inactive,
+        case_health_rate_limit_preserves_previous_status,
         case_default_profile_no_signals,
         case_named_profile_client_effort_high,
         case_named_profile_client_responses_effort,

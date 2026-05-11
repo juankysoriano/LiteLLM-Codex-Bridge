@@ -208,7 +208,6 @@ def _write_test_config(path: Path, mock_url: str) -> None:
                     "silent_completion_recovery",
                     "truncated_content_recovery",
                     "empty_with_stop_retry",
-                    "tool_call_args_retry",
                     "xml_tool_residue_retry",
                 ],
             },
@@ -236,6 +235,8 @@ class TestState:
             "empty_with_stop_retry": 0,
             "tool_call_args_retry": 0,
             "xml_tool_residue": 0,
+            "gemma_thought_leak_fix": 0,
+            "gemma_thought_leak_channel_fix": 0,
             "gemma_thought_leak_retry": 0,
         }
 
@@ -829,6 +830,164 @@ def case_reasoning_content_stream_passthrough(t: TestState) -> None:
     print("  ✓ reasoning_content passthrough: thought streamed before final content")
 
 
+def case_gemma_thought_leak_fix_keeps_valid_tool_calls_stream(t: TestState) -> None:
+    """When Gemma leaks `thought` into content but also emits valid
+    structured tool_calls, the bridge can drop content and keep the tool
+    call without spending a retry."""
+    label = "gemma_thought_leak_fix"
+    t.reset_mock()
+    t.queue("/v1/chat/completions", {
+        "stream_events": [
+            {
+                "id": "chatcmpl_gemma_tool_fix",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl_gemma_tool_fix",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "thought\nI should use the time tool now.\n"},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl_gemma_tool_fix",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_time_again",
+                                "type": "function",
+                                "function": {"name": "get_system_time", "arguments": "{}"},
+                            }],
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl_gemma_tool_fix",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 30, "total_tokens": 80},
+            },
+        ],
+    })
+    body = {
+        "model": "gemma4",
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "que hora es?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_time",
+                    "type": "function",
+                    "function": {"name": "get_system_time", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_time", "content": "2026-05-08 12:00:00 CEST"},
+        ],
+        "tools": [_TIME_TOOL],
+    }
+    with httpx.stream("POST", f"{t.bridge}/test_force_stream/v1/chat/completions", json=body, timeout=15) as r:
+        r.raise_for_status()
+        text = "".join(r.iter_text())
+    assert "thought" not in text, text
+    assert "tool_calls" in text, text
+    assert "get_system_time" in text, text
+
+    seen = httpx.get(f"{t.mock}/scenario/seen", timeout=5).json()
+    assert len(seen["/v1/chat/completions"]) == 1, seen
+    t.assert_recovery(label, label + " (stream)")
+    latest = t.latest_activity() or {}
+    assert latest.get("original_response"), latest
+    original_msg = ((latest["original_response"].get("choices") or [{}])[0]).get("message") or {}
+    assert original_msg.get("content") == "<str 40 chars>", latest["original_response"]
+
+
+def case_gemma_thought_leak_channel_fix_stream(t: TestState) -> None:
+    """Gemma sometimes emits `thought ... <channel|> final`.
+    The bridge can keep the post-channel content without retrying."""
+    label = "gemma_thought_leak_channel_fix"
+    t.reset_mock()
+    t.queue("/v1/chat/completions", {
+        "stream_events": [
+            {
+                "id": "chatcmpl_gemma_channel_fix",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl_gemma_channel_fix",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "content": "\nthought\nI should answer from the tool result.<channel|>La hora actual es 12:00 CEST."
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl_gemma_channel_fix",
+                "object": "chat.completion.chunk",
+                "model": "gemma4",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 30, "total_tokens": 80},
+            },
+        ],
+    })
+    body = {
+        "model": "gemma4",
+        "stream": True,
+        "messages": [
+            {"role": "user", "content": "que hora es?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_time",
+                    "type": "function",
+                    "function": {"name": "get_system_time", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_time", "content": "2026-05-08 12:00:00 CEST"},
+        ],
+        "tools": [_TIME_TOOL],
+    }
+    with httpx.stream("POST", f"{t.bridge}/test_force_stream/v1/chat/completions", json=body, timeout=15) as r:
+        r.raise_for_status()
+        text = "".join(r.iter_text())
+    assert "La hora actual es 12:00 CEST." in text, text
+    assert "thought" not in text, text
+    assert "<channel|>" not in text, text
+
+    seen = httpx.get(f"{t.mock}/scenario/seen", timeout=5).json()
+    assert len(seen["/v1/chat/completions"]) == 1, seen
+    t.assert_recovery(label, label + " (stream)")
+    latest = t.latest_activity() or {}
+    assert latest.get("original_response"), latest
+    original_msg = ((latest["original_response"].get("choices") or [{}])[0]).get("message") or {}
+    assert original_msg.get("content") == "<str 85 chars>", latest["original_response"]
+
+
 def case_gemma_tool_result_thought_leak_retry_stream(t: TestState) -> None:
     """Gemma can stream post-tool hidden thought as visible `content`
     prefixed with the literal sentinel `thought`. The bridge must keep
@@ -931,6 +1090,10 @@ def case_gemma_tool_result_thought_leak_retry_stream(t: TestState) -> None:
     ), retry_body
 
     t.assert_recovery(label, label + " (stream)")
+    latest = t.latest_activity() or {}
+    assert latest.get("original_response"), latest
+    original_msg = ((latest["original_response"].get("choices") or [{}])[0]).get("message") or {}
+    assert original_msg.get("content") == "<str 64 chars>", latest["original_response"]
 
 
 def case_tool_call_args_retry_nonstream(t: TestState) -> None:
@@ -1210,6 +1373,8 @@ def main() -> int:
             case_xml_tool_residue_retry_nonstream(t)
             case_xml_tool_residue_retry_stream(t)
             case_reasoning_content_stream_passthrough(t)
+            case_gemma_thought_leak_fix_keeps_valid_tool_calls_stream(t)
+            case_gemma_thought_leak_channel_fix_stream(t)
             case_gemma_tool_result_thought_leak_retry_stream(t)
             case_tool_call_args_retry_nonstream(t)
             case_tool_call_args_retry_skips_when_client_disabled(t)

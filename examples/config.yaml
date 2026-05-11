@@ -1,7 +1,7 @@
 upstreams:
   nan:
     url: "https://api.nan.builders/v1"
-    rate_limit_rpm: 1000
+    rate_limit_rpm: 100
     rate_limit_concurrent: 5
     reserved_priority_slots: 2
     reserved_priority_threshold: 1
@@ -24,6 +24,7 @@ profiles:
       - silent_completion_recovery
       - truncated_content_recovery
       - empty_with_stop_retry
+      - gemma_thought_leak_retry
 
   myproject:
     upstream: nan
@@ -41,5 +42,7 @@ profiles:
       - silent_completion_recovery
       - truncated_content_recovery
       - empty_with_stop_retry
+      - gemma_thought_leak_retry
+    disabled_features: []
 
 default_profile: default
